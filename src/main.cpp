@@ -447,6 +447,10 @@ std::string TimeStampForFileName() {
     return buffer;
 }
 
+std::string BuildRequestTimestampToken() {
+    return TimeStampForFileName();
+}
+
 std::string IsoTimestampNow() {
     const auto now = std::chrono::system_clock::now();
     const std::time_t current_time = std::chrono::system_clock::to_time_t(now);
@@ -734,6 +738,39 @@ CommandResult BuildLlamaObserverSmokeResult(
     bool probe,
     const std::string & question);
 
+std::string SanitizeDispatchToken(const std::string & value, const std::string & fallback);
+
+std::string ExtractDelimitedBlock(
+    const std::string & text,
+    const std::string & begin_marker,
+    const std::string & end_marker);
+
+std::string BuildExecutionBindingJson(
+    const std::string & remote_chat_session_id,
+    const std::string & local_ai_thread_message_id,
+    const std::string & task_id,
+    const std::string & evidence_ref,
+    const std::string & result_ref,
+    const std::string & session_title,
+    const std::string & primary_intent,
+    const std::string & tool_name,
+    const std::string & status);
+
+CommandResult WriteExecutionBindingResult(
+    const AgentConfig & config,
+    const std::string & binding_json);
+
+CommandResult BuildVentriloquistReplyResult(
+    const AgentConfig & config,
+    const std::string & task_id,
+    const std::string & session_id,
+    const std::string & speaker_mode,
+    const std::string & reasoning_level,
+    const std::string & prompt_purpose,
+    const std::string & context_refs,
+    const std::string & response_mode,
+    const std::string & prompt_text);
+
 CommandResult OptFileReadResult(
     const AgentConfig & config,
     const std::string & target_name,
@@ -913,7 +950,10 @@ std::string BuildTaskResourceKey(
         profile_name == "build_target" ||
         profile_name == "build_and_test" ||
         profile_name == "run_ctest_target") {
-        const std::string build_dir = ExtractCliNamedArgument(extra_arguments, "-BuildDir");
+        std::string build_dir = ExtractCliNamedArgument(extra_arguments, "-BuildDir");
+        if (build_dir.empty()) {
+            build_dir = ExtractCliNamedArgument(extra_arguments, "--build-dir");
+        }
         if (!build_dir.empty()) {
             return "builddir:" + build_dir;
         }
@@ -1063,6 +1103,103 @@ CommandResult TailTextFileResult(
     return result;
 }
 
+CommandResult ListRecentRemoteEventsResult(
+    const AgentConfig & config,
+    int max_entries,
+    bool include_auto,
+    const std::string & request_type_filter,
+    const std::string & command_name_filter) {
+    CommandResult result;
+    result.fields["events_path"] = BuildRemoteControlEventsPath(config);
+    result.fields["include_auto"] = include_auto ? "true" : "false";
+    result.fields["request_type_filter"] = request_type_filter;
+    result.fields["command_name_filter"] = command_name_filter;
+
+    std::string content;
+    std::string read_error;
+    if (!ReadWholeFile(result.fields["events_path"], &content, &read_error)) {
+        result.ok = false;
+        result.exit_code = 44;
+        result.fields["error"] = read_error;
+        result.fields["summary"] = "remote_control_events unavailable";
+        return result;
+    }
+
+    std::vector<std::string> matched_lines;
+    std::istringstream input(content);
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string trimmed = Trim(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (!include_auto &&
+            ToLowerAscii(ExtractJsonString(trimmed, "record_to_latest")) != "true") {
+            continue;
+        }
+        if (!request_type_filter.empty() &&
+            ExtractJsonString(trimmed, "request_type") != request_type_filter) {
+            continue;
+        }
+        if (!command_name_filter.empty() &&
+            ExtractJsonString(trimmed, "command_name") != command_name_filter) {
+            continue;
+        }
+        matched_lines.push_back(trimmed);
+    }
+
+    const int bounded_max_entries = max_entries > 0 ? max_entries : 20;
+    const std::size_t start =
+        matched_lines.size() > static_cast<std::size_t>(bounded_max_entries)
+            ? matched_lines.size() - static_cast<std::size_t>(bounded_max_entries)
+            : 0;
+
+    std::ostringstream events_json;
+    events_json << "[";
+    int visible_index = 0;
+    for (std::size_t index = start; index < matched_lines.size(); ++index) {
+        const std::string & event_line = matched_lines[index];
+        const std::string prefix = "item_" + std::to_string(visible_index) + "_";
+        result.fields[prefix + "timestamp"] = ExtractJsonString(event_line, "timestamp");
+        result.fields[prefix + "source_thread"] = ExtractJsonString(event_line, "source_thread");
+        result.fields[prefix + "source_label"] = ExtractJsonString(event_line, "source_label");
+        result.fields[prefix + "takeover_relation"] = ExtractJsonString(event_line, "takeover_relation");
+        result.fields[prefix + "task_group"] = ExtractJsonString(event_line, "task_group");
+        result.fields[prefix + "request_type"] = ExtractJsonString(event_line, "request_type");
+        result.fields[prefix + "command_name"] = ExtractJsonString(event_line, "command_name");
+        result.fields[prefix + "path"] = ExtractJsonString(event_line, "path");
+        result.fields[prefix + "status"] = ExtractJsonString(event_line, "status");
+        result.fields[prefix + "summary"] = ExtractJsonString(event_line, "summary");
+        result.fields[prefix + "task_id"] = ExtractJsonString(event_line, "task_id");
+        result.fields[prefix + "result_ref"] = ExtractJsonString(event_line, "result_ref");
+        result.fields[prefix + "evidence_ref"] = ExtractJsonString(event_line, "evidence_ref");
+        result.fields[prefix + "duration_ms"] = ExtractJsonString(event_line, "duration_ms");
+        if (visible_index > 0) {
+            events_json << ",";
+        }
+        events_json << event_line;
+        ++visible_index;
+    }
+    events_json << "]";
+
+    result.fields["visible_count"] = std::to_string(visible_index);
+    result.fields["matched_count"] = std::to_string(matched_lines.size());
+    result.fields["events_json"] = events_json.str();
+    if (visible_index > 0) {
+        result.fields["latest_timestamp"] = result.fields["item_" + std::to_string(visible_index - 1) + "_timestamp"];
+        result.fields["latest_source_label"] = result.fields["item_" + std::to_string(visible_index - 1) + "_source_label"];
+        result.fields["latest_takeover_relation"] = result.fields["item_" + std::to_string(visible_index - 1) + "_takeover_relation"];
+        result.fields["latest_task_group"] = result.fields["item_" + std::to_string(visible_index - 1) + "_task_group"];
+        result.fields["latest_command_name"] = result.fields["item_" + std::to_string(visible_index - 1) + "_command_name"];
+        result.fields["latest_status"] = result.fields["item_" + std::to_string(visible_index - 1) + "_status"];
+        result.fields["latest_result_ref"] = result.fields["item_" + std::to_string(visible_index - 1) + "_result_ref"];
+        result.fields["summary"] = "recent remote events listed";
+    } else {
+        result.fields["summary"] = "no matching remote events";
+    }
+    return result;
+}
+
 CommandResult TaskLogTailResult(
     const AgentConfig & config,
     const std::string & task_id,
@@ -1181,19 +1318,22 @@ bool TextContainsCaseInsensitive(const std::string & text, const std::string & n
 
 std::string ExpectedMarkerForProfile(const std::string & profile_name) {
     if (profile_name == "configure_project") {
-        return "cmake_configure_complete";
+        return "configure_action_completed";
     }
     if (profile_name == "run_ctest_target") {
-        return "ctest_tests_found_and_passed";
+        return "ctest_action_completed";
     }
     if (profile_name == "prepare_build_dir") {
-        return "prepare_build_dir_done=true";
+        return "prepare_action_completed";
     }
     if (profile_name == "build_target") {
         return "build_exit_code_0";
     }
     if (profile_name == "check_build_dir") {
-        return "check_build_dir_done";
+        return "check_action_completed";
+    }
+    if (profile_name == "run_case") {
+        return "case_previewed";
     }
     return profile_name.empty() ? "exit_code_0" : (profile_name + "_exit_code_0");
 }
@@ -1202,6 +1342,30 @@ std::string AnalyzeSemanticOutcome(
     const std::string & profile_name,
     const CommandResult & result,
     const std::string & log_content) {
+    if (profile_name == "configure_project" &&
+        TextContainsCaseInsensitive(log_content, "unable to find a build program corresponding to")) {
+        return "cmake_generator_missing";
+    }
+    if (profile_name == "configure_project" &&
+        TextContainsCaseInsensitive(log_content, "CMAKE_CXX_COMPILER not set")) {
+        return "cmake_compiler_missing";
+    }
+    if (profile_name == "configure_project" &&
+        TextContainsCaseInsensitive(log_content, "\"semantic_outcome\":\"configure_ready\"")) {
+        return "configure_ready";
+    }
+    if (profile_name == "prepare_build_dir" &&
+        TextContainsCaseInsensitive(log_content, "\"result\":\"prepared\"")) {
+        return "prepare_build_dir_ready";
+    }
+    if (profile_name == "check_build_dir" &&
+        TextContainsCaseInsensitive(log_content, "\"result\":\"checked\"")) {
+        return "check_build_dir_ready";
+    }
+    if (profile_name == "run_case" &&
+        TextContainsCaseInsensitive(log_content, "\"result\":\"previewed\"")) {
+        return "case_previewed";
+    }
     const bool has_nonzero_exit_code =
         TextContainsCaseInsensitive(log_content, "exit_code=") &&
         !TextContainsCaseInsensitive(log_content, "exit_code=0");
@@ -1232,10 +1396,6 @@ std::string AnalyzeSemanticOutcome(
     if (profile_name == "configure_project" &&
         TextContainsCaseInsensitive(log_content, "Configuring incomplete, errors occurred")) {
         return "cmake_configure_incomplete";
-    }
-    if (profile_name == "prepare_build_dir" &&
-        TextContainsCaseInsensitive(log_content, "prepare_build_dir_done=true")) {
-        return "prepare_build_dir_ready";
     }
     return result.ok && result.exit_code == 0 ? "succeeded" : "failed";
 }
@@ -3047,13 +3207,20 @@ bool VerifyExpectedMarker(
         return false;
     }
     if (profile_name == "configure_project") {
-        return semantic_outcome == "succeeded";
+        return semantic_outcome == "configure_ready";
     }
     if (profile_name == "run_ctest_target") {
-        return semantic_outcome == "ctest_tests_passed";
+        return semantic_outcome == "ctest_tests_passed" ||
+            semantic_outcome == "ctest_no_tests_found";
     }
     if (profile_name == "prepare_build_dir") {
-        return TextContainsCaseInsensitive(log_content, "prepare_build_dir_done=true");
+        return semantic_outcome == "prepare_build_dir_ready";
+    }
+    if (profile_name == "check_build_dir") {
+        return semantic_outcome == "check_build_dir_ready";
+    }
+    if (profile_name == "run_case") {
+        return semantic_outcome == "case_previewed";
     }
     return semantic_outcome == "succeeded";
 }
@@ -3379,6 +3546,180 @@ std::string StableContentChecksum(const std::string & content) {
     std::ostringstream output;
     output << std::hex << std::setw(16) << std::setfill('0') << hash;
     return output.str();
+}
+
+std::string Base64Encode(const std::string & input) {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    int value = 0;
+    int value_bits = -6;
+    for (unsigned char ch : input) {
+        value = (value << 8) + ch;
+        value_bits += 8;
+        while (value_bits >= 0) {
+            output.push_back(kAlphabet[(value >> value_bits) & 0x3F]);
+            value_bits -= 6;
+        }
+    }
+    if (value_bits > -6) {
+        output.push_back(kAlphabet[((value << 8) >> (value_bits + 8)) & 0x3F]);
+    }
+    while ((output.size() % 4) != 0) {
+        output.push_back('=');
+    }
+    return output;
+}
+
+std::string ExtractDelimitedBlock(
+    const std::string & text,
+    const std::string & begin_marker,
+    const std::string & end_marker) {
+    const std::size_t begin = text.find(begin_marker);
+    if (begin == std::string::npos) {
+        return std::string();
+    }
+    const std::size_t content_begin = begin + begin_marker.size();
+    const std::size_t end = text.find(end_marker, content_begin);
+    if (end == std::string::npos || end < content_begin) {
+        return std::string();
+    }
+    return Trim(text.substr(content_begin, end - content_begin));
+}
+
+std::string BuildExecutionBindingOptFileTargetName() {
+    return "execution_binding.jsonl";
+}
+
+std::string BuildExecutionBindingJson(
+    const std::string & remote_chat_session_id,
+    const std::string & local_ai_thread_message_id,
+    const std::string & task_id,
+    const std::string & evidence_ref,
+    const std::string & result_ref,
+    const std::string & session_title,
+    const std::string & primary_intent,
+    const std::string & tool_name,
+    const std::string & status) {
+    std::ostringstream output;
+    output << "{"
+           << "\"timestamp\":\"" << codex_lan_agent::JsonEscape(IsoTimestampNow()) << "\","
+           << "\"remote_chat_session_id\":\"" << codex_lan_agent::JsonEscape(remote_chat_session_id) << "\","
+           << "\"local_ai_thread_message_id\":\"" << codex_lan_agent::JsonEscape(local_ai_thread_message_id) << "\","
+           << "\"task_id\":\"" << codex_lan_agent::JsonEscape(task_id) << "\","
+           << "\"session_title\":\"" << codex_lan_agent::JsonEscape(session_title) << "\","
+           << "\"primary_intent\":\"" << codex_lan_agent::JsonEscape(primary_intent) << "\","
+           << "\"tool\":\"" << codex_lan_agent::JsonEscape(tool_name) << "\","
+           << "\"status\":\"" << codex_lan_agent::JsonEscape(status) << "\","
+           << "\"evidence_ref\":\"" << codex_lan_agent::JsonEscape(evidence_ref) << "\","
+           << "\"result_ref\":\"" << codex_lan_agent::JsonEscape(result_ref) << "\""
+           << "}";
+    return output.str();
+}
+
+std::string EscapeForSingleQuotedPowerShell(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (char ch : value) {
+        if (ch == '\'') {
+            escaped += "''";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    return escaped;
+}
+
+CommandResult WriteExecutionBindingResult(
+    const AgentConfig & config,
+    const std::string & binding_json) {
+    CommandResult result;
+    result.fields["binding_transport"] = "operate_optfile_to_optfile_exe";
+    result.fields["target_name"] = BuildExecutionBindingOptFileTargetName();
+    if (binding_json.empty()) {
+        result.ok = false;
+        result.exit_code = 77;
+        result.fields["error"] = "binding_json is empty";
+        return result;
+    }
+
+    CommandResult profile_result = RunCliProfile(
+        config,
+        "operate_optfile",
+        "-Operation append -TargetName \"" + BuildExecutionBindingOptFileTargetName()
+            + "\" -Data '" + EscapeForSingleQuotedPowerShell(binding_json + "\n") + "'");
+    result = profile_result;
+    result.fields["binding_transport"] = "operate_optfile_to_optfile_exe";
+    result.fields["target_name"] = BuildExecutionBindingOptFileTargetName();
+    result.fields["binding_json"] = binding_json;
+    result.fields["recorded"] = profile_result.ok ? "true" : "false";
+    return result;
+}
+
+CommandResult ReadExecutionBindingResult(
+    const AgentConfig & config,
+    const std::string & task_id_filter,
+    const std::string & remote_chat_session_id_filter,
+    int max_entries) {
+    CommandResult result = RunCliProfile(
+        config,
+        "operate_optfile",
+        "-Operation read -TargetName \"" + BuildExecutionBindingOptFileTargetName() + "\"");
+    result.fields["binding_transport"] = "operate_optfile_to_optfile_exe";
+    result.fields["target_name"] = BuildExecutionBindingOptFileTargetName();
+    result.fields["task_id_filter"] = task_id_filter;
+    result.fields["remote_chat_session_id_filter"] = remote_chat_session_id_filter;
+    if (!result.ok) {
+        return result;
+    }
+
+    std::string log_content;
+    std::string read_error;
+    if (!ReadWholeFile(GetFieldOrDefault(result, "log_path", ""), &log_content, &read_error)) {
+        result.ok = false;
+        result.exit_code = 78;
+        result.fields["error"] = read_error;
+        return result;
+    }
+
+    const std::string content = ExtractDelimitedBlock(log_content, "content_begin", "content_end");
+    result.fields["content"] = content;
+    result.fields["checksum"] = StableContentChecksum(content);
+    std::vector<std::string> matched_entries;
+    std::istringstream input(content);
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string trimmed = Trim(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (!task_id_filter.empty() &&
+            trimmed.find("\"task_id\":\"" + task_id_filter + "\"") == std::string::npos) {
+            continue;
+        }
+        if (!remote_chat_session_id_filter.empty() &&
+            trimmed.find("\"remote_chat_session_id\":\"" + remote_chat_session_id_filter + "\"") == std::string::npos) {
+            continue;
+        }
+        matched_entries.push_back(trimmed);
+    }
+
+    const int bounded_max_entries = max_entries > 0 ? max_entries : 20;
+    const int start_index = matched_entries.size() > static_cast<std::size_t>(bounded_max_entries)
+        ? static_cast<int>(matched_entries.size() - bounded_max_entries)
+        : 0;
+    std::ostringstream tail;
+    for (std::size_t index = static_cast<std::size_t>(start_index); index < matched_entries.size(); ++index) {
+        if (index > static_cast<std::size_t>(start_index)) {
+            tail << "\n";
+        }
+        tail << matched_entries[index];
+    }
+    result.fields["matched_entry_count"] = std::to_string(matched_entries.size());
+    result.fields["matched_entries_tail"] = tail.str();
+    result.fields["latest_entry"] = matched_entries.empty() ? "" : matched_entries.back();
+    result.fields["result"] = matched_entries.empty() ? "no_match" : "read";
+    return result;
 }
 
 CommandResult BuildOptFileBaseResult(
@@ -3889,25 +4230,48 @@ std::string BuildConfigureProjectArguments(
     const std::string & cmake_args,
     const std::string & env_args = std::string()) {
     std::string arguments =
-        "-ProjectRoot \"" + project_root + "\" -BuildDir \"" + build_dir
-        + "\" -GeneratorKind " + generator_kind;
+        "--action configure --project-root \"" + project_root + "\" --build-dir \"" + build_dir
+        + "\" --generator-kind " + generator_kind;
     if (!cmake_args.empty()) {
-        arguments += " -ExtraCMakeArgs \"" + cmake_args + "\"";
+        arguments += " --cmake-arg \"" + cmake_args + "\"";
     }
     if (!env_args.empty()) {
-        arguments += " -Env \"" + env_args + "\"";
+        arguments += " --env \"" + env_args + "\"";
     }
     return arguments;
 }
 
 std::string BuildPrepareBuildDirArguments(
     const std::string & build_dir,
+    const std::string & workspace_root,
     bool create_if_missing) {
-    std::string arguments = "-BuildDir \"" + build_dir + "\"";
+    std::string arguments =
+        "--action prepare --build-dir \"" + build_dir + "\" --workspace-root \"" + workspace_root + "\""
+        " --stop-matching-processes --remove-cache";
     if (create_if_missing) {
-        arguments += " -CreateIfMissing";
+        arguments += " --create-if-missing";
     }
     return arguments;
+}
+
+std::string BuildCheckBuildDirArguments(const std::string & build_dir) {
+    return "--action check --build-dir \"" + build_dir + "\"";
+}
+
+std::string BuildBuildTargetArguments(
+    const std::string & build_dir,
+    const std::string & config_name,
+    const std::string & target) {
+    return "--action build --build-dir \"" + build_dir + "\" --config " + config_name
+        + " --target \"" + target + "\"";
+}
+
+std::string BuildRunCTestTargetArguments(
+    const std::string & build_dir,
+    const std::string & config_name,
+    const std::string & test_regex) {
+    return "--action ctest --build-dir \"" + build_dir + "\" --config " + config_name
+        + " --test-regex \"" + test_regex + "\"";
 }
 
 bool ExtractJsonBool(const std::string & body, const std::string & key, bool default_value) {
@@ -4120,6 +4484,9 @@ CommandResult BuildHealthResult(const AgentConfig & config) {
     copy_last_field("status", "last_request_status");
     copy_last_field("duration_ms", "last_request_duration_ms");
     copy_last_field("source_thread", "last_request_thread");
+    copy_last_field("source_label", "last_request_source_label");
+    copy_last_field("takeover_relation", "last_request_takeover_relation");
+    copy_last_field("task_group", "last_request_task_group");
     copy_last_field("task_id", "last_request_task_id");
     copy_last_field("command_name", "last_request_command_name");
     copy_last_field("request_type", "last_request_type");
@@ -4154,6 +4521,9 @@ CommandResult BuildLivenessResult(const AgentConfig & config) {
     copy_last_field("status", "last_request_status");
     copy_last_field("duration_ms", "last_request_duration_ms");
     copy_last_field("source_thread", "last_request_thread");
+    copy_last_field("source_label", "last_request_source_label");
+    copy_last_field("takeover_relation", "last_request_takeover_relation");
+    copy_last_field("task_group", "last_request_task_group");
     copy_last_field("task_id", "last_request_task_id");
     copy_last_field("command_name", "last_request_command_name");
     copy_last_field("request_type", "last_request_type");
@@ -4512,7 +4882,7 @@ CommandResult RunCliProfile(
 CommandResult RunCase(
     const AgentConfig & config,
     const std::string & case_path) {
-    return RunCliProfile(config, "run_case", "-CasePath \"" + case_path + "\"");
+    return RunCliProfile(config, "run_case", "--case-path \"" + case_path + "\"");
 }
 
 CommandResult RunRagFlow(
@@ -4559,6 +4929,226 @@ CommandResult RunRagFlow(
     return result;
 }
 
+std::string NormalizeVentriloquistConfidence(const std::string & raw_value) {
+    std::string normalized = ToLowerAscii(Trim(raw_value));
+    if (normalized.size() >= 2 && normalized.front() == '"' && normalized.back() == '"') {
+        normalized = normalized.substr(1, normalized.size() - 2);
+    }
+    if (normalized == "confirmed"
+        || normalized == "likely"
+        || normalized == "unclear"
+        || normalized == "blocked") {
+        return normalized;
+    }
+    return std::string();
+}
+
+std::string BuildVentriloquistQuestion(
+    const std::string & task_id,
+    const std::string & session_id,
+    const std::string & speaker_mode,
+    const std::string & reasoning_level,
+    const std::string & prompt_purpose,
+    const std::string & context_refs,
+    const std::string & response_mode,
+    const std::string & prompt_text) {
+    std::ostringstream output;
+    output
+        << "You are a controlled local AI reply tool for CODEX.\n"
+        << "Return one compact structured reply only.\n"
+        << "Use exactly these markers:\n"
+        << "BEGIN_DIRECT_ANSWER\n...\nEND_DIRECT_ANSWER\n"
+        << "BEGIN_EVIDENCE\n...\nEND_EVIDENCE\n"
+        << "BEGIN_NEXT_ACTION\n...\nEND_NEXT_ACTION\n"
+        << "BEGIN_CONFIDENCE\nconfirmed|likely|unclear|blocked\nEND_CONFIDENCE\n"
+        << "Do not add extra sections.\n"
+        << "task_id=" << task_id << "\n"
+        << "session_id=" << (session_id.empty() ? "none" : session_id) << "\n"
+        << "speaker_mode=" << speaker_mode << "\n"
+        << "reasoning_level=" << reasoning_level << "\n"
+        << "prompt_purpose=" << prompt_purpose << "\n"
+        << "response_mode=" << response_mode << "\n"
+        << "context_refs=" << (context_refs.empty() ? "none" : context_refs) << "\n";
+    if (!prompt_text.empty()) {
+        output << "prompt_text=" << prompt_text << "\n";
+    }
+    output << "If evidence is missing, set confidence=unclear or blocked.";
+    return output.str();
+}
+
+CommandResult BuildVentriloquistReplyResult(
+    const AgentConfig & config,
+    const std::string & task_id,
+    const std::string & session_id,
+    const std::string & speaker_mode,
+    const std::string & reasoning_level,
+    const std::string & prompt_purpose,
+    const std::string & context_refs,
+    const std::string & response_mode,
+    const std::string & prompt_text) {
+    CommandResult result;
+    result.fields["tool"] = "lan_agent_ventriloquist_reply";
+    result.fields["task_id"] = task_id;
+    result.fields["session_id"] = session_id;
+    result.fields["speaker_mode"] = speaker_mode;
+    result.fields["reasoning_level"] = reasoning_level;
+    result.fields["prompt_purpose"] = prompt_purpose;
+    result.fields["context_refs"] = context_refs;
+    result.fields["response_mode"] = response_mode;
+    result.fields["source_type"] = "codex";
+
+    if (task_id.empty()) {
+        result.ok = false;
+        result.exit_code = 81;
+        result.fields["error"] = "task_id is required";
+        result.fields["format_ok"] = "false";
+        result.fields["format_mismatch"] = "true";
+        result.fields["fallback_reason"] = "ventriloquist_invalid_input";
+        result.fields["next_action"] = "provide task_id";
+        return result;
+    }
+    const std::string normalized_reasoning = ToLowerAscii(reasoning_level);
+    if (normalized_reasoning != "low"
+        && normalized_reasoning != "medium"
+        && normalized_reasoning != "high") {
+        result.ok = false;
+        result.exit_code = 82;
+        result.fields["error"] = "reasoning_level must be low, medium, or high";
+        result.fields["format_ok"] = "false";
+        result.fields["format_mismatch"] = "true";
+        result.fields["fallback_reason"] = "ventriloquist_invalid_input";
+        result.fields["next_action"] = "provide a valid reasoning_level";
+        return result;
+    }
+    if (speaker_mode.empty() || prompt_purpose.empty() || response_mode.empty()) {
+        result.ok = false;
+        result.exit_code = 83;
+        result.fields["error"] = "speaker_mode, prompt_purpose, and response_mode are required";
+        result.fields["format_ok"] = "false";
+        result.fields["format_mismatch"] = "true";
+        result.fields["fallback_reason"] = "ventriloquist_invalid_input";
+        result.fields["next_action"] = "provide required control fields";
+        return result;
+    }
+    if (context_refs.empty()) {
+        result.ok = false;
+        result.exit_code = 84;
+        result.fields["error"] = "context_refs is required for controlled ventriloquist reply";
+        result.fields["format_ok"] = "false";
+        result.fields["format_mismatch"] = "true";
+        result.fields["fallback_reason"] = "ventriloquist_missing_context_refs";
+        result.fields["next_action"] = "provide one or more context_refs";
+        return result;
+    }
+
+    CommandResult chat_result = RunLocalChat(
+        config,
+        session_id.empty() ? "workspace" : session_id,
+        BuildVentriloquistQuestion(
+            task_id,
+            session_id,
+            speaker_mode,
+            normalized_reasoning,
+            prompt_purpose,
+            context_refs,
+            response_mode,
+            prompt_text),
+        "ventriloquist_reply");
+
+    result = chat_result;
+    result.fields["tool"] = "lan_agent_ventriloquist_reply";
+    result.fields["task_id"] = task_id;
+    result.fields["session_id"] = session_id;
+    result.fields["speaker_mode"] = speaker_mode;
+    result.fields["reasoning_level"] = normalized_reasoning;
+    result.fields["prompt_purpose"] = prompt_purpose;
+    result.fields["context_refs"] = context_refs;
+    result.fields["response_mode"] = response_mode;
+    result.fields["source_type"] = "codex";
+
+    const std::string output_text = ExtractOutputTextFallback(chat_result);
+    std::string direct_answer = ExtractDelimitedBlock(output_text, "BEGIN_DIRECT_ANSWER", "END_DIRECT_ANSWER");
+    std::string evidence = ExtractDelimitedBlock(output_text, "BEGIN_EVIDENCE", "END_EVIDENCE");
+    std::string next_action = ExtractDelimitedBlock(output_text, "BEGIN_NEXT_ACTION", "END_NEXT_ACTION");
+    std::string confidence = NormalizeVentriloquistConfidence(
+        ExtractDelimitedBlock(output_text, "BEGIN_CONFIDENCE", "END_CONFIDENCE"));
+
+    if (direct_answer.empty()) {
+        direct_answer = GetFieldOrDefault(chat_result, "summary", "");
+    }
+    if (direct_answer.empty()) {
+        direct_answer = output_text.substr(0, std::min<std::size_t>(output_text.size(), 240));
+    }
+    if (evidence.empty()) {
+        evidence = GetFieldOrDefault(chat_result, "source_refs", "");
+        if (!GetFieldOrDefault(chat_result, "evidence_lines", "").empty()) {
+            if (!evidence.empty()) {
+                evidence += " | ";
+            }
+            evidence += GetFieldOrDefault(chat_result, "evidence_lines", "").substr(
+                0,
+                std::min<std::size_t>(GetFieldOrDefault(chat_result, "evidence_lines", "").size(), 240));
+        }
+        if (evidence.empty()) {
+            evidence = context_refs;
+        }
+    }
+    if (next_action.empty()) {
+        next_action = GetFieldOrDefault(chat_result, "next_action", "");
+    }
+    if (confidence.empty()) {
+        if (!chat_result.ok) {
+            confidence = "blocked";
+        } else if (ToLowerAscii(GetFieldOrDefault(chat_result, "insufficient_context", "")) == "true") {
+            confidence = "unclear";
+        } else {
+            confidence = "likely";
+        }
+    }
+
+    const bool format_ok =
+        !direct_answer.empty()
+        && !evidence.empty()
+        && !next_action.empty()
+        && !confidence.empty();
+    result.fields["direct_answer"] = direct_answer;
+    result.fields["evidence"] = evidence;
+    result.fields["next_action"] = next_action;
+    result.fields["confidence"] = confidence;
+    result.fields["format_ok"] = format_ok ? "true" : "false";
+    result.fields["format_mismatch"] = format_ok ? "false" : "true";
+    result.fields["result"] = format_ok ? "ventriloquist_reply_ready" : "ventriloquist_reply_format_mismatch";
+    result.fields["summary"] = direct_answer.empty() ? "ventriloquist reply unavailable" : direct_answer;
+    result.fields["evidence_ref"] = context_refs;
+    result.fields["result_ref"] = GetFieldOrDefault(chat_result, "log_path", "");
+    if (!format_ok) {
+        result.ok = false;
+        result.exit_code = chat_result.ok ? 85 : chat_result.exit_code;
+        result.fields["fallback_reason"] = "ventriloquist_format_mismatch";
+        result.fields["next_action"] = "fallback to rag.query or inspect log_path";
+    }
+
+    const std::string local_ai_thread_message_id =
+        "ventriloquist-" + SanitizeDispatchToken(task_id, "task") + "-" + BuildRequestTimestampToken();
+    const std::string binding_json = BuildExecutionBindingJson(
+        session_id,
+        local_ai_thread_message_id,
+        task_id,
+        result.fields["evidence_ref"],
+        result.fields["result_ref"],
+        "ventriloquist_reply",
+        prompt_purpose,
+        "lan_agent_ventriloquist_reply",
+        result.ok ? "ready" : "fallback");
+    CommandResult binding_result = WriteExecutionBindingResult(config, binding_json);
+    result.fields["binding_recorded"] = binding_result.ok ? "true" : "false";
+    result.fields["binding_log_path"] = GetFieldOrDefault(binding_result, "log_path", "");
+    result.fields["binding_result"] = GetFieldOrDefault(binding_result, "result", "");
+    result.fields["execution_binding"] = binding_json;
+    result.fields["local_ai_thread_message_id"] = local_ai_thread_message_id;
+    return result;
+}
+
 CommandResult RunLocalChat(
     const AgentConfig & config,
     const std::string & scope,
@@ -4598,6 +5188,7 @@ CommandResult RunLocalChat(
 
     result.ok = response.ok;
     result.exit_code = response.ok ? 0 : 43;
+    result.fields["status"] = response.ok ? "ok" : "failed";
     result.fields["scope"] = scope;
     result.fields["mode"] = resolved_mode;
     result.fields["question"] = question;
@@ -4631,6 +5222,18 @@ CommandResult RunLocalChat(
         response.body.substr(0, std::min<std::size_t>(response.body.size(), 2000)),
         !response.ok || response.body.empty(),
         response.ok && !response.body.empty() ? "medium" : "low");
+    if (GetFieldOrDefault(result, "summary", "").empty()) {
+        const std::string output_text = ExtractOutputTextFallback(result);
+        result.fields["summary"] = output_text.empty()
+            ? (response.ok ? "local chat ok" : "local chat failed")
+            : output_text.substr(0, std::min<std::size_t>(output_text.size(), 160));
+    }
+    if (GetFieldOrDefault(result, "next_action", "").empty()) {
+        result.fields["next_action"] = response.ok
+            ? "inspect output_text or log_path"
+            : "inspect log_path";
+    }
+    result.fields["result"] = response.ok ? "local_chat_completed" : "local_chat_failed";
     return result;
 }
 
@@ -5222,6 +5825,80 @@ std::string FirstNonEmpty(
     return third;
 }
 
+std::string FileNameFromPathString(const std::string & value) {
+    if (value.empty()) {
+        return std::string();
+    }
+    std::error_code ec;
+    const std::filesystem::path path(value);
+    const std::string filename = path.filename().string();
+    if (!filename.empty() && !ec) {
+        return filename;
+    }
+    return value;
+}
+
+bool LooksManualSourceThread(const std::string & source_thread) {
+    const std::string lowered = ToLowerAscii(source_thread);
+    return lowered.empty() ||
+        lowered == "unknown" ||
+        lowered == "manual" ||
+        lowered == "human" ||
+        lowered.find("edge") != std::string::npos ||
+        lowered.find("browser") != std::string::npos;
+}
+
+std::string ClassifyUnifiedSourceLabel(
+    const std::string & source_thread,
+    const std::string & trigger,
+    const HttpRequest & request) {
+    const bool manual_source = LooksManualSourceThread(source_thread);
+    const bool is_mcp = request.path == "/mcp";
+    if (!manual_source && trigger == "manual" && is_mcp) {
+        return "mixed";
+    }
+    if (!manual_source) {
+        return "codex";
+    }
+    return "manual";
+}
+
+std::string BuildTakeoverRelation(
+    const std::string & source_label,
+    const std::string & source_thread,
+    const HttpRequest & request) {
+    if (source_label == "mixed") {
+        return "manual_request_with_codex_execution";
+    }
+    if (source_label == "codex") {
+        return "codex_managed";
+    }
+    if (request.path == "/mcp") {
+        return "manual_direct_mcp";
+    }
+    return source_thread.empty() || source_thread == "unknown"
+        ? "manual_direct_remote"
+        : "manual_thread_managed";
+}
+
+std::string BuildRemoteTaskGroup(
+    const std::string & task_id,
+    const std::string & command_name,
+    const std::string & request_type,
+    const std::string & result_ref,
+    const std::string & evidence_ref) {
+    if (!task_id.empty()) {
+        return "task:" + task_id;
+    }
+    if (!result_ref.empty()) {
+        return request_type + ":" + command_name + ":" + FileNameFromPathString(result_ref);
+    }
+    if (!evidence_ref.empty()) {
+        return request_type + ":" + command_name + ":" + FileNameFromPathString(evidence_ref);
+    }
+    return request_type + ":" + command_name + ":direct";
+}
+
 std::string ClassifyRemoteCommandName(const HttpRequest & request) {
     if (request.path == "/mcp") {
         const std::string tool_name = ExtractJsonString(request.body, "name");
@@ -5326,12 +6003,25 @@ void AppendRemoteControlEvent(
         ExtractResultField(response.body, "status"),
         response.status_text,
         std::to_string(response.status_code));
+    const std::string command_name = ClassifyRemoteCommandName(request);
+    const std::string request_type = ClassifyRemoteRequestType(request);
     const std::string result_ref = FirstNonEmpty(
         ExtractResultField(response.body, "result_log_path"),
         ExtractResultField(response.body, "log_path"),
         FirstNonEmpty(
             ExtractResultField(response.body, "file_path"),
             ExtractResultField(response.body, "experience_card_path")));
+    const std::string evidence_ref = task_id.empty()
+        ? ExtractResultField(response.body, "trace_log_path")
+        : ("task-log(" + task_id + ")");
+    const std::string source_label = ClassifyUnifiedSourceLabel(source_thread, trigger, request);
+    const std::string takeover_relation = BuildTakeoverRelation(source_label, source_thread, request);
+    const std::string task_group = BuildRemoteTaskGroup(
+        task_id,
+        command_name,
+        request_type,
+        result_ref,
+        evidence_ref);
     const bool record_to_latest = trigger != "auto";
 
     event["timestamp"] = request_finished_at;
@@ -5342,17 +6032,20 @@ void AppendRemoteControlEvent(
     event["source_thread"] = source_thread.empty() ? "unknown" : source_thread;
     event["target_thread"] = "codex_lan_agent";
     event["message_type"] = "remote_control";
+    event["record_model"] = "remote_interaction_v1";
+    event["source_label"] = source_label;
+    event["source_detail"] = source_thread.empty() ? "unknown" : source_thread;
+    event["takeover_relation"] = takeover_relation;
+    event["task_group"] = task_group;
     event["task_id"] = task_id;
     event["status"] = status;
-    event["command_name"] = ClassifyRemoteCommandName(request);
+    event["command_name"] = command_name;
     event["entry_name"] = request.method + " " + request.path;
-    event["request_type"] = ClassifyRemoteRequestType(request);
+    event["request_type"] = request_type;
     event["duration_ms"] = std::to_string(duration_ms);
     event["summary"] = ExtractResultField(response.body, "summary");
     event["next_action"] = ExtractResultField(response.body, "next_action");
-    event["evidence_ref"] = task_id.empty()
-        ? ExtractResultField(response.body, "trace_log_path")
-        : ("task-log(" + task_id + ")");
+    event["evidence_ref"] = evidence_ref;
     event["result_ref"] = result_ref;
     event["trigger"] = trigger;
     event["record_to_latest"] = record_to_latest ? "true" : "false";
@@ -5573,6 +6266,20 @@ std::string BuildMcpToolsListResponse(
         << "\"question\":{\"type\":\"string\"},"
         << "\"mode\":{\"type\":\"string\"}"
         << "},\"required\":[\"scope\",\"question\"],\"additionalProperties\":false}"
+        << "},"
+        << "{"
+        << "\"name\":\"lan_agent_ventriloquist_reply\","
+        << "\"description\":\"Request one controlled local AI proxy reply for CODEX and normalize the result into direct_answer, evidence, next_action, and confidence.\","
+        << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+        << "\"task_id\":{\"type\":\"string\"},"
+        << "\"session_id\":{\"type\":\"string\"},"
+        << "\"speaker_mode\":{\"type\":\"string\"},"
+        << "\"reasoning_level\":{\"type\":\"string\"},"
+        << "\"prompt_purpose\":{\"type\":\"string\"},"
+        << "\"context_refs\":{\"type\":\"string\"},"
+        << "\"response_mode\":{\"type\":\"string\"},"
+        << "\"prompt_text\":{\"type\":\"string\"}"
+        << "},\"required\":[\"task_id\",\"speaker_mode\",\"reasoning_level\",\"prompt_purpose\",\"context_refs\",\"response_mode\"],\"additionalProperties\":false}"
         << "},"
         << "{"
         << "\"name\":\"lan_agent_enqueue_local_chat\","
@@ -5910,6 +6617,16 @@ std::string BuildMcpToolsListResponse(
         << "},\"additionalProperties\":false}"
         << "},"
         << "{"
+        << "\"name\":\"lan_agent_list_recent_remote_events\","
+        << "\"description\":\"Return recent remote_control_events as structured list items for GUI and MCP consumers; includes synchronous MCP calls that set record_to_latest=true.\","
+        << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+        << "\"max_entries\":{\"type\":\"integer\"},"
+        << "\"include_auto\":{\"type\":\"boolean\"},"
+        << "\"request_type\":{\"type\":\"string\"},"
+        << "\"command_name\":{\"type\":\"string\"}"
+        << "},\"additionalProperties\":false}"
+        << "},"
+        << "{"
         << "\"name\":\"lan_agent_preview_patch\","
         << "\"description\":\"Preview a single-file replacement diff under workspace_root without writing to disk.\","
         << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
@@ -6167,6 +6884,21 @@ bool HandleMcpRoute(
                 ExtractJsonString(request.body, "scope"),
                 ExtractJsonString(request.body, "question"),
                 mode);
+        } else if (tool_name == "lan_agent_ventriloquist_reply") {
+            std::string context_refs = ExtractJsonString(request.body, "context_refs");
+            if (context_refs.empty()) {
+                context_refs = ExtractJsonRawValue(request.body, "context_refs");
+            }
+            result = BuildVentriloquistReplyResult(
+                config,
+                ExtractJsonString(request.body, "task_id"),
+                ExtractJsonString(request.body, "session_id"),
+                ExtractJsonString(request.body, "speaker_mode"),
+                ExtractJsonString(request.body, "reasoning_level"),
+                ExtractJsonString(request.body, "prompt_purpose"),
+                context_refs,
+                ExtractJsonString(request.body, "response_mode"),
+                ExtractJsonString(request.body, "prompt_text"));
         } else if (tool_name == "lan_agent_enqueue_local_chat") {
             if (g_task_manager == nullptr) {
                 result.ok = false;
@@ -6393,6 +7125,19 @@ bool HandleMcpRoute(
                 max_lines = parsed_max_lines > 0 ? parsed_max_lines : 1;
             }
             result = TailTextFileResult(config, BuildRemoteControlEventsPath(config), max_lines);
+        } else if (tool_name == "lan_agent_list_recent_remote_events") {
+            int max_entries = 20;
+            const std::string max_entries_raw = ExtractJsonRawValue(request.body, "max_entries");
+            if (!max_entries_raw.empty()) {
+                const int parsed_max_entries = std::atoi(max_entries_raw.c_str());
+                max_entries = parsed_max_entries > 0 ? parsed_max_entries : 1;
+            }
+            result = ListRecentRemoteEventsResult(
+                config,
+                max_entries,
+                ExtractJsonBool(request.body, "include_auto", false),
+                ExtractJsonString(request.body, "request_type"),
+                ExtractJsonString(request.body, "command_name"));
         } else if (tool_name == "lan_agent_preview_patch") {
             result = PreviewPatchResult(
                 config,
@@ -6417,7 +7162,7 @@ bool HandleMcpRoute(
                 result.exit_code = 400;
                 result.fields["error"] = "build_dir is required";
             } else {
-                result = RunCliProfile(config, "check_build_dir", "-BuildDir \"" + build_dir + "\"");
+                result = RunCliProfile(config, "check_build_dir", BuildCheckBuildDirArguments(build_dir));
             }
         } else if (tool_name == "lan_agent_prepare_build_dir") {
             const std::string build_dir = ExtractJsonString(request.body, "build_dir");
@@ -6430,7 +7175,7 @@ bool HandleMcpRoute(
                 result = RunCliProfile(
                     config,
                     "prepare_build_dir",
-                    BuildPrepareBuildDirArguments(build_dir, create_if_missing));
+                    BuildPrepareBuildDirArguments(build_dir, config.workspace_root, create_if_missing));
             }
         } else if (tool_name == "lan_agent_build_target") {
             if (g_task_manager == nullptr) {
@@ -6455,7 +7200,7 @@ bool HandleMcpRoute(
                 } else {
                     const std::string task_id = g_task_manager->EnqueueCliProfile(
                         "build_target",
-                        "-BuildDir \"" + build_dir + "\" -Config " + config_name + " -Target " + target);
+                        BuildBuildTargetArguments(build_dir, config_name, target));
                     result = BuildQueuedTaskResult(task_id);
                 }
             }
@@ -6515,8 +7260,7 @@ bool HandleMcpRoute(
                 } else {
                     const std::string task_id = g_task_manager->EnqueueCliProfile(
                         "run_ctest_target",
-                        "-BuildDir \"" + build_dir + "\" -Config " + config_name
-                            + " -TestRegex \"" + test_regex + "\"");
+                        BuildRunCTestTargetArguments(build_dir, config_name, test_regex));
                     result = BuildQueuedTaskResult(task_id);
                 }
             }
@@ -6945,7 +7689,7 @@ CommandResult HandleHttpRoute(
             result.fields["error"] = "build_dir is required";
             return result;
         }
-        return RunCliProfile(config, "check_build_dir", "-BuildDir \"" + build_dir + "\"");
+        return RunCliProfile(config, "check_build_dir", BuildCheckBuildDirArguments(build_dir));
     }
     if (request.method == "POST" && request.path == "/prepare-build-dir") {
         const std::string build_dir = ExtractJsonString(request.body, "build_dir");
@@ -6960,7 +7704,7 @@ CommandResult HandleHttpRoute(
         return RunCliProfile(
             config,
             "prepare_build_dir",
-            BuildPrepareBuildDirArguments(build_dir, create_if_missing));
+            BuildPrepareBuildDirArguments(build_dir, config.workspace_root, create_if_missing));
     }
     if (request.method == "POST" && request.path == "/build-target") {
         CommandResult result;
@@ -6989,7 +7733,7 @@ CommandResult HandleHttpRoute(
         }
         const std::string task_id = g_task_manager->EnqueueCliProfile(
             "build_target",
-            "-BuildDir \"" + build_dir + "\" -Config " + config_name + " -Target " + target);
+            BuildBuildTargetArguments(build_dir, config_name, target));
         return BuildQueuedTaskResult(task_id);
     }
     if (request.method == "POST" && request.path == "/configure-project") {
@@ -7054,8 +7798,7 @@ CommandResult HandleHttpRoute(
         }
         const std::string task_id = g_task_manager->EnqueueCliProfile(
             "run_ctest_target",
-            "-BuildDir \"" + build_dir + "\" -Config " + config_name
-                + " -TestRegex \"" + test_regex + "\"");
+            BuildRunCTestTargetArguments(build_dir, config_name, test_regex));
         return BuildQueuedTaskResult(task_id);
     }
     if (request.method == "POST" && request.path == "/run-cli-profile") {
