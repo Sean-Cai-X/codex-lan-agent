@@ -10,7 +10,9 @@
 #include <cstdio>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <vector>
 #else
@@ -59,6 +61,18 @@ void AppendLogHeader(
     output << "\n";
 }
 
+void AppendLogHeartbeat(
+    const std::string & log_path,
+    unsigned long process_id,
+    long long quiet_sec) {
+    std::ofstream output(log_path, std::ios::out | std::ios::app);
+    output << "[task_heartbeat]\n";
+    output << "timestamp=" << StatusTimeStampText() << "\n";
+    output << "process_id=" << process_id << "\n";
+    output << "quiet_sec=" << quiet_sec << "\n";
+    output << "\n";
+}
+
 std::uintmax_t SafeFileSize(const std::string & path) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
@@ -91,11 +105,22 @@ std::string GetShellFlag() {
 }
 #endif
 
+std::string CompletionReasonFromResult(const ProcessRunResult & result) {
+    if (result.stalled) {
+        return "stall_timeout";
+    }
+    if (result.timed_out) {
+        return "total_timeout";
+    }
+    return result.exit_code == 0 ? "process_exit_0" : "process_exit_nonzero";
+}
+
 bool RunCommandWithLog(
     const std::string & command_line,
     const std::string & working_directory,
     const std::string & log_path,
     int timeout_sec,
+    int stall_timeout_sec,
     ProcessRunResult * result,
     std::string * error_message) {
     if (!result) {
@@ -111,7 +136,13 @@ bool RunCommandWithLog(
     result->started_at = StatusTimeStampText();
     result->last_output_at = result->started_at;
     result->process_id = 0;
+    result->heartbeat_count = 0;
+    result->runtime_sec = 0;
+    result->quiet_sec_at_finish = 0;
+    result->process_output_observed = false;
     result->stalled = false;
+    result->completion_reason.clear();
+    result->timed_out = false;
 
 #ifdef _WIN32
     SECURITY_ATTRIBUTES security_attributes{};
@@ -170,8 +201,8 @@ bool RunCommandWithLog(
 
     const auto started = std::chrono::steady_clock::now();
     auto last_output_change = started;
+    auto last_heartbeat = started;
     std::uintmax_t last_size = SafeFileSize(log_path);
-    const int stall_timeout_sec = 30;
 
     DWORD wait_result = WAIT_TIMEOUT;
     while (true) {
@@ -185,6 +216,7 @@ bool RunCommandWithLog(
         if (current_size != last_size) {
             last_size = current_size;
             last_output_change = now;
+            result->process_output_observed = true;
             result->last_output_at = StatusTimeStampText();
         }
 
@@ -198,12 +230,25 @@ bool RunCommandWithLog(
             }
         }
 
-        const auto quiet_sec =
-            std::chrono::duration_cast<std::chrono::seconds>(now - last_output_change).count();
-        if (quiet_sec >= stall_timeout_sec) {
-            result->stalled = true;
-            KillProcessTreeWindows(result->process_id);
-            break;
+        if (stall_timeout_sec > 0) {
+            const auto quiet_sec =
+                std::chrono::duration_cast<std::chrono::seconds>(now - last_output_change).count();
+            if (quiet_sec >= stall_timeout_sec) {
+                result->stalled = true;
+                KillProcessTreeWindows(result->process_id);
+                break;
+            }
+        } else {
+            const auto heartbeat_sec =
+                std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count();
+            if (heartbeat_sec >= 30) {
+                const auto quiet_sec =
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_output_change).count();
+                AppendLogHeartbeat(log_path, result->process_id, quiet_sec);
+                ++result->heartbeat_count;
+                last_heartbeat = now;
+                last_size = SafeFileSize(log_path);
+            }
         }
     }
 
@@ -216,7 +261,12 @@ bool RunCommandWithLog(
     } else {
         result->exit_code = static_cast<int>(exit_code);
     }
+    const auto finished = std::chrono::steady_clock::now();
+    result->runtime_sec = std::chrono::duration_cast<std::chrono::seconds>(finished - started).count();
+    result->quiet_sec_at_finish =
+        std::chrono::duration_cast<std::chrono::seconds>(finished - last_output_change).count();
     result->finished_at = StatusTimeStampText();
+    result->completion_reason = CompletionReasonFromResult(*result);
 
     CloseHandle(process_info.hThread);
     CloseHandle(process_info.hProcess);
@@ -276,7 +326,11 @@ bool RunCommandWithLog(
     int status = 0;
     result->timed_out = false;
     result->process_id = static_cast<unsigned long>(child_pid);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec > 0 ? timeout_sec : 31536000);
+    const auto started = std::chrono::steady_clock::now();
+    auto last_output_change = started;
+    std::uintmax_t last_size = SafeFileSize(log_path);
+    const auto deadline =
+        started + std::chrono::seconds(timeout_sec > 0 ? timeout_sec : 31536000);
     while (true) {
         const pid_t wait_result = waitpid(child_pid, &status, WNOHANG);
         if (wait_result == child_pid) {
@@ -287,6 +341,13 @@ bool RunCommandWithLog(
                 *error_message = "waitpid failed";
             }
             return false;
+        }
+        const std::uintmax_t current_size = SafeFileSize(log_path);
+        if (current_size != last_size) {
+            last_size = current_size;
+            last_output_change = std::chrono::steady_clock::now();
+            result->process_output_observed = true;
+            result->last_output_at = StatusTimeStampText();
         }
         if (timeout_sec > 0 && std::chrono::steady_clock::now() >= deadline) {
             result->timed_out = true;
@@ -304,7 +365,12 @@ bool RunCommandWithLog(
     } else {
         result->exit_code = -1;
     }
+    const auto finished = std::chrono::steady_clock::now();
+    result->runtime_sec = std::chrono::duration_cast<std::chrono::seconds>(finished - started).count();
+    result->quiet_sec_at_finish =
+        std::chrono::duration_cast<std::chrono::seconds>(finished - last_output_change).count();
     result->finished_at = StatusTimeStampText();
+    result->completion_reason = CompletionReasonFromResult(*result);
     return true;
 #endif
 }
