@@ -84,10 +84,12 @@ typedef void (*ClangAstResultCallback)(
 struct ClangIndexerOptions
 {
     std::string compile_db_dir;
+    std::string compilation_database_path;
     std::string source_file;
     std::string output_json_path;
     std::vector<std::string> extra_include_dirs;
     std::vector<std::string> extra_defines;
+    std::vector<std::string> target_namespaces;
     std::string project_root;
     bool verbose = false;
 };

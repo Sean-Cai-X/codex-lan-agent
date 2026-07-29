@@ -17,6 +17,21 @@ ClangAstParseResult DeserializeAstParseResultFromJson(
 std::string BuildCxScriptFromSchema(
     const ApiSchema & schema);
 
+struct CxScriptValidationResult {
+    bool valid = false;
+    std::vector<std::string> errors;
+    std::vector<std::string> warnings;
+    std::vector<std::string> allowed_constructs;
+    std::vector<std::string> forbidden_constructs;
+    std::string summary;
+};
+
+CxScriptValidationResult ValidateCxScriptSyntax(
+    const std::string & script);
+
+std::string SerializeCxScriptValidationToJson(
+    const CxScriptValidationResult & result);
+
 }
 
 #endif

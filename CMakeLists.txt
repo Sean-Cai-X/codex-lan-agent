@@ -29,6 +29,7 @@ add_executable(codex_lan_agent
   src/ClangIndexerAdapter.cpp
   src/ClangAstVisitor.cpp
   src/ClangAstParser.cpp
+  src/CfGBuilder.cpp
   src/ProcessRunner.cpp
   src/HttpClient.cpp
   src/main.cpp
@@ -45,47 +46,6 @@ target_link_libraries(codex_lan_agent PRIVATE
   Threads::Threads
 )
 
-find_package(Qt6 COMPONENTS Core QUIET)
-if(Qt6_FOUND)
-  set(CODEX_LAN_AGENT_QT_CORE Qt6::Core)
-else()
-  find_package(Qt5 COMPONENTS Core QUIET)
-  if(Qt5_FOUND)
-    set(CODEX_LAN_AGENT_QT_CORE Qt5::Core)
-  endif()
-endif()
-
-if(CODEX_LAN_AGENT_QT_CORE)
-  add_executable(directory_access
-    tools/directory_access/main.cpp
-  )
-  target_link_libraries(directory_access PRIVATE
-    ${CODEX_LAN_AGENT_QT_CORE}
-  )
-
-  add_executable(git_snapshot
-    tools/git_snapshot/main.cpp
-  )
-  target_link_libraries(git_snapshot PRIVATE
-    ${CODEX_LAN_AGENT_QT_CORE}
-  )
-
-  if(CODEX_LAN_AGENT_COPY_TO_ROOT)
-    add_custom_command(TARGET directory_access POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:directory_access>"
-        "${CMAKE_CURRENT_SOURCE_DIR}/directory_access.exe"
-    )
-    add_custom_command(TARGET git_snapshot POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:git_snapshot>"
-        "${CMAKE_CURRENT_SOURCE_DIR}/git_snapshot.exe"
-    )
-  endif()
-else()
-  message(WARNING "Qt Core was not found; git_snapshot helper will not be built")
-endif()
-
 if(WIN32)
   target_compile_definitions(codex_lan_agent PRIVATE
     _CRT_SECURE_NO_WARNINGS
@@ -96,6 +56,7 @@ if(WIN32)
   target_link_libraries(codex_lan_agent PRIVATE
     ws2_32
     winhttp
+    version
   )
 endif()
 
@@ -167,9 +128,8 @@ if(CODEX_LAN_AGENT_ENABLE_CLANG_AST)
       "Please copy LLVM/Clang .lib files to third_party/llvm/lib/.")
   endif()
 
-  set(CODEX_CLANG_AST_SOURCES
-    src/ClangAstVisitor.cpp
-    src/ClangAstParser.cpp
+  file(GLOB CODEX_LLVM_LIBS CONFIGURE_DEPENDS
+    "${CODEX_LLVM_ROOT}/lib/*.lib"
   )
 
   target_include_directories(codex_lan_agent PRIVATE
@@ -177,66 +137,7 @@ if(CODEX_LAN_AGENT_ENABLE_CLANG_AST)
   )
 
   target_link_libraries(codex_lan_agent PRIVATE
-    # Clang Tooling (核心框架)
-    "${CODEX_LLVM_ROOT}/lib/clangTooling.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangToolingCore.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangToolingInclusions.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangToolingRefactoring.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangToolingSyntax.lib"
-    
-    # Clang AST & Frontend
-    "${CODEX_LLVM_ROOT}/lib/clangAST.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangFrontend.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangFrontendTool.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangLex.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangSema.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangParse.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangBasic.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangEdit.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangAnalysis.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangDriver.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangSerialization.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangRewrite.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangRewriteFrontend.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangIndex.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangSupport.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangFormat.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangASTMatchers.lib"
-    
-    # Clang 扩展模块
-    "${CODEX_LLVM_ROOT}/lib/clangARCMigrate.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangCodeGen.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangCrossTU.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangDependencyScanning.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangStaticAnalyzerCore.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangStaticAnalyzerFrontend.lib"
-    
-    # Clang-Tidy (来自 clang-tools-extra)
-    "${CODEX_LLVM_ROOT}/lib/clangTidy.lib"
-    "${CODEX_LLVM_ROOT}/lib/clangTidyMiscModule.lib"
-    
-    # LLVM 核心库 (LLVM 18 更新)
-    "${CODEX_LLVM_ROOT}/lib/LLVMSupport.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMCore.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMTarget.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMMC.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMMCParser.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMObject.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMIRReader.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMAsmParser.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMAsmPrinter.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMCodeGen.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMCodeGenTypes.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMBitReader.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMBitWriter.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMBitstreamReader.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMObjectYAML.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMOption.lib"
-    
-    # LLVM X86 特定库 (替代 LLVMTargetTransformInfo 和 LLVMX86Utils)
-    "${CODEX_LLVM_ROOT}/lib/LLVMX86CodeGen.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMX86Desc.lib"
-    "${CODEX_LLVM_ROOT}/lib/LLVMX86Info.lib"
+    ${CODEX_LLVM_LIBS}
   )
 
   target_compile_definitions(codex_lan_agent PRIVATE

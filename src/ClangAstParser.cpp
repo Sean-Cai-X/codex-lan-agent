@@ -6,6 +6,8 @@
 
 #include <sstream>
 #include <algorithm>
+#include <cctype>
+#include <regex>
 
 namespace codex_lan_agent
 {
@@ -312,24 +314,43 @@ std::string BuildCxScriptFromSchema(const ApiSchema & schema)
     std::ostringstream oss;
 
     oss << "// Generated CxScript from Clang AST Schema\n";
-    oss << "// Module: " << schema.module_name << "\n\n";
-
-    for (const auto & ns : schema.namespaces) {
-        oss << "// Namespace: " << ns << "\n";
+    oss << "// Module: " << schema.module_name << "\n";
+    oss << "// Namespaces: ";
+    for (size_t i = 0; i < schema.namespaces.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << schema.namespaces[i];
     }
+    oss << "\n\n";
 
+    oss << "// === Object Declarations ===\n";
+    for (const auto & cls : schema.classes) {
+        std::string var_name = cls.name;
+        if (!var_name.empty()) {
+            var_name[0] = static_cast<char>(std::tolower(var_name[0]));
+        }
+        oss << cls.name << " " << var_name << ";\n";
+    }
     oss << "\n";
 
+    oss << "// === Global Inputs ===\n";
+    oss << "// int global_roi_x0 = 0;\n";
+    oss << "// int global_roi_y0 = 0;\n";
+    oss << "// int global_roi_x1 = 0;\n";
+    oss << "// int global_roi_y1 = 0;\n";
+    oss << "// double global_threshold = 0.0;\n";
+    oss << "// double global_gap = 0.0;\n\n";
+
+    oss << "// === Method Calls ===\n";
     for (const auto & cls : schema.classes) {
-        oss << "// Class: " << cls.qualified_name << "\n";
-        oss << "// Methods: " << cls.methods.size() << "\n";
+        std::string var_name = cls.name;
+        if (!var_name.empty()) {
+            var_name[0] = static_cast<char>(std::tolower(var_name[0]));
+        }
 
         for (const auto & method : cls.methods) {
-            oss << "//   " << method.name << "(";
+            oss << "// " << var_name << "." << method.name << "(";
             for (size_t i = 0; i < method.params.size(); ++i) {
-                if (i > 0) {
-                    oss << ", ";
-                }
+                if (i > 0) oss << ", ";
                 oss << method.params[i].type.spelling;
                 if (!method.params[i].name.empty()) {
                     oss << " " << method.params[i].name;
@@ -337,12 +358,157 @@ std::string BuildCxScriptFromSchema(const ApiSchema & schema)
             }
             oss << ") -> " << method.return_type.spelling << "\n";
         }
-        oss << "\n";
+    }
+    oss << "\n";
+
+    oss << "// === Free Functions ===\n";
+    for (const auto & func : schema.free_functions) {
+        oss << "// " << func.qualified_name << "(";
+        for (size_t i = 0; i < func.params.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << func.params[i].type.spelling;
+            if (!func.params[i].name.empty()) {
+                oss << " " << func.params[i].name;
+            }
+        }
+        oss << ") -> " << func.return_type.spelling << "\n";
     }
 
-    for (const auto & func : schema.free_functions) {
-        oss << "// Free Function: " << func.qualified_name << "\n";
+    oss << "\n// === Contract ===\n";
+    oss << "// contract.reset();\n";
+    oss << "// if (result) { contract.pass(); } else { contract.fail(); }\n";
+    oss << "// return;\n";
+
+    return oss.str();
+}
+
+CxScriptValidationResult ValidateCxScriptSyntax(
+    const std::string & script)
+{
+    CxScriptValidationResult result;
+
+    static const std::vector<std::string> kForbiddenPatterns = {
+        "\\bauto\\b",
+        "\\bstd::vector\\b",
+        "\\bstd::map\\b",
+        "\\bnew\\s+",
+        "\\bdelete\\b",
+        "\\bfor\\s*\\(",
+        "\\bwhile\\s*\\(",
+        "\\bswitch\\s*\\(",
+        "\\belse\\s+if\\b",
+        "&&.*&&|\\|\\|.*\\|\\|",
+        "\\breturn\\s+[^;]",
+        "\\.open\\s*\\(",
+        "\\.read\\s*\\(",
+        "\\.write\\s*\\(",
+        "cv::",
+        "#include",
+        "\\btemplate\\b",
+        "\\bnamespace\\b",
+        "\\bclass\\s+\\w+\\s*\\{",
+        "\\bstruct\\s+\\w+\\s*\\{",
+    };
+
+    static const std::vector<std::string> kAllowedPatterns = {
+        ";",
+        "\\bint\\s+\\w+",
+        "\\bdouble\\s+\\w+",
+        "\\b[a-zA-Z]\\w*\\s+\\w+\\s*;",
+        "\\w+\\.\\w+\\(",
+        "//",
+        "/\\*",
+        "\\*/",
+        "\\bif\\s*\\(",
+        "\\breturn\\s*;",
+        "\\bcontract\\.",
+        "\\bglobal_\\w+",
+        "=",
+        "\\{",
+        "\\}",
+    };
+
+    size_t forbidden_count = 0;
+    for (const auto & pattern : kForbiddenPatterns) {
+        std::regex re(pattern);
+        auto begin = std::sregex_iterator(script.begin(), script.end(), re);
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            result.forbidden_constructs.push_back(
+                "Forbidden pattern '" + pattern + "' found");
+            forbidden_count++;
+        }
     }
+
+    if (forbidden_count > 0) {
+        result.errors.push_back(
+            "Found " + std::to_string(forbidden_count) + " forbidden CxScript patterns");
+        result.valid = false;
+    } else {
+        result.valid = true;
+        result.allowed_constructs.push_back("No forbidden patterns detected");
+    }
+
+    bool has_object_decl = std::regex_search(script, std::regex(R"([A-Z]\w*\s+\w+\s*;)"));
+    if (has_object_decl) {
+        result.allowed_constructs.push_back("Object declarations present");
+    }
+
+    bool has_contract = std::regex_search(script, std::regex(R"(contract\.)"));
+    if (has_contract) {
+        result.allowed_constructs.push_back("Contract API references present");
+    }
+
+    bool has_return = std::regex_search(script, std::regex(R"(\breturn\s*;)"));
+    if (has_return) {
+        result.allowed_constructs.push_back("Return statement present");
+    }
+
+    bool has_method_call = std::regex_search(script, std::regex(R"(\w+\.\w+\()"));
+    if (has_method_call) {
+        result.allowed_constructs.push_back("Method call references present");
+    }
+
+    bool has_global = std::regex_search(script, std::regex(R"(\bglobal_\w+)"));
+    if (has_global) {
+        result.allowed_constructs.push_back("Global variable references present");
+    }
+
+    result.summary = result.valid
+        ? "CxScript syntax validation PASSED: " +
+            std::to_string(result.allowed_constructs.size()) + " allowed constructs verified"
+        : "CxScript syntax validation FAILED: " +
+            std::to_string(forbidden_count) + " forbidden patterns found";
+
+    return result;
+}
+
+std::string SerializeCxScriptValidationToJson(
+    const CxScriptValidationResult & result)
+{
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"valid\":" << (result.valid ? "true" : "false") << ",";
+    oss << "\"summary\":\"" << EscapeJsonString(result.summary) << "\",";
+
+    auto write_array = [&oss](const std::string & key,
+                              const std::vector<std::string> & items) {
+        oss << "\"" << key << "\":[";
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << "\"" << EscapeJsonString(items[i]) << "\"";
+        }
+        oss << "]";
+    };
+
+    write_array("errors", result.errors);
+    oss << ",";
+    write_array("warnings", result.warnings);
+    oss << ",";
+    write_array("allowed_constructs", result.allowed_constructs);
+    oss << ",";
+    write_array("forbidden_constructs", result.forbidden_constructs);
+    oss << "}";
 
     return oss.str();
 }

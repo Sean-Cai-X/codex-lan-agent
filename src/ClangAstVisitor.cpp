@@ -2,6 +2,11 @@
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+
+#include "clang/Tooling/CompilationDatabase.h"
+#include "clang/Tooling/ArgumentsAdjusters.h"
 
 namespace codex_lan_agent
 {
@@ -200,6 +205,10 @@ bool ClangApiVisitor::VisitFunctionDecl(clang::FunctionDecl * func)
                 }
             }
 
+            if (!IsInTargetNamespace(cls.namespace_name)) {
+                return true;
+            }
+
             ExtractSourceLocation(
                 record->getBeginLoc(),
                 &cls.source_file,
@@ -216,6 +225,12 @@ bool ClangApiVisitor::VisitFunctionDecl(clang::FunctionDecl * func)
         method.qualified_name = qualified_name;
         clang::QualType ret_type = func->getReturnType();
         method.return_type = ConvertTypeInfo(ret_type.getTypePtr());
+        method.is_const = false;
+        method.is_static = false;
+
+        if (const auto * method_decl = clang::dyn_cast<clang::CXXMethodDecl>(func)) {
+            method.is_const = method_decl->isConst();
+        }
 
         if (func->getStorageClass() == clang::SC_Static) {
             method.is_static = true;
@@ -267,6 +282,10 @@ bool ClangApiVisitor::VisitCXXRecordDecl(
                           cls.namespace_name) == namespaces_.end()) {
                 namespaces_.push_back(cls.namespace_name);
             }
+        }
+
+        if (!IsInTargetNamespace(cls.namespace_name)) {
+            return true;
         }
 
         ExtractSourceLocation(
@@ -378,17 +397,21 @@ ClangAstParseResult RunClangAstParserImpl(
         return result;
     }
 
-    std::vector<std::string> target_namespaces;
+    std::vector<std::string> target_namespaces = options.target_namespaces;
+    ClangAstParseResult parsed_result;
 
     struct ActionFactory {
         std::vector<std::string> target_namespaces;
+        ClangAstParseResult * out_result;
         std::unique_ptr<clang::ASTConsumer> newASTConsumer() {
-            return std::make_unique<ClangApiConsumer>(nullptr, target_namespaces);
+            return std::make_unique<ClangApiConsumer>(
+                nullptr, target_namespaces, out_result);
         }
     };
 
     ActionFactory factory;
     factory.target_namespaces = target_namespaces;
+    factory.out_result = &parsed_result;
 
     std::vector<std::string> argv_storage;
     std::vector<const char *> argv;
@@ -428,9 +451,131 @@ ClangAstParseResult RunClangAstParserImpl(
 
     clang::tooling::CommonOptionsParser & op = expected_parser.get();
 
+    std::string compile_db_path = options.compilation_database_path;
+    if (compile_db_path.empty()) {
+        compile_db_path = options.compile_db_dir;
+    }
+
+    std::unique_ptr<clang::tooling::CompilationDatabase> compilation_db;
+    if (!compile_db_path.empty()) {
+        std::string err_msg;
+        compilation_db =
+            clang::tooling::CompilationDatabase::loadFromDirectory(
+                compile_db_path, err_msg);
+    }
+
     clang::tooling::ClangTool tool(
-        op.getCompilations(),
+        compilation_db
+            ? *compilation_db
+            : op.getCompilations(),
         op.getSourcePathList());
+
+    if (!compilation_db) {
+        std::vector<std::string> std_args = {
+            "-std=c++17",
+            "-fsyntax-only"
+        };
+        tool.appendArgumentsAdjuster(
+            clang::tooling::getInsertArgumentAdjuster(
+                std_args,
+                clang::tooling::ArgumentInsertPosition::BEGIN));
+    }
+
+    if (!options.extra_include_dirs.empty()) {
+        std::vector<std::string> include_args;
+        for (const auto & inc : options.extra_include_dirs) {
+            include_args.push_back("-I" + inc);
+        }
+        tool.appendArgumentsAdjuster(
+            clang::tooling::getInsertArgumentAdjuster(
+                include_args,
+                clang::tooling::ArgumentInsertPosition::BEGIN));
+    }
+
+    if (!options.extra_defines.empty()) {
+        std::vector<std::string> define_args;
+        for (const auto & def : options.extra_defines) {
+            define_args.push_back("-D" + def);
+        }
+        tool.appendArgumentsAdjuster(
+            clang::tooling::getInsertArgumentAdjuster(
+                define_args,
+                clang::tooling::ArgumentInsertPosition::BEGIN));
+    }
+
+#ifdef _WIN32
+    {
+        std::vector<std::string> msvc_includes;
+        if (llvm::sys::fs::exists("C:/Program Files/Microsoft Visual Studio")) {
+            std::vector<std::string> versions = { "2022", "2019", "2017" };
+            std::vector<std::string> editions = { "Community", "Professional", "Enterprise" };
+            for (const auto & ver : versions) {
+                for (const auto & ed : editions) {
+                    std::string vc_path = "C:/Program Files/Microsoft Visual Studio/" +
+                        ver + "/" + ed + "/VC/Tools/MSVC";
+                    if (llvm::sys::fs::exists(vc_path)) {
+                        std::error_code ec;
+                        for (auto it = llvm::sys::fs::directory_iterator(vc_path, ec);
+                             it != llvm::sys::fs::directory_iterator(); it.increment(ec)) {
+                            std::string dir_path = it->path();
+                            std::string include_path = dir_path + "/include";
+                            if (llvm::sys::fs::exists(include_path)) {
+                                msvc_includes.push_back(include_path);
+                            }
+                            std::string atlmfc_path = dir_path + "/atlmfc/include";
+                            if (llvm::sys::fs::exists(atlmfc_path)) {
+                                msvc_includes.push_back(atlmfc_path);
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (!msvc_includes.empty()) break;
+            }
+        }
+
+        std::string sdk_include = "C:/Program Files (x86)/Windows Kits/10/Include";
+        if (llvm::sys::fs::exists(sdk_include)) {
+            std::error_code ec;
+            std::string latest_sdk;
+            for (auto it = llvm::sys::fs::directory_iterator(sdk_include, ec);
+                 it != llvm::sys::fs::directory_iterator(); it.increment(ec)) {
+                std::string dir_path = it->path();
+                std::string ver = llvm::sys::path::filename(dir_path).str();
+                if (ver.size() >= 4 && ver[0] >= '0' && ver[0] <= '9') {
+                    if (latest_sdk.empty() || ver > latest_sdk) {
+                        latest_sdk = ver;
+                    }
+                }
+            }
+            if (!latest_sdk.empty()) {
+                std::string ucrt_path = sdk_include + "/" + latest_sdk + "/ucrt";
+                if (llvm::sys::fs::exists(ucrt_path)) {
+                    msvc_includes.push_back(ucrt_path);
+                }
+                std::string um_path = sdk_include + "/" + latest_sdk + "/um";
+                if (llvm::sys::fs::exists(um_path)) {
+                    msvc_includes.push_back(um_path);
+                }
+                std::string shared_path = sdk_include + "/" + latest_sdk + "/shared";
+                if (llvm::sys::fs::exists(shared_path)) {
+                    msvc_includes.push_back(shared_path);
+                }
+            }
+        }
+
+        if (!msvc_includes.empty()) {
+            std::vector<std::string> msvc_args;
+            for (const auto & inc : msvc_includes) {
+                msvc_args.push_back("-I" + inc);
+            }
+            tool.appendArgumentsAdjuster(
+                clang::tooling::getInsertArgumentAdjuster(
+                    msvc_args,
+                    clang::tooling::ArgumentInsertPosition::BEGIN));
+        }
+    }
+#endif
 
     int run_result = tool.run(
         clang::tooling::newFrontendActionFactory(&factory).get());
@@ -442,6 +587,7 @@ ClangAstParseResult RunClangAstParserImpl(
         return result;
     }
 
+    result = parsed_result;
     return result;
 }
 

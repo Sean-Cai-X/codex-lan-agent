@@ -39,6 +39,7 @@
 #include "ClangIndexerAdapter.h"
 #include "ClangAstVisitor.h"
 #include "ClangAstParser.h"
+#include "ClangAstTool.h"
 
 bool ReadWholeFile(
     const std::filesystem::path & path,
@@ -4290,8 +4291,6 @@ int RunServer(const AgentConfig & config) {
     return 0;
 }
 
-}  // namespace
-
 CommandResult RunClangIndexerResult(
     const AgentConfig & config,
     const std::string & source_file,
@@ -4430,6 +4429,8 @@ CommandResult RunClangIndexerResult(
 
     return result;
 }
+
+}  // namespace
 
 int main(int argc, char ** argv) {
     try {

@@ -1021,6 +1021,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         }},
         {"lan_agent_run_clang_ast_parser", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::BuildRunClangAstParserResult(config, params);
+        }},
+        {"lan_agent_build_cfg", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildRunCfgResult(config, params);
         }}
     };
     return handlers;
@@ -1171,7 +1174,8 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_cmm_get_architecture", "cmm_bridge", "cmm_get_architecture", "low", "cmm,bridge,read_only"},
         {"lan_agent_cmm_detect_changes", "cmm_bridge", "cmm_detect_changes", "medium", "cmm,bridge,read_only"},
         {"lan_agent_cmm_index_repository", "cmm_bridge", "cmm_index_repository", "medium", "cmm,bridge,write"},
-        {"lan_agent_run_clang_ast_parser", "clang_ast_parse", "clang_ast_parser", "medium", "clang,ast,parse,analysis"}
+        {"lan_agent_run_clang_ast_parser", "clang_ast_parse", "clang_ast_parser", "medium", "clang,ast,parse,analysis"},
+        {"lan_agent_build_cfg", "clang_cfg_build", "clang_cfg_builder", "medium", "clang,cfg,control_flow,graph,analysis"}
     };
     return rules;
 }

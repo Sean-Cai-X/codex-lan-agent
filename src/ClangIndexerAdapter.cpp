@@ -1,6 +1,7 @@
 #include "ClangIndexerAdapter.h"
 #include "ClangAstVisitor.h"
 #include "ClangAstParser.h"
+#include "CfGBuilder.h"
 #include "comm.h"
 #include "StructuredJsonOperations.h"
 #include "JsonRequestView.h"
@@ -166,24 +167,6 @@ std::string FindClangIndexerExecutablePath(
     return std::string();
 }
 
-ClangAstParseResult RunClangAstParser(
-    const ClangIndexerOptions & options)
-{
-    ClangAstParseResult result = RunClangAstParserImpl(options);
-    return result;
-}
-
-void SetClangAstResultCallback(
-    ClangAstResultCallback callback,
-    void * user_data)
-{
-    static ClangAstResultCallback s_callback = nullptr;
-    static void * s_user_data = nullptr;
-    s_callback = callback;
-    s_user_data = user_data;
-}
-}
-
 CommandResult BuildRunClangAstParserResult(
     const ::codex_lan_agent::AgentConfig & config,
     const ::JsonRequestView & params)
@@ -195,9 +178,34 @@ CommandResult BuildRunClangAstParserResult(
     ClangIndexerOptions options;
     options.source_file = params.GetString("source_file");
     options.compile_db_dir = params.GetString("compile_db_dir");
+    options.compilation_database_path = params.GetString("compilation_database_path");
     options.output_json_path = params.GetString("output_json_path");
     options.project_root = params.GetString("project_root");
     options.verbose = params.GetBool("verbose", false);
+
+    std::string target_ns_json = params.GetString("target_namespaces");
+    if (!target_ns_json.empty()) {
+        std::string cleaned = target_ns_json;
+        if (!cleaned.empty() && cleaned.front() == '[') {
+            cleaned = cleaned.substr(1);
+        }
+        if (!cleaned.empty() && cleaned.back() == ']') {
+            cleaned.pop_back();
+        }
+        std::istringstream iss(cleaned);
+        std::string item;
+        while (std::getline(iss, item, ',')) {
+            while (!item.empty() && (item.front() == '"' || item.front() == ' ')) {
+                item.erase(item.begin());
+            }
+            while (!item.empty() && (item.back() == '"' || item.back() == ' ')) {
+                item.pop_back();
+            }
+            if (!item.empty()) {
+                options.target_namespaces.push_back(item);
+            }
+        }
+    }
 
     std::string include_dirs_json = params.GetString("extra_include_dirs");
     if (!include_dirs_json.empty()) {
@@ -296,6 +304,13 @@ CommandResult BuildRunClangAstParserResult(
     std::string json_output = SerializeAstParseResultToJson(ast_result);
     result.fields["ast_json"] = json_output;
 
+    std::string cxscript_output = BuildCxScriptFromSchema(ast_result.schema);
+    result.fields["generated_cxscript"] = cxscript_output;
+
+    CxScriptValidationResult validation = ValidateCxScriptSyntax(cxscript_output);
+    result.fields["generated_cxscript_valid"] = validation.valid ? "true" : "false";
+    result.fields["generated_cxscript_validation"] = SerializeCxScriptValidationToJson(validation);
+
     if (!options.output_json_path.empty()) {
         result.fields["output_json_path"] = options.output_json_path;
     }
@@ -305,7 +320,90 @@ CommandResult BuildRunClangAstParserResult(
         std::to_string(ast_result.schema.free_functions.size()) + " functions, " +
         std::to_string(ast_result.call_refs.size()) + " call refs";
 
-    result.fields["next_action"] = "Use ast_json field to access parsed API schema";
+    result.fields["next_action"] = validation.valid
+        ? "generated_cxscript is syntactically valid CxScript. Use it as a template for writing cxsc test scripts."
+        : "generated_cxscript has syntax issues. Check generated_cxscript_validation for details.";
 
     return result;
+}
+
+CommandResult BuildRunCfgResult(
+    const ::codex_lan_agent::AgentConfig & config,
+    const ::JsonRequestView & params)
+{
+    using namespace ::codex_lan_agent;
+
+    CommandResult result;
+
+    ClangIndexerOptions options;
+    options.source_file = params.GetString("source_file");
+    options.compile_db_dir = params.GetString("compile_db_dir");
+    options.compilation_database_path = params.GetString("compilation_database_path");
+    options.verbose = params.GetBool("verbose", false);
+
+    std::string extra_includes_json = params.GetString("extra_include_dirs");
+    if (!extra_includes_json.empty()) {
+        std::string cleaned = extra_includes_json;
+        if (!cleaned.empty() && cleaned.front() == '[') cleaned = cleaned.substr(1);
+        if (!cleaned.empty() && cleaned.back() == ']') cleaned.pop_back();
+        std::istringstream iss(cleaned);
+        std::string token;
+        while (std::getline(iss, token, ',')) {
+            token.erase(0, token.find_first_not_of(" \t\""));
+            token.erase(token.find_last_not_of(" \t\"") + 1);
+            if (!token.empty()) {
+                options.extra_include_dirs.push_back(token);
+            }
+        }
+    }
+
+    result.fields["source_file"] = options.source_file;
+    result.fields["compile_db_dir"] = options.compile_db_dir;
+
+    CfgBuildResult cfg_result = RunCfgBuilder(options);
+
+    if (!cfg_result.success) {
+        result.ok = false;
+        result.exit_code = 500;
+        result.fields["status"] = "failed";
+        result.fields["error"] = cfg_result.error;
+        result.fields["summary"] = "CFG construction failed: " + cfg_result.error;
+        result.fields["build_time_ms"] = std::to_string(cfg_result.build_time_ms);
+        return result;
+    }
+
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["status"] = "success";
+    result.fields["cfg_json"] = SerializeCfgBuildResultToJson(cfg_result);
+    result.fields["cfg_dot"] = SerializeCfgToDot(cfg_result, params.GetString("function_name"));
+    result.fields["total_functions"] = std::to_string(cfg_result.total_functions);
+    result.fields["total_blocks"] = std::to_string(cfg_result.total_blocks);
+    result.fields["total_edges"] = std::to_string(cfg_result.total_edges);
+    result.fields["build_time_ms"] = std::to_string(cfg_result.build_time_ms);
+
+    std::ostringstream summary;
+    summary << "CFG built: "
+            << cfg_result.total_functions << " functions, "
+            << cfg_result.total_blocks << " blocks, "
+            << cfg_result.total_edges << " edges";
+    result.fields["summary"] = summary.str();
+    result.fields["next_action"] = "Use cfg_json for detailed block/edge structure. Build call graph next.";
+
+    return result;
+}
+}
+
+CommandResult BuildRunClangAstParserResult(
+    const ::codex_lan_agent::AgentConfig & config,
+    const ::JsonRequestView & params)
+{
+    return ::codex_lan_agent::BuildRunClangAstParserResult(config, params);
+}
+
+CommandResult BuildRunCfgResult(
+    const ::codex_lan_agent::AgentConfig & config,
+    const ::JsonRequestView & params)
+{
+    return ::codex_lan_agent::BuildRunCfgResult(config, params);
 }

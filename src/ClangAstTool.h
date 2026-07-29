@@ -8,4 +8,8 @@ CommandResult BuildRunClangAstParserResult(
     const ::codex_lan_agent::AgentConfig & config,
     const ::JsonRequestView & params);
 
+CommandResult BuildRunCfgResult(
+    const ::codex_lan_agent::AgentConfig & config,
+    const ::JsonRequestView & params);
+
 #endif

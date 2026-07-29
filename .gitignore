@@ -1,0 +1,53 @@
+# Build directories
+build/
+build01/
+builddir_guard/
+build_local_verify/
+build_ninja_verify/
+builddir_guard/
+
+# Binary files
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.zip
+*.tar.gz
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test output
+test_*_output*
+*.dot
+
+# Configuration files (local)
+*.cfg
+!codex_lan_agent.cfg
+
+# Data files
+*.jsonl
+!package.json
+
+# Upload files
+uploads/

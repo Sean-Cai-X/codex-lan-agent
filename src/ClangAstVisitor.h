@@ -23,9 +23,13 @@
 namespace codex_lan_agent
 {
 
+class ClangApiConsumer;
+
 class ClangApiVisitor
     : public clang::RecursiveASTVisitor<ClangApiVisitor>
 {
+    friend class ClangApiConsumer;
+
 public:
     explicit ClangApiVisitor(clang::ASTContext * ctx)
         : ctx_(ctx)
@@ -78,21 +82,29 @@ class ClangApiConsumer : public clang::ASTConsumer
 public:
     explicit ClangApiConsumer(
         clang::ASTContext * ctx,
-        const std::vector<std::string> & target_namespaces)
-        : visitor_(ctx)
+        const std::vector<std::string> & target_namespaces,
+        ClangAstParseResult * out_result = nullptr)
+        : visitor_(ctx), out_result_(out_result)
     {
         visitor_.SetTargetNamespaces(target_namespaces);
     }
 
     void HandleTranslationUnit(clang::ASTContext & ctx) override
     {
+        visitor_.ctx_ = &ctx;
         visitor_.TraverseDecl(ctx.getTranslationUnitDecl());
+        if (out_result_) {
+            *out_result_ = visitor_.GetResult();
+        }
     }
 
     ClangApiVisitor & GetVisitor() { return visitor_; }
+    ClangAstParseResult GetParseResult() const { return parsed_result_; }
 
 private:
     ClangApiVisitor visitor_;
+    ClangAstParseResult parsed_result_;
+    ClangAstParseResult * out_result_;
 };
 
 class ClangApiAction : public clang::ASTFrontendAction
