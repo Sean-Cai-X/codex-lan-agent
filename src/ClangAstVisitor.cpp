@@ -451,17 +451,31 @@ ClangAstParseResult RunClangAstParserImpl(
 
     clang::tooling::CommonOptionsParser & op = expected_parser.get();
 
-    std::string compile_db_path = options.compilation_database_path;
-    if (compile_db_path.empty()) {
-        compile_db_path = options.compile_db_dir;
+    std::unique_ptr<clang::tooling::CompilationDatabase> compilation_db;
+    std::string compile_db_dir;
+    std::string compile_db_file_path;
+    std::string compile_db_error;
+    if (!ResolveCompilationDatabaseLocation(
+            options,
+            &compile_db_dir,
+            &compile_db_file_path,
+            &compile_db_error)) {
+        result.success = false;
+        result.error = compile_db_error;
+        return result;
     }
 
-    std::unique_ptr<clang::tooling::CompilationDatabase> compilation_db;
-    if (!compile_db_path.empty()) {
+    if (!compile_db_dir.empty()) {
         std::string err_msg;
         compilation_db =
             clang::tooling::CompilationDatabase::loadFromDirectory(
-                compile_db_path, err_msg);
+                compile_db_dir, err_msg);
+        if (!compilation_db) {
+            result.success = false;
+            result.error = "Failed to load compilation database from: " +
+                compile_db_dir + " - " + err_msg;
+            return result;
+        }
     }
 
     clang::tooling::ClangTool tool(
@@ -504,7 +518,7 @@ ClangAstParseResult RunClangAstParserImpl(
     }
 
 #ifdef _WIN32
-    {
+    if (!compilation_db) {
         std::vector<std::string> msvc_includes;
         if (llvm::sys::fs::exists("C:/Program Files/Microsoft Visual Studio")) {
             std::vector<std::string> versions = { "2022", "2019", "2017" };

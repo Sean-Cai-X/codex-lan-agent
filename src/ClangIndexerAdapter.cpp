@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 
 namespace codex_lan_agent
@@ -48,6 +49,84 @@ bool FileExists(const std::string & path)
     std::error_code ec;
     return std::filesystem::exists(path, ec);
 }
+
+std::string NormalizePathString(const std::filesystem::path & path)
+{
+    std::error_code ec;
+    const std::filesystem::path weak = std::filesystem::weakly_canonical(path, ec);
+    return ec ? path.lexically_normal().string() : weak.string();
+}
+}
+
+bool ResolveCompilationDatabaseLocation(
+    const ClangIndexerOptions & options,
+    std::string * resolved_directory,
+    std::string * resolved_file_path,
+    std::string * error_message)
+{
+    if (resolved_directory != nullptr) {
+        resolved_directory->clear();
+    }
+    if (resolved_file_path != nullptr) {
+        resolved_file_path->clear();
+    }
+    if (error_message != nullptr) {
+        error_message->clear();
+    }
+
+    std::string candidate = options.compilation_database_path;
+    if (candidate.empty()) {
+        candidate = options.compile_db_dir;
+    }
+    if (candidate.empty()) {
+        return true;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path raw_path(candidate);
+    if (!std::filesystem::exists(raw_path, ec) || ec) {
+        if (error_message != nullptr) {
+            *error_message = "compilation database path does not exist: " + candidate;
+        }
+        return false;
+    }
+
+    std::filesystem::path directory_path;
+    std::filesystem::path file_path;
+    if (std::filesystem::is_regular_file(raw_path, ec) && !ec) {
+        if (raw_path.filename() != "compile_commands.json") {
+            if (error_message != nullptr) {
+                *error_message =
+                    "compilation_database_path must point to compile_commands.json: " + candidate;
+            }
+            return false;
+        }
+        file_path = raw_path;
+        directory_path = raw_path.parent_path();
+    } else if (std::filesystem::is_directory(raw_path, ec) && !ec) {
+        directory_path = raw_path;
+        file_path = raw_path / "compile_commands.json";
+        if (!std::filesystem::exists(file_path, ec) || ec) {
+            if (error_message != nullptr) {
+                *error_message =
+                    "compile_commands.json was not found in directory: " + candidate;
+            }
+            return false;
+        }
+    } else {
+        if (error_message != nullptr) {
+            *error_message = "invalid compilation database path: " + candidate;
+        }
+        return false;
+    }
+
+    if (resolved_directory != nullptr) {
+        *resolved_directory = NormalizePathString(directory_path);
+    }
+    if (resolved_file_path != nullptr) {
+        *resolved_file_path = NormalizePathString(file_path);
+    }
+    return true;
 }
 
 bool BuildClangIndexerCommand(
@@ -66,9 +145,19 @@ bool BuildClangIndexerCommand(
     args->push_back("--source");
     args->push_back(options.source_file);
 
-    if (!options.compile_db_dir.empty()) {
+    std::string resolved_compile_db_dir;
+    std::string resolved_compile_db_file;
+    if (!ResolveCompilationDatabaseLocation(
+            options,
+            &resolved_compile_db_dir,
+            &resolved_compile_db_file,
+            nullptr)) {
+        return false;
+    }
+
+    if (!resolved_compile_db_dir.empty()) {
         args->push_back("--compile-db");
-        args->push_back(options.compile_db_dir);
+        args->push_back(resolved_compile_db_dir);
     }
 
     if (!options.output_json_path.empty()) {
@@ -267,6 +356,32 @@ CommandResult BuildRunClangAstParserResult(
         return result;
     }
 
+    std::string resolved_compile_db_dir;
+    std::string resolved_compile_db_file;
+    std::string compile_db_error;
+    if (!ResolveCompilationDatabaseLocation(
+            options,
+            &resolved_compile_db_dir,
+            &resolved_compile_db_file,
+            &compile_db_error)) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = compile_db_error;
+        result.fields["result"] = "parse_blocked";
+        result.fields["preflight_status"] = "blocked";
+        result.fields["preflight_reason_code"] = "invalid_compilation_database";
+        result.fields["summary"] = "Clang AST parse blocked: invalid compilation database input";
+        result.fields["next_action"] =
+            "provide compile_db_dir pointing to a directory containing compile_commands.json, or compilation_database_path pointing to the compile_commands.json file";
+        return result;
+    }
+    if (!resolved_compile_db_dir.empty()) {
+        options.compile_db_dir = resolved_compile_db_dir;
+        options.compilation_database_path = resolved_compile_db_file;
+        result.fields["resolved_compile_db_dir"] = resolved_compile_db_dir;
+        result.fields["resolved_compilation_database_path"] = resolved_compile_db_file;
+    }
+
     ClangAstParseResult ast_result = RunClangAstParser(options);
 
     if (!ast_result.success) {
@@ -313,6 +428,30 @@ CommandResult BuildRunClangAstParserResult(
 
     if (!options.output_json_path.empty()) {
         result.fields["output_json_path"] = options.output_json_path;
+        std::ofstream output(options.output_json_path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            result.ok = false;
+            result.exit_code = 500;
+            result.fields["error"] = "failed to open output_json_path for writing";
+            result.fields["result"] = "parse_failed";
+            result.fields["preflight_status"] = "failed";
+            result.fields["preflight_reason_code"] = "output_json_write_failed";
+            result.fields["summary"] = "Clang AST parse failed while writing output_json_path";
+            return result;
+        }
+        output << json_output;
+        output.close();
+        result.fields["output_json_written"] = output.good() ? "true" : "false";
+        if (!output.good()) {
+            result.ok = false;
+            result.exit_code = 500;
+            result.fields["error"] = "failed to write parser JSON to output_json_path";
+            result.fields["result"] = "parse_failed";
+            result.fields["preflight_status"] = "failed";
+            result.fields["preflight_reason_code"] = "output_json_write_failed";
+            result.fields["summary"] = "Clang AST parse failed while writing output_json_path";
+            return result;
+        }
     }
 
     result.fields["summary"] = "Clang AST parsed successfully: " +
@@ -340,6 +479,7 @@ CommandResult BuildRunCfgResult(
     options.compile_db_dir = params.GetString("compile_db_dir");
     options.compilation_database_path = params.GetString("compilation_database_path");
     options.verbose = params.GetBool("verbose", false);
+    options.output_json_path = params.GetString("output_json_path");
 
     std::string extra_includes_json = params.GetString("extra_include_dirs");
     if (!extra_includes_json.empty()) {
@@ -359,6 +499,32 @@ CommandResult BuildRunCfgResult(
 
     result.fields["source_file"] = options.source_file;
     result.fields["compile_db_dir"] = options.compile_db_dir;
+
+    std::string resolved_compile_db_dir;
+    std::string resolved_compile_db_file;
+    std::string compile_db_error;
+    if (!ResolveCompilationDatabaseLocation(
+            options,
+            &resolved_compile_db_dir,
+            &resolved_compile_db_file,
+            &compile_db_error)) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["status"] = "blocked";
+        result.fields["error"] = compile_db_error;
+        result.fields["preflight_status"] = "blocked";
+        result.fields["preflight_reason_code"] = "invalid_compilation_database";
+        result.fields["summary"] = "CFG construction blocked: invalid compilation database input";
+        result.fields["next_action"] =
+            "provide compile_db_dir pointing to a directory containing compile_commands.json, or compilation_database_path pointing to the compile_commands.json file";
+        return result;
+    }
+    if (!resolved_compile_db_dir.empty()) {
+        options.compile_db_dir = resolved_compile_db_dir;
+        options.compilation_database_path = resolved_compile_db_file;
+        result.fields["resolved_compile_db_dir"] = resolved_compile_db_dir;
+        result.fields["resolved_compilation_database_path"] = resolved_compile_db_file;
+    }
 
     CfgBuildResult cfg_result = RunCfgBuilder(options);
 
@@ -381,6 +547,32 @@ CommandResult BuildRunCfgResult(
     result.fields["total_blocks"] = std::to_string(cfg_result.total_blocks);
     result.fields["total_edges"] = std::to_string(cfg_result.total_edges);
     result.fields["build_time_ms"] = std::to_string(cfg_result.build_time_ms);
+    result.fields["preflight_status"] = "ready";
+    if (!options.output_json_path.empty()) {
+        result.fields["output_json_path"] = options.output_json_path;
+        std::ofstream output(options.output_json_path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            result.ok = false;
+            result.exit_code = 500;
+            result.fields["status"] = "failed";
+            result.fields["error"] = "failed to open output_json_path for writing";
+            result.fields["summary"] = "CFG construction failed while writing output_json_path";
+            result.fields["preflight_reason_code"] = "output_json_write_failed";
+            return result;
+        }
+        output << result.fields["cfg_json"];
+        output.close();
+        result.fields["output_json_written"] = output.good() ? "true" : "false";
+        if (!output.good()) {
+            result.ok = false;
+            result.exit_code = 500;
+            result.fields["status"] = "failed";
+            result.fields["error"] = "failed to write cfg_json to output_json_path";
+            result.fields["summary"] = "CFG construction failed while writing output_json_path";
+            result.fields["preflight_reason_code"] = "output_json_write_failed";
+            return result;
+        }
+    }
 
     std::ostringstream summary;
     summary << "CFG built: "

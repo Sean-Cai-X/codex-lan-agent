@@ -104,6 +104,12 @@ struct ClangIndexerResult
     int elapsed_ms = 0;
 };
 
+bool ResolveCompilationDatabaseLocation(
+    const ClangIndexerOptions & options,
+    std::string * resolved_directory,
+    std::string * resolved_file_path,
+    std::string * error_message);
+
 bool BuildClangIndexerCommand(
     const std::string & indexer_path,
     const ClangIndexerOptions & options,
