@@ -38,6 +38,9 @@ public:
 
     bool VisitFunctionDecl(clang::FunctionDecl * func);
     bool VisitCXXRecordDecl(clang::CXXRecordDecl * record);
+    bool TraverseFunctionDecl(clang::FunctionDecl * func);
+    bool VisitVarDecl(clang::VarDecl * var);
+    bool VisitBinaryOperator(clang::BinaryOperator * op);
     bool VisitCallExpr(clang::CallExpr * call);
     bool VisitDeclRefExpr(clang::DeclRefExpr * ref);
     bool VisitMemberExpr(clang::MemberExpr * member);
@@ -60,6 +63,12 @@ private:
         std::string * file,
         int * line,
         int * col) const;
+    std::string ExtractAssignedSymbol(const clang::Expr * expr) const;
+    void RecordDataFlowRef(
+        const std::string & symbol,
+        const std::string & access_kind,
+        const std::string & stmt_kind,
+        const clang::SourceLocation & loc);
 
 private:
     clang::ASTContext * ctx_;
@@ -68,6 +77,7 @@ private:
     std::vector<ClangClassInfo> classes_;
     std::vector<ClangMethodInfo> free_functions_;
     std::vector<ClangCallRef> call_refs_;
+    std::vector<ClangDataFlowRef> data_flow_refs_;
     std::vector<std::string> namespaces_;
 
     std::unordered_map<std::string, size_t> class_index_;
@@ -75,6 +85,7 @@ private:
 
     std::string current_function_name_;
     std::string current_class_name_;
+    std::string current_dataflow_function_name_;
 };
 
 class ClangApiConsumer : public clang::ASTConsumer

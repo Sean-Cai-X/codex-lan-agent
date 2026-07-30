@@ -193,6 +193,31 @@ void WriteCallRefJson(
     oss << "}";
 }
 
+void WriteDataFlowRefJson(
+    std::ostringstream & oss,
+    const ClangDataFlowRef & ref,
+    int indent)
+{
+    WriteIndent(oss, indent);
+    oss << "{\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"symbol\": \"" << EscapeJsonString(ref.symbol) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"access_kind\": \"" << EscapeJsonString(ref.access_kind) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"function_name\": \"" << EscapeJsonString(ref.function_name) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"stmt_kind\": \"" << EscapeJsonString(ref.stmt_kind) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"source_file\": \"" << EscapeJsonString(ref.source_file) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"source_line\": " << ref.source_line << ",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"source_col\": " << ref.source_col << "\n";
+    WriteIndent(oss, indent);
+    oss << "}";
+}
+
 }
 
 ClangAstParseResult RunClangAstParser(
@@ -262,6 +287,16 @@ std::string SerializeAstParseResultToJson(
     for (size_t i = 0; i < result.call_refs.size(); ++i) {
         WriteCallRefJson(oss, result.call_refs[i], 2);
         if (i + 1 < result.call_refs.size()) {
+            oss << ",";
+        }
+        oss << "\n";
+    }
+    oss << "  ],\n";
+
+    oss << "  \"data_flow_refs\": [\n";
+    for (size_t i = 0; i < result.data_flow_refs.size(); ++i) {
+        WriteDataFlowRefJson(oss, result.data_flow_refs[i], 2);
+        if (i + 1 < result.data_flow_refs.size()) {
             oss << ",";
         }
         oss << "\n";

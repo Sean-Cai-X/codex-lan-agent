@@ -67,12 +67,24 @@ struct ClangCallRef
     int source_col = 0;
 };
 
+struct ClangDataFlowRef
+{
+    std::string symbol;
+    std::string access_kind;
+    std::string function_name;
+    std::string stmt_kind;
+    std::string source_file;
+    int source_line = 0;
+    int source_col = 0;
+};
+
 struct ClangAstParseResult
 {
     bool success = false;
     std::string error;
     ApiSchema schema;
     std::vector<ClangCallRef> call_refs;
+    std::vector<ClangDataFlowRef> data_flow_refs;
     std::vector<std::string> target_namespaces;
     int elapsed_ms = 0;
 };

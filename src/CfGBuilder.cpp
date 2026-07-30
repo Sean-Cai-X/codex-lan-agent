@@ -140,6 +140,7 @@ struct CfgExtractionVisitor : public clang::RecursiveASTVisitor<CfgExtractionVis
     std::vector<CfgFunctionInfo> functions_;
     std::string source_file_;
     std::string target_source_file_;
+    std::set<std::string> emitted_function_keys_;
 
     bool VisitFunctionDecl(clang::FunctionDecl * func)
     {
@@ -190,6 +191,14 @@ struct CfgExtractionVisitor : public clang::RecursiveASTVisitor<CfgExtractionVis
 
         info.source_file = ExtractSourceFile(*ctx_, body);
         info.source_line = ExtractSourceLine(*ctx_, body);
+
+        const std::string function_key =
+            info.qualified_name + "@" + NormalizeComparablePath(info.source_file) +
+            ":" + std::to_string(info.source_line);
+        if (emitted_function_keys_.find(function_key) != emitted_function_keys_.end()) {
+            return true;
+        }
+        emitted_function_keys_.insert(function_key);
 
         clang::CFG::BuildOptions opts;
         opts.PruneTriviallyFalseEdges = true;

@@ -1024,6 +1024,27 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         }},
         {"lan_agent_build_cfg", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::BuildRunCfgResult(config, params);
+        }},
+        {"lan_agent_query_cfg_artifact", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildQueryCfgArtifactResult(config, params);
+        }},
+        {"lan_agent_build_call_graph", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildRunCallGraphResult(config, params);
+        }},
+        {"lan_agent_build_dfg", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildRunDfgResult(config, params);
+        }},
+        {"lan_agent_query_call_graph_artifact", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildQueryCallGraphArtifactResult(config, params);
+        }},
+        {"lan_agent_query_dfg_artifact", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildQueryDfgArtifactResult(config, params);
+        }},
+        {"lan_agent_build_program_slice", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildRunProgramSliceResult(config, params);
+        }},
+        {"lan_agent_query_program_slice_artifact", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::BuildQueryProgramSliceArtifactResult(config, params);
         }}
     };
     return handlers;
@@ -1175,7 +1196,14 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_cmm_detect_changes", "cmm_bridge", "cmm_detect_changes", "medium", "cmm,bridge,read_only"},
         {"lan_agent_cmm_index_repository", "cmm_bridge", "cmm_index_repository", "medium", "cmm,bridge,write"},
         {"lan_agent_run_clang_ast_parser", "clang_ast_parse", "clang_ast_parser", "medium", "clang,ast,parse,analysis"},
-        {"lan_agent_build_cfg", "clang_cfg_build", "clang_cfg_builder", "medium", "clang,cfg,control_flow,graph,analysis"}
+        {"lan_agent_build_cfg", "clang_cfg_build", "clang_cfg_builder", "medium", "clang,cfg,control_flow,graph,analysis"},
+        {"lan_agent_query_cfg_artifact", "clang_cfg_artifact_query", "clang_cfg_artifact_query", "low", "clang,cfg,artifact,query,read_only"},
+        {"lan_agent_build_call_graph", "clang_call_graph_build", "clang_call_graph_builder", "medium", "clang,call_graph,call_refs,analysis"},
+        {"lan_agent_build_dfg", "clang_dfg_build", "clang_dfg_builder", "medium", "clang,dfg,data_flow,def_use,analysis"},
+        {"lan_agent_query_call_graph_artifact", "clang_call_graph_artifact_query", "clang_call_graph_artifact_query", "low", "clang,call_graph,artifact,query,read_only"},
+        {"lan_agent_query_dfg_artifact", "clang_dfg_artifact_query", "clang_dfg_artifact_query", "low", "clang,dfg,artifact,query,read_only"},
+        {"lan_agent_build_program_slice", "clang_program_slice_build", "clang_program_slicer", "medium", "clang,program_slicing,dfg,analysis"},
+        {"lan_agent_query_program_slice_artifact", "clang_program_slice_artifact_query", "clang_program_slice_artifact_query", "low", "clang,program_slicing,artifact,query,read_only"}
     };
     return rules;
 }

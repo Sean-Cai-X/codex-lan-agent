@@ -127,6 +127,66 @@ void ClangApiVisitor::ExtractSourceLocation(
     *col = ploc.getColumn();
 }
 
+std::string ClangApiVisitor::ExtractAssignedSymbol(const clang::Expr * expr) const
+{
+    if (!expr) {
+        return {};
+    }
+
+    const clang::Expr * stripped = expr->IgnoreParenImpCasts();
+    if (const auto * decl_ref = clang::dyn_cast<clang::DeclRefExpr>(stripped)) {
+        const clang::NamedDecl * decl = decl_ref->getDecl();
+        return decl ? decl->getNameAsString() : std::string();
+    }
+    if (const auto * member_expr = clang::dyn_cast<clang::MemberExpr>(stripped)) {
+        const clang::NamedDecl * decl = member_expr->getMemberDecl();
+        return decl ? decl->getNameAsString() : std::string();
+    }
+    if (const auto * array_subscript = clang::dyn_cast<clang::ArraySubscriptExpr>(stripped)) {
+        return ExtractAssignedSymbol(array_subscript->getBase());
+    }
+    if (const auto * unary = clang::dyn_cast<clang::UnaryOperator>(stripped)) {
+        return ExtractAssignedSymbol(unary->getSubExpr());
+    }
+    return {};
+}
+
+void ClangApiVisitor::RecordDataFlowRef(
+    const std::string & symbol,
+    const std::string & access_kind,
+    const std::string & stmt_kind,
+    const clang::SourceLocation & loc)
+{
+    if (symbol.empty()) {
+        return;
+    }
+
+    ClangDataFlowRef ref;
+    ref.symbol = symbol;
+    ref.access_kind = access_kind;
+    ref.function_name = current_dataflow_function_name_;
+    ref.stmt_kind = stmt_kind;
+    ExtractSourceLocation(loc, &ref.source_file, &ref.source_line, &ref.source_col);
+    if (!ref.source_file.empty() && ref.source_line > 0) {
+        data_flow_refs_.push_back(ref);
+    }
+}
+
+bool ClangApiVisitor::TraverseFunctionDecl(clang::FunctionDecl * func)
+{
+    if (!func) {
+        return true;
+    }
+
+    const std::string previous = current_dataflow_function_name_;
+    if (func->isDefined()) {
+        current_dataflow_function_name_ = GetQualifiedName(func);
+    }
+    const bool ok = clang::RecursiveASTVisitor<ClangApiVisitor>::TraverseFunctionDecl(func);
+    current_dataflow_function_name_ = previous;
+    return ok;
+}
+
 bool ClangApiVisitor::VisitFunctionDecl(clang::FunctionDecl * func)
 {
     if (!func || !func->isDefined()) {
@@ -255,6 +315,33 @@ bool ClangApiVisitor::VisitFunctionDecl(clang::FunctionDecl * func)
     return true;
 }
 
+bool ClangApiVisitor::VisitVarDecl(clang::VarDecl * var)
+{
+    if (!var || var->isImplicit()) {
+        return true;
+    }
+    RecordDataFlowRef(
+        var->getNameAsString(),
+        "def",
+        "VarDecl",
+        var->getLocation());
+    return true;
+}
+
+bool ClangApiVisitor::VisitBinaryOperator(clang::BinaryOperator * op)
+{
+    if (!op || !op->isAssignmentOp()) {
+        return true;
+    }
+
+    RecordDataFlowRef(
+        ExtractAssignedSymbol(op->getLHS()),
+        "def",
+        op->getStmtClassName(),
+        op->getOperatorLoc());
+    return true;
+}
+
 bool ClangApiVisitor::VisitCXXRecordDecl(
     clang::CXXRecordDecl * record)
 {
@@ -350,6 +437,14 @@ bool ClangApiVisitor::VisitDeclRefExpr(clang::DeclRefExpr * ref)
     if (clang::isa<clang::FunctionDecl>(decl)) {
         std::string func_name = GetQualifiedName(decl);
         current_function_name_ = func_name;
+    } else if (clang::isa<clang::VarDecl>(decl) ||
+               clang::isa<clang::ParmVarDecl>(decl) ||
+               clang::isa<clang::FieldDecl>(decl)) {
+        RecordDataFlowRef(
+            decl->getNameAsString(),
+            "use",
+            "DeclRefExpr",
+            ref->getBeginLoc());
     }
 
     return true;
@@ -382,6 +477,7 @@ ClangAstParseResult ClangApiVisitor::GetResult() const
     result.schema.classes = classes_;
     result.schema.namespaces = namespaces_;
     result.call_refs = call_refs_;
+    result.data_flow_refs = data_flow_refs_;
     result.target_namespaces = target_namespaces_;
     return result;
 }
