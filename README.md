@@ -15,7 +15,9 @@
 7. [Artifact 二次查询与分页](#7-artifact-二次查询与分页)
 8. [测试脚本与一键验证](#8-测试脚本与一键验证)
 9. [测试结论](#9-测试结论)
-10. [常见问题排查](#10-常见问题排查)
+10. [CMM 工具清单](#10-cmm-工具清单)
+11. [Clang 分析工具 vs CMM 工具功能对比](#11-clang-分析工具-vs-cmm-工具功能对比)
+12. [常见问题排查](#12-常见问题排查)
 
 ---
 
@@ -197,6 +199,84 @@ $response.result.tools.Count  # 应输出工具总数
 2. 显式 `compile_db_dir` → 拼接 `compile_commands.json`
 3. `project_root` + 常见构建目录 → 自动搜索 `build/`, `AIbuild/`, `cmake-build-*/`
 4. 均未找到 → 降级为无编译数据库模式（`compile_db_mode=none`，复杂文件可能失败）
+
+### 4.4 CMM 工具清单（codebase-memory-mcp 桥接）
+
+CMM（Codebase Memory MCP）工具通过 `codex_lan_agent` 桥接到独立的 `codebase-memory-mcp` 服务，提供基于**预建索引**的项目级代码图查询能力。使用前需先调用 `lan_agent_cmm_index_repository` 建立索引。
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_cmm_list_projects` | 列出 CMM 已索引的所有项目 | — |
+| `lan_agent_cmm_index_status` | 查询指定项目的索引状态 | `project` |
+| `lan_agent_cmm_index_repository` | 索引一个仓库到 CMM | `repo_path`, `name` |
+| `lan_agent_cmm_delete_project` | 从 CMM 删除已索引项目 | `project` |
+| `lan_agent_cmm_search_code` | 代码文本搜索（支持正则、文件过滤） | `project` |
+| `lan_agent_cmm_search_graph` | 图节点搜索（按 label/kind/relationship） | `project` |
+| `lan_agent_cmm_query_graph` | 图查询（类 Cypher 查询） | `project`, `query` |
+| `lan_agent_cmm_trace_path` | 调用链/依赖链路径追踪 | `project` |
+| `lan_agent_cmm_get_code_snippet` | 按 qualified_name 获取代码片段 | `project` |
+| `lan_agent_cmm_get_graph_schema` | 获取项目图数据库 schema | `project` |
+| `lan_agent_cmm_get_architecture` | 项目架构分析（模块依赖、分层） | `project` |
+| `lan_agent_cmm_detect_changes` | 分支变更检测与影响分析 | `project` |
+
+#### CMM 通用参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `project` | string | CMM 项目名称或绝对路径（自动归一化） |
+| `query` / `pattern` | string | 搜索查询字符串或正则模式 |
+| `file_pattern` | string | 文件 Glob 过滤（如 `*.cpp`） |
+| `path_filter` | string | 路径正则过滤（如 `cximage/`） |
+| `limit` | integer | 返回结果数量上限，默认 10 |
+| `offset` | integer | 分页偏移 |
+| `context` | integer | 代码上下文行数 |
+| `mode` | string | `compact` / `full` / `files` |
+| `depth` | integer | 路径追踪深度 |
+| `direction` | string | 路径方向 |
+
+#### CMM 索引建立示例
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "cmm-index"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_cmm_index_repository"
+        arguments = @{
+            repo_path = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxvision_repo"
+            name = "cxvision"
+            include = @("*.cpp", "*.h", "*.hpp")
+            exclude = @("third_party/", "build/")
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 300
+```
+
+#### CMM 代码搜索示例
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "cmm-search"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_cmm_search_code"
+        arguments = @{
+            project = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxvision_repo"
+            query = "center_x"
+            path_filter = "cximage/"
+            file_pattern = "*.cpp"
+            limit = 20
+            context = 3
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 60
+```
 
 ---
 
@@ -536,9 +616,85 @@ function Invoke-McpTool {
 
 ---
 
-## 10. 常见问题排查
+## 10. CMM 工具状态
 
-### 10.1 服务启动失败 / 连接拒绝
+CMM 工具通过 `codex_lan_agent` 桥接 `codebase-memory-mcp` 服务，已在 MCP 工具列表中注册。使用前需确保：
+1. `codebase-memory-mcp` 服务已独立运行。
+2. 目标项目已通过 `lan_agent_cmm_index_repository` 完成索引。
+
+CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服务实际可用性。
+
+---
+
+## 11. Clang 分析工具 vs CMM 工具功能对比
+
+### 11.1 核心差异
+
+| 维度 | Clang 分析工具 (L0-L6) | CMM 工具 (`lan_agent_cmm_*`) |
+|---|---|---|
+| **数据时效** | 实时解析源文件 | 基于预建索引（需先 `index_repository`） |
+| **分析深度** | AST statement-level（语句级） | 图节点/关系级（函数、类、文件级） |
+| **适用范围** | 单文件级（`source_file`） | 整个项目级（`project`/`repo`） |
+| **底层引擎** | Clang/LLVM AST | codebase-memory-mcp 图数据库 |
+| **典型耗时** | 简单文件 1-5s，复杂文件 180-300s | 毫秒级（索引已建） |
+
+### 11.2 功能对照表
+
+| 功能需求 | Clang 工具 | CMM 工具 | 说明 |
+|---|---|---|---|
+| **工具/项目发现** | `tools/list` (L0) | `cmm_list_projects` | 发现可用工具 vs 发现已索引项目 |
+| **AST 解析** | `run_clang_ast_parser` (L1) | — | Clang 独有：函数列表、类结构、调用引用 |
+| **控制流图 (CFG)** | `build_cfg` (L2) | — | Clang 独有：基本块、分支边、圈复杂度 |
+| **调用图** | `build_call_graph` (L3) | `cmm_search_graph` / `cmm_trace_path` | Clang 实时单文件；CMM 项目级预建图 |
+| **数据流图 (DFG)** | `build_dfg` (L4) | — | Clang 独有：def/use 边、过程间绑定 |
+| **程序切片** | `build_program_slice` (L5) | — | Clang 独有：backward/forward 符号级切片 |
+| **Path-sensitive 元数据** | `build_dfg/slice` + `include_path_metadata` | — | Clang 独有：CFG 分支条件、控制依赖 |
+| **代码搜索** | — | `cmm_search_code` | CMM 独有：文本/正则搜索、文件过滤 |
+| **图查询** | — | `cmm_query_graph` | CMM 独有：Cypher-like 图查询 |
+| **路径追踪** | — | `cmm_trace_path` | CMM 独有：调用链/依赖链追踪 |
+| **代码片段获取** | — | `cmm_get_code_snippet` | CMM 独有：按 qualified_name 定位代码 |
+| **架构分析** | — | `cmm_get_architecture` | CMM 独有：模块依赖、分层分析 |
+| **变更检测** | — | `cmm_detect_changes` | CMM 独有：对比分支差异 |
+| **索引管理** | — | `cmm_index_repository` / `cmm_delete_project` | CMM 独有：项目索引生命周期 |
+| **Artifact 二次查询** | `query_*_artifact` (L6) | — | Clang 独有：分页/聚焦查询无需重跑 |
+
+### 11.3 使用场景对比
+
+| 场景 | 推荐工具 | 原因 |
+|---|---|---|
+| 分析单个函数的控制流 | `build_cfg` (L2) | AST 级精确 CFG，含基本块和分支 |
+| 分析变量 `center_x` 的数据流 | `build_dfg` (L4) | statement-level def/use，含过程间绑定 |
+| 做程序切片（找符号影响范围） | `build_program_slice` (L5) | 精确到语句的 backward/forward 切片 |
+| 跨文件查找谁调用了 `learn()` | `cmm_search_graph` / `cmm_trace_path` | 项目级调用链，无需逐个文件解析 |
+| 搜索代码中的 TODO/FIXME | `cmm_search_code` | 文本搜索，支持正则和文件过滤 |
+| 了解项目整体架构分层 | `cmm_get_architecture` | 模块依赖、分层、入口点分析 |
+| 对比两个分支的变更影响 | `cmm_detect_changes` | 基于 git diff + 图分析 |
+| 快速查询已分析结果（分页） | `query_*_artifact` (L6) | 毫秒级，无需重跑 Clang |
+
+### 11.4 组合使用建议
+
+```
+复杂分析任务典型工作流：
+
+1. 项目级定位（CMM）
+   cmm_search_code(query="center_x") → 找到涉及的文件
+
+2. 文件级深度分析（Clang）
+   build_dfg(source_file=FastMatch.cpp, focus_symbol="center_x")
+   → 获取精确的数据流和过程间绑定
+
+3. 结果复用（Artifact Query）
+   query_dfg_artifact(artifact_summary_path=...)
+   → 分页查看、聚焦邻域，无需重跑
+```
+
+**互补关系**：CMM 适合**项目级快速定位**，Clang 工具适合**单文件深度语义分析**。两者结合可覆盖从宏观架构到微观语句的完整分析链路。
+
+---
+
+## 12. 常见问题排查
+
+### 12.1 服务启动失败 / 连接拒绝
 
 ```
 错误：Could not establish connection
@@ -553,13 +709,13 @@ Start-Sleep -Seconds 1
 # 重新启动
 ```
 
-### 10.2 工具不在 tools/list 中
+### 12.2 工具不在 tools/list 中
 
 **原因**：工具 schema 未在 `McpProtocolOperations.h` 的 `BuildMcpToolsListResponse` 中注册。
 
 **解决**：检查 [src/McpProtocolOperations.h](file:///d:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/McpProtocolOperations.h) 中对应工具的 schema 定义是否存在。
 
-### 10.3 复杂文件解析失败
+### 12.3 复杂文件解析失败
 
 **原因**：`compile_commands.json` 未找到或路径不正确。
 
@@ -568,11 +724,11 @@ Start-Sleep -Seconds 1
 2. 确认 `<project_root>/build/compile_commands.json` 存在。
 3. 如无，用 CMake 生成：`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`。
 
-### 10.4 DFG/Slice 超时
+### 12.4 DFG/Slice 超时
 
 **解决**：增大超时到 300s，或减小 `max_nodes` / `max_edges` / `max_interprocedural_bindings`。
 
-### 10.5 MinGW 编译
+### 12.5 MinGW 编译
 
 项目默认使用 MSVC。如需 MinGW：
 
