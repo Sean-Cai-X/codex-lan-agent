@@ -1,6 +1,6 @@
 # codex-lan-agent
 
-基于 Clang AST 的 C/C++ 代码分析 MCP 工具链，提供 AST 解析、控制流图（CFG）、调用图（Call Graph）、数据流图（DFG）和程序切片（Program Slice）能力，通过 MCP 协议（Streamable HTTP）对外服务。
+基于 Clang AST 的 C/C++ 代码分析 MCP 工具链，提供 AST 解析、控制流图（CFG）、调用图（Call Graph）、数据流图（DFG）、程序切片（Program Slice）能力，并内置语义网格（Semantic Grid）长文本解构、归纳、检索、溯源与上下文重构能力，通过 MCP 协议（Streamable HTTP）对外服务。
 
 ---
 
@@ -13,11 +13,12 @@
 5. [接入本地模型后的操作语义](#5-接入本地模型后的操作语义)
 6. [完整使用案例](#6-完整使用案例)
 7. [Artifact 二次查询与分页](#7-artifact-二次查询与分页)
-8. [测试脚本与一键验证](#8-测试脚本与一键验证)
-9. [测试结论](#9-测试结论)
-10. [CMM 工具清单](#10-cmm-工具清单)
-11. [Clang 分析工具 vs CMM 工具功能对比](#11-clang-分析工具-vs-cmm-工具功能对比)
-12. [常见问题排查](#12-常见问题排查)
+8. [语义网格工具：长文本解构与上下文重构](#8-语义网格工具长文本解构与上下文重构)
+9. [测试脚本与一键验证](#9-测试脚本与一键验证)
+10. [测试结论](#10-测试结论)
+11. [CMM 工具清单](#11-cmm-工具清单)
+12. [Clang 分析工具 vs CMM 工具功能对比](#12-clang-分析工具-vs-cmm-工具功能对比)
+13. [常见问题排查](#13-常见问题排查)
 
 ---
 
@@ -39,6 +40,8 @@ AI Agent / IDE / 本地模型
 │  CfGBuilder.cpp                   │  ← CFG 构建
 │  GraphSerialization.cpp           │  ← CallGraph / DFG / Slice
 ├───────────────────────────────────┤
+│  SemanticGridOperations.cpp       │  ← 语义网格（解构/归纳/检索/溯源/增量）
+├───────────────────────────────────┤
 │  compile_commands.json            │  ← 编译数据库（项目侧）
 │  Clang / LLVM                     │  ← 底层解析引擎
 └───────────────────────────────────┘
@@ -49,6 +52,7 @@ AI Agent / IDE / 本地模型
 - 复杂项目通过 `compile_commands.json` 提供编译参数，不硬编码环境。
 - 每个工具产出标准化 JSON artifact，支持二次查询（artifact query）。
 - 分页（`offset_*` / `max_*`）和邻域提取（`focus_symbol` / `neighborhood_depth`）在 artifact 层完成，无需重跑 Clang。
+- 语义网格工具独立于 Clang 工具链，可单独用于长文本/规则文档的解构与检索，为本地模型提供上下文重构能力。
 
 ---
 
@@ -171,7 +175,20 @@ $response.result.tools.Count  # 应输出工具总数
 | `lan_agent_build_program_slice` | 程序切片（backward/forward） | `source_file`, `symbol` |
 | `lan_agent_query_program_slice_artifact` | Slice artifact 二次查询 | `artifact_json_path` 或 `artifact_summary_path` |
 
-### 4.2 通用参数说明
+### 4.2 语义网格工具（6 个）
+
+语义网格工具负责长文本的解构、五层语义金字塔构建、检索、原文溯源、上下文重构和多轮增量更新。
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_semantic_grid_ingest_text` | 将长文本解构为语义片段 fragments | `source_text` 或 `source_file` |
+| `lan_agent_semantic_grid_build` | 从 fragments/source_text 构建 L1-L5 语义金字塔 | `source_text` 或 `fragments_json` 或 `artifact_summary_path` |
+| `lan_agent_semantic_grid_query` | 按 layer/keyword/fuzzy/regex 查询语义网格 | `artifact_summary_path` |
+| `lan_agent_semantic_grid_trace_source` | 从任意语义节点追溯回原文 fragment | `artifact_summary_path`, `node_id` |
+| `lan_agent_semantic_grid_context_bundle` | 根据任务意图生成 LLM 上下文 bundle | `artifact_summary_path` |
+| `lan_agent_semantic_grid_incremental_update` | 多轮增量追加，支持 content_hash 去重 | `artifact_summary_path`, `source_text` |
+
+### 4.3 通用参数说明
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
@@ -193,14 +210,44 @@ $response.result.tools.Count  # 应输出工具总数
 | `include_path_metadata` | boolean | 是否计算 path-sensitive 元数据（CFG 分支/环） |
 | `max_interprocedural_bindings` | integer | 过程间绑定候选最大数，默认 512 |
 
-### 4.3 compile_commands.json 发现顺序
+### 4.4 语义网格参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `source_text` | string | 内联长文本（ingest/build/incremental） |
+| `source_file` | string | 文本/markdown 文件路径（ingest/build/incremental） |
+| `source_kind` | string | 来源类型，如 `md`/`txt`/`complex_markdown`/`incremental_markdown` |
+| `split_strategy` | string | 切分策略：`markdown`(默认) / `paragraph` / `sentence` / `sliding_window` |
+| `max_fragment_chars` | integer | 单个片段软上限字符数，默认 900 |
+| `sliding_overlap_chars` | integer | `sliding_window` 模式的重叠字符数 |
+| `max_fragments` | integer | 最大片段数，默认 512 |
+| `domain` | string | L2 领域提示，默认 `general` |
+| `grid_id` | string | 可选显式 grid id |
+| `fragments_json` | string | ingest 返回的 fragments JSON 字符串 |
+| `artifact_summary_path` | string | summary.json 路径，用于二次查询/增量更新 |
+| `artifact_grid_json_path` | string | semantic_grid.json 路径 |
+| `artifact_fragments_json_path` | string | fragments.json 路径 |
+| `node_id` | string | 语义节点 ID（query/trace_source） |
+| `layer` | string | L1_META / L2_DOMAIN / L3_FLOW / L4_ATOM / L5_RAW |
+| `keyword` / `query` | string | 搜索关键词 |
+| `fuzzy_match` | boolean | 启用 token/子序列模糊匹配 |
+| `regex_match` | boolean | 将 keyword 当作正则表达式 |
+| `relation_type` | string | contains / source_trace / sequence / synonym / complement / depend / exclude / reference |
+| `direction` | string | both / in/up / out/down |
+| `offset` / `limit` | integer | 分页参数 |
+| `task_intent` | string | 上下文重构的任务意图 |
+| `flow_stage` | string | 上下文重构的流程阶段过滤 |
+| `max_chars` | integer | 上下文 bundle 最大字符数 |
+| `dedupe_existing` | boolean | 增量更新时按 content_hash 去重，默认 true |
+
+### 4.5 compile_commands.json 发现顺序
 
 1. 显式 `compilation_database_path` → 直接使用
 2. 显式 `compile_db_dir` → 拼接 `compile_commands.json`
 3. `project_root` + 常见构建目录 → 自动搜索 `build/`, `AIbuild/`, `cmake-build-*/`
 4. 均未找到 → 降级为无编译数据库模式（`compile_db_mode=none`，复杂文件可能失败）
 
-### 4.4 CMM 工具清单（codebase-memory-mcp 桥接）
+### 4.6 CMM 工具清单（codebase-memory-mcp 桥接）
 
 CMM（Codebase Memory MCP）工具通过 `codex_lan_agent` 桥接到独立的 `codebase-memory-mcp` 服务，提供基于**预建索引**的项目级代码图查询能力。使用前需先调用 `lan_agent_cmm_index_repository` 建立索引。
 
@@ -306,6 +353,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 | L4 | `lan_agent_build_dfg` | 获取数据流（def/use 边、过程间绑定） |
 | L5 | `lan_agent_build_program_slice` | 获取符号级切片（backward/forward） |
 | L6 | `lan_agent_query_*_artifact` | 从已写入的 artifact 二次查询，无需重跑 Clang |
+| SG | `lan_agent_semantic_grid_*` | 长文本语义网格：解构、归纳、检索、溯源、上下文重构、增量 |
 
 ### 5.3 模型决策规则
 
@@ -317,6 +365,8 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 4. **复杂项目必传 `project_root`**：确保 `compile_commands.json` 被发现，否则复杂文件解析失败。
 5. **大文件分页**：使用 `offset_*` / `max_*` 控制返回量，避免单次响应过大。
 6. **超时意识**：DFG/Slice 对复杂文件可能需要 180-300s，模型应设置足够超时。
+7. **语义网格用于非代码文本**：长文本/规则文档/经验框架使用 `semantic_grid_*` 工具链，不走 Clang 工具。
+8. **增量更新用链式 summary**：每轮增量使用上一轮返回的 `artifact_summary_json_path` 作为下一轮输入。
 
 ### 5.4 典型模型对话流程
 
@@ -336,6 +386,59 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
   "center_x 在 FastMatch.cpp 中被定义于第 45 行（learn 阶段），
    在第 78 行被使用（match 阶段），
    过程间绑定：learn → match 通过参数传递..."
+```
+
+### 5.5 语义网格对话流程（长文本分析）
+
+```
+用户：将这份规则文档解构，并检索其中关于"约束"的语义节点
+
+模型内部决策：
+  1. tools/list → 确认 lan_agent_semantic_grid_build 可用
+  2. lan_agent_semantic_grid_build(source_text=<规则文档>, domain="rule_doc")
+     → 返回 fragment_count, node_count, edge_count, layer_distribution
+  3. lan_agent_semantic_grid_query(artifact_summary_path=<build 返回的 path>,
+                                    layer="L4_ATOM", keyword="约束", fuzzy_match=true)
+     → 返回 matched_nodes_json, match_mode=fuzzy
+  4. 从 matched_nodes 取第一个 node_id
+  5. lan_agent_semantic_grid_trace_source(artifact_summary_path=<同上>,
+                                          node_id=<上一步的 node_id>)
+     → 返回 source_fragments_json，包含原文 content_text 和 section_path
+  6. lan_agent_semantic_grid_context_bundle(artifact_summary_path=<同上>,
+                                            task_intent="约束 规则",
+                                            fuzzy_match=true, max_nodes=8)
+     → 返回 context_bundle_json + prompt_sections，供模型直接消费
+
+模型输出：
+  "该规则文档被解构为 11 个语义片段，构建出 27 个语义节点。
+   关于'约束'的语义节点位于 L4_ATOM 层，对应原文片段：
+   '禁止把推理约束和经验描述混在同一个原子节点中'。
+   上下文 bundle 已生成，包含 8 个相关节点和 prompt 文本..."
+```
+
+### 5.6 多轮增量对话流程
+
+```
+用户：再追加一段新经验，并确保不重复已有内容
+
+模型内部决策：
+  1. 使用上一轮 build 的 artifact_summary_path
+  2. lan_agent_semantic_grid_incremental_update(
+       artifact_summary_path=<base/summary.json>,
+       source_text=<新增经验文本>,
+       dedupe_existing=true)
+     → 返回 added_fragment_count, skipped_duplicate_fragment_count,
+       delta_fragments_json, delta_nodes_json
+  3. 如需查询新增内容：
+     lan_agent_semantic_grid_query(
+       artifact_summary_path=<incremental 返回的新 summary.json>,
+       keyword="<新增主题>", fuzzy_match=true)
+  4. 如重复提交相同文本：
+     added_fragment_count=0, skipped_duplicate_fragment_count>0 → 确认去重生效
+
+模型输出：
+  "已追加 4 个新片段，新增 8 个语义节点（delta）。
+   如重复提交相同内容，系统会跳过 4 个重复片段，节点数不变。"
 ```
 
 ---
@@ -513,9 +616,223 @@ $content = $response.result.structuredContent
 
 ---
 
-## 8. 测试脚本与一键验证
+## 8. 语义网格工具：长文本解构与上下文重构
 
-### 8.1 一键脚本 1：模板回归
+### 8.1 功能意义
+
+语义网格（Semantic Grid）是一套**独立于 Clang 代码分析**的长文本处理工具链，解决以下问题：
+
+- **长文本不可检索**：将规则文档、经验框架、操作手册等长文本解构为可索引的语义片段。
+- **语义层级缺失**：构建 L1-L5 五层语义金字塔，从元认知到原文片段垂直贯通。
+- **上下文窗口不足**：本地模型上下文有限，`context_bundle` 按任务意图生成精简上下文。
+- **多轮追加无去重**：增量更新时按 `content_hash` 自动去重，避免语义重复。
+- **无法溯源到原文**：`trace_source` 从任意语义节点追溯回原始片段，保留 `section_path` 和行号。
+
+### 8.2 五层语义金字塔
+
+```
+L1_META        整体语义网格元认知节点（1 个）
+  └─ L2_DOMAIN 领域主题节点（1 个，由 domain 参数决定）
+       └─ L3_FLOW  流程/类别节点（按 fragment_type 分类）
+            └─ L4_ATOM  原子语义节点（每个 fragment 一个）
+                 └─ L5_RAW  原文片段节点（保留完整 content_text）
+```
+
+**关系类型**：
+- `contains`：垂直层级包含关系（L1→L2→L3→L4→L5）
+- `source_trace`：L4 原子节点到 L5 原文片段的溯源关系
+- `sequence`：同层 L4 节点之间的时序关系
+
+### 8.3 Fragment 结构
+
+每个 fragment 包含：
+
+| 字段 | 说明 |
+|---|---|
+| `fragment_id` | `frag_1`, `frag_2`, ... |
+| `source_file` | 来源文件路径（如有） |
+| `source_kind` | `md` / `txt` / `complex_markdown` / `incremental_markdown` |
+| `section_path` | Markdown 标题路径，如 `第一层 > 规则边界` |
+| `content_hash` | FNV-1a hash，用于增量去重 |
+| `source_line_start` / `source_line_end` | 原文行号范围 |
+| `fragment_type` | `boundary_rule` / `condition_statement` / `action_step` / `term_definition` |
+| `content_text` | 原文片段文本 |
+| `keyword_tags` | 自动提取的关键词标签 |
+
+### 8.4 完整流程：基础构建 + 查询 + 溯源 + 上下文重构
+
+```powershell
+# 1. 构建语义网格
+$buildBody = @{
+    jsonrpc = "2.0"
+    id = "sg-build"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_build"
+        arguments = @{
+            source_text = "# 规则文档`n## 第一章`n禁止绕过统一执行核心..."
+            source_kind = "complex_markdown"
+            split_strategy = "markdown"
+            max_fragments = 64
+            domain = "rule_doc"
+            output_dir = "D:/tmp/sg_base"
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$build = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $buildBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# fragment_count=11, node_count=28, edge_count=34
+# layer_distribution: L1_META=1, L2_DOMAIN=1, L3_FLOW=4, L4_ATOM=11, L5_RAW=11
+# artifact_summary_json_path exists
+
+# 2. 查询（fuzzy 模式）
+$queryBody = @{
+    jsonrpc = "2.0"
+    id = "sg-query"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_query"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path
+            layer = "L4_ATOM"
+            keyword = "section priority"
+            fuzzy_match = $true
+            limit = 12
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$query = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $queryBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, match_mode=fuzzy, node_count > 0
+# matched_nodes_json exists
+
+# 3. 原文溯源
+$firstNodeId = ($query.matched_nodes_json | ConvertFrom-Json)[0].node_id
+$traceBody = @{
+    jsonrpc = "2.0"
+    id = "sg-trace"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_trace_source"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path
+            node_id = $firstNodeId
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$trace = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $traceBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, source_fragment_count > 0
+# source_fragments_json contains content_text, section_path, content_hash
+
+# 4. 上下文重构
+$bundleBody = @{
+    jsonrpc = "2.0"
+    id = "sg-bundle"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_context_bundle"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path
+            task_intent = "约束 规则 priority source trace"
+            fuzzy_match = $true
+            max_nodes = 12
+            max_chars = 5000
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$bundle = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $bundleBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, node_count > 0
+# context_bundle_json contains prompt_text
+# context_sections_json contains section_priority, section_weight
+# prompt_sections exists
+```
+
+### 8.5 多轮增量更新
+
+```powershell
+# 第 1 轮增量
+$inc1Body = @{
+    jsonrpc = "2.0"
+    id = "sg-inc1"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_incremental_update"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path  # ← base 轮的 summary
+            source_text = "## 新增经验`n跨轮分析需要保持 fragment id 稳定..."
+            source_kind = "incremental_markdown"
+            split_strategy = "markdown"
+            max_fragments = 32
+            dedupe_existing = $true
+            output_dir = "D:/tmp/sg_inc1"
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$inc1 = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $inc1Body -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# incoming_fragment_count=4, added_fragment_count=4
+# new_fragment_count=15 (base 11 + new 4)
+# new_node_count=36 (base 28 + delta 8)
+# delta_fragments_json exists, delta_nodes_json exists
+
+# 重复提交（去重验证）
+$dupBody = @{
+    jsonrpc = "2.0"
+    id = "sg-dup"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_incremental_update"
+        arguments = @{
+            artifact_summary_path = $inc1.artifact_summary_json_path  # ← inc1 轮的 summary
+            source_text = "## 新增经验`n跨轮分析需要保持 fragment id 稳定..."  # 同一段文本
+            source_kind = "incremental_markdown"
+            split_strategy = "markdown"
+            dedupe_existing = $true
+            output_dir = "D:/tmp/sg_dup"
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$dup = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $dupBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# incoming_fragment_count=4, added_fragment_count=0
+# skipped_duplicate_fragment_count=4  ← 去重生效
+# new_fragment_count=15 (不变), new_node_count=36 (不变)
+```
+
+### 8.6 Artifact 文件结构
+
+```
+output_dir/
+├── semantic_grid.json      ← 完整网格（fragments + nodes + edges）
+├── nodes.json              ← 节点列表
+├── edges.json              ← 边列表
+├── summary.json            ← 摘要（artifact_*_path 指针）
+├── delta_fragments.json    ← 增量轮新增片段（仅 incremental_update）
+└── delta_nodes.json        ← 增量轮新增节点（仅 incremental_update）
+```
+
+**链式 summary 规则**：每轮 `incremental_update` 返回的 `artifact_summary_json_path` 可直接作为下一轮的 `artifact_summary_path` 输入，形成多轮增量链路。
+
+### 8.7 查询模式说明
+
+| 模式 | 参数 | 匹配规则 |
+|---|---|---|
+| substring（默认） | 无特殊参数 | 关键词子串匹配 |
+| fuzzy | `fuzzy_match=true` | token 全匹配 / 子序列匹配 |
+| regex | `regex_match=true` | 正则表达式匹配（icase） |
+
+**分页字段**：`offset` / `limit` / `has_more` / `next_offset_or_null` / `pagination_status`
+
+---
+
+## 9. 测试脚本与一键验证
+
+### 9.1 一键脚本 1：模板回归
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_analysis_templates_1_11.ps1
@@ -523,7 +840,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 
 覆盖：`tools/list`、AST、CFG、CallGraph、DFG、Slice、artifact query、分页、path-sensitive metadata。
 
-### 8.2 一键脚本 2：复杂项目分析
+### 9.2 一键脚本 2：复杂项目分析
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\analysis_client_examples.ps1 `
@@ -536,7 +853,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 
 > **注意**：DFG 对复杂文件可能需要 180-300s，脚本默认超时 180s。如超时，手动以 300s 超时重跑。
 
-### 8.3 手动 MCP 调用模板
+### 9.3 手动 MCP 调用模板
 
 ```powershell
 function Invoke-McpTool {
@@ -551,11 +868,27 @@ function Invoke-McpTool {
 }
 ```
 
+### 9.4 一键脚本 3：语义网格基础 Smoke
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_semantic_grid_smoke.ps1
+```
+
+覆盖：`tools/list`（6 工具注册）、`ingest_text`（解构）、`build`（L1-L5 金字塔）、`query`（fuzzy 查询）、`trace_source`（原文溯源）、`context_bundle`（上下文重构）。
+
+### 9.5 一键脚本 4：复杂文本 + 多轮增量 Smoke
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_semantic_grid_complex_incremental_smoke.ps1
+```
+
+覆盖：复杂 markdown 基础构建、增量追加（+4 fragments）、fuzzy 查询、重复增量去重（dedupe）、上下文重构（section_priority）。
+
 ---
 
-## 9. 测试结论
+## 10. 测试结论
 
-### 9.1 环境
+### 10.1 环境
 
 | 项 | 值 |
 |---|---|
@@ -564,7 +897,7 @@ function Invoke-McpTool {
 | 测试目标文件 | `cximage\FastMatch.cpp`（复杂项目） + `test_simple.cpp`（简单文件） |
 | compile_commands.json | `D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\build\compile_commands.json` |
 
-### 9.2 工具可用性
+### 10.2 工具可用性
 
 | 工具 | 状态 | 结论 |
 |---|---|---|
@@ -579,7 +912,7 @@ function Invoke-McpTool {
 | `lan_agent_build_program_slice` | 可用 | `slice_precision=ast_statement_def_use_cfg_callgraph_v1` |
 | `lan_agent_query_program_slice_artifact` | 可用 | artifact + source_lines 二次查询成功 |
 
-### 9.3 核心断言结果
+### 10.3 核心断言结果（Clang 分析工具）
 
 | 断言 | 结果 |
 |---|---|
@@ -602,7 +935,47 @@ function Invoke-McpTool {
 | artifact query `artifact_json_path_resolved_from=artifact_summary_path` | PASS |
 | artifact query `artifact_parser_status=success` | PASS |
 
-### 9.4 已知限制
+### 10.4 语义网格测试结果
+
+#### 基础 Smoke (`run_semantic_grid_smoke.ps1`)
+
+| 断言 | 结果 |
+|---|---|
+| 6 个 semantic grid 工具全部注册 | PASS |
+| `ingest_text` fragment_count > 0 | PASS (11 fragments) |
+| `build` node_count > fragment_count | PASS (27 nodes > 11 fragments) |
+| `build` edge_count > 0 | PASS (34 edges) |
+| `build` layer_distribution 包含 L1-L5 | PASS |
+| `query` node_count > 0 | PASS (1 node) |
+| `trace_source` source_fragment_count > 0 | PASS (1 fragment) |
+| `context_bundle` node_count > 0 | PASS (8 nodes) |
+| `context_bundle` 包含 prompt_text | PASS |
+
+#### 复杂增量 Smoke (`run_semantic_grid_complex_incremental_smoke.ps1`)
+
+| 断言 | 结果 |
+|---|---|
+| 基础 build 成功 | PASS (28 nodes, 34 edges) |
+| `semantic_grid_json` 包含 `section_path` | PASS |
+| `semantic_grid_json` 包含 `content_hash` | PASS |
+| `layer_distribution` 包含 L1_META/L2_DOMAIN/L3_FLOW/L4_ATOM/L5_RAW | PASS |
+| 增量追加 added_fragment_count > 0 | PASS (+4 fragments) |
+| 增量追加 new_fragment_count > previous | PASS (15 > 11) |
+| 增量追加 delta_node_count > 0 | PASS (36 > 28, delta=8) |
+| `delta_fragments.json` 存在 | PASS |
+| `delta_nodes.json` 存在 | PASS |
+| fuzzy 查询 match_mode=fuzzy | PASS |
+| fuzzy 查询 node_count > 0 | PASS |
+| 重复增量 added_fragment_count=0 | PASS |
+| 重复增量 skipped_duplicate_fragment_count > 0 | PASS (4) |
+| 重复增量 new_fragment_count 不变 | PASS (15=15) |
+| 重复增量 new_node_count 不变 | PASS (36=36) |
+| `context_bundle` 包含 section_priority | PASS |
+| `prompt_sections` 包含 Semantic Grid Context | PASS |
+| artifact_summary_path 链式传递 | PASS (base→inc1→dup) |
+| artifact 文件全部存在 | PASS |
+
+### 10.5 已知限制
 
 | 限制 | 详情 | 规避 |
 |---|---|---|
@@ -610,13 +983,15 @@ function Invoke-McpTool {
 | 端口占用 | 旧进程残留导致新实例启动失败 | 启动前 `Stop-Process` |
 | compile_commands.json 依赖 | 无编译数据库时复杂文件解析失败 | 确保 `project_root` 指向含 `build/compile_commands.json` 的目录 |
 
-### 9.5 最终状态
+### 10.6 最终状态
 
 **[Verified]** — MCP 工具链可用于复杂项目分析，全部核心断言通过。
 
+**[Verified]** — 语义网格工具链支持复杂文本解构、L1-L5 语义金字塔构建、fuzzy/regex 查询、原文溯源、上下文重构、多轮增量追加与 content_hash 去重，全部断言通过。
+
 ---
 
-## 10. CMM 工具状态
+## 11. CMM 工具状态
 
 CMM 工具通过 `codex_lan_agent` 桥接 `codebase-memory-mcp` 服务，已在 MCP 工具列表中注册。使用前需确保：
 1. `codebase-memory-mcp` 服务已独立运行。
@@ -626,9 +1001,9 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 
 ---
 
-## 11. Clang 分析工具 vs CMM 工具功能对比
+## 12. Clang 分析工具 vs CMM 工具功能对比
 
-### 11.1 核心差异
+### 12.1 核心差异
 
 | 维度 | Clang 分析工具 (L0-L6) | CMM 工具 (`lan_agent_cmm_*`) |
 |---|---|---|
@@ -638,7 +1013,7 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | **底层引擎** | Clang/LLVM AST | codebase-memory-mcp 图数据库 |
 | **典型耗时** | 简单文件 1-5s，复杂文件 180-300s | 毫秒级（索引已建） |
 
-### 11.2 功能对照表
+### 12.2 功能对照表
 
 | 功能需求 | Clang 工具 | CMM 工具 | 说明 |
 |---|---|---|---|
@@ -658,7 +1033,7 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | **索引管理** | — | `cmm_index_repository` / `cmm_delete_project` | CMM 独有：项目索引生命周期 |
 | **Artifact 二次查询** | `query_*_artifact` (L6) | — | Clang 独有：分页/聚焦查询无需重跑 |
 
-### 11.3 使用场景对比
+### 12.3 使用场景对比
 
 | 场景 | 推荐工具 | 原因 |
 |---|---|---|
@@ -671,7 +1046,7 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | 对比两个分支的变更影响 | `cmm_detect_changes` | 基于 git diff + 图分析 |
 | 快速查询已分析结果（分页） | `query_*_artifact` (L6) | 毫秒级，无需重跑 Clang |
 
-### 11.4 组合使用建议
+### 12.4 组合使用建议
 
 ```
 复杂分析任务典型工作流：
@@ -692,9 +1067,9 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 
 ---
 
-## 12. 常见问题排查
+## 13. 常见问题排查
 
-### 12.1 服务启动失败 / 连接拒绝
+### 13.1 服务启动失败 / 连接拒绝
 
 ```
 错误：Could not establish connection
@@ -709,13 +1084,13 @@ Start-Sleep -Seconds 1
 # 重新启动
 ```
 
-### 12.2 工具不在 tools/list 中
+### 13.2 工具不在 tools/list 中
 
 **原因**：工具 schema 未在 `McpProtocolOperations.h` 的 `BuildMcpToolsListResponse` 中注册。
 
 **解决**：检查 [src/McpProtocolOperations.h](file:///d:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/McpProtocolOperations.h) 中对应工具的 schema 定义是否存在。
 
-### 12.3 复杂文件解析失败
+### 13.3 复杂文件解析失败
 
 **原因**：`compile_commands.json` 未找到或路径不正确。
 
@@ -724,11 +1099,11 @@ Start-Sleep -Seconds 1
 2. 确认 `<project_root>/build/compile_commands.json` 存在。
 3. 如无，用 CMake 生成：`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`。
 
-### 12.4 DFG/Slice 超时
+### 13.4 DFG/Slice 超时
 
 **解决**：增大超时到 300s，或减小 `max_nodes` / `max_edges` / `max_interprocedural_bindings`。
 
-### 12.5 MinGW 编译
+### 13.5 MinGW 编译
 
 项目默认使用 MSVC。如需 MinGW：
 
@@ -738,3 +1113,21 @@ cmake --build AIbuild
 ```
 
 > 注意：MinGW 模式下 Clang Tooling 的头文件路径需要额外配置，建议优先使用 MSVC。
+
+### 13.6 语义网格增量去重不生效
+
+**原因**：`dedupe_existing` 参数未设置为 `true`，或上一轮的 `artifact_summary_path` 不正确。
+
+**解决**：
+1. 确认 `dedupe_existing=true`（默认为 true）。
+2. 确认 `artifact_summary_path` 指向上一轮 `incremental_update` 返回的 `artifact_summary_json_path`。
+3. 检查 `summary.json` 中的 `artifact_semantic_grid_json_path` 指针是否有效。
+
+### 13.7 语义网格 query 返回空结果
+
+**原因**：keyword 未匹配到任何节点，或 layer 过滤过严。
+
+**解决**：
+1. 尝试 `fuzzy_match=true` 启用模糊匹配。
+2. 尝试不传 `layer` 参数，搜索所有层。
+3. 使用 `regex_match=true` 扩展匹配范围。

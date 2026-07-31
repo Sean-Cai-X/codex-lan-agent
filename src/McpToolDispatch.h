@@ -491,6 +491,24 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_remote_session_semantic_catalog", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildRemoteSessionSemanticCatalogResult(config);
         }},
+        {"lan_agent_semantic_grid_ingest_text", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildSemanticGridIngestTextResult(config, params);
+        }},
+        {"lan_agent_semantic_grid_build", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildSemanticGridBuildResult(config, params);
+        }},
+        {"lan_agent_semantic_grid_query", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildSemanticGridQueryResult(config, params);
+        }},
+        {"lan_agent_semantic_grid_trace_source", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildSemanticGridTraceSourceResult(config, params);
+        }},
+        {"lan_agent_semantic_grid_context_bundle", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildSemanticGridContextBundleResult(config, params);
+        }},
+        {"lan_agent_semantic_grid_incremental_update", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildSemanticGridIncrementalUpdateResult(config, params);
+        }},
         {"lan_agent_list_profiles", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildProfileListResult(config);
         }},
@@ -1093,6 +1111,12 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_rag_review_observe", "rag_bridge_review_observe", "rag_review_observe", "medium", "rag,bridge,review,observe,write,store_refs"},
         {"lan_agent_rag_storage_page", "rag_bridge_storage_page", "rag_storage_page", "low", "rag,bridge,storage,page,read_only"},
         {"lan_agent_remote_session_semantic_catalog", "remote_session_semantic_catalog", "remote_session_semantic_catalog", "low", "remote-session,semantic-catalog,read_only"},
+        {"lan_agent_semantic_grid_ingest_text", "semantic_grid_ingest", "semantic_grid_ingest_text", "low", "semantic-grid,ingest,text,read_only"},
+        {"lan_agent_semantic_grid_build", "semantic_grid_build", "semantic_grid_build", "medium", "semantic-grid,build,artifact"},
+        {"lan_agent_semantic_grid_query", "semantic_grid_query", "semantic_grid_query", "low", "semantic-grid,query,read_only"},
+        {"lan_agent_semantic_grid_trace_source", "semantic_grid_trace", "semantic_grid_trace_source", "low", "semantic-grid,trace,read_only"},
+        {"lan_agent_semantic_grid_context_bundle", "semantic_grid_context", "semantic_grid_context_bundle", "low", "semantic-grid,context,read_only"},
+        {"lan_agent_semantic_grid_incremental_update", "semantic_grid_incremental_update", "semantic_grid_incremental_update", "medium", "semantic-grid,incremental,artifact"},
         {"lan_agent_list_profiles", "read_observe", "profile_catalog", "low", "profile,catalog,read_only"},
         {"lan_agent_profile_catalog", "read_observe", "profile_catalog", "low", "profile,catalog,read_only"},
         {"lan_agent_discover_ctest_tests", "ctest_discovery", "test_inventory", "low", "ctest,discover,read_only"},

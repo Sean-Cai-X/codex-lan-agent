@@ -40,6 +40,7 @@
 #include "ClangAstVisitor.h"
 #include "ClangAstParser.h"
 #include "ClangAstTool.h"
+#include "SemanticGridOperations.h"
 
 bool ReadWholeFile(
     const std::filesystem::path & path,
