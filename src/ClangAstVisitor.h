@@ -6,9 +6,12 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/ASTTypeTraits.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ParentMapContext.h"
+#include "clang/AST/Stmt.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -41,7 +44,9 @@ public:
     bool TraverseFunctionDecl(clang::FunctionDecl * func);
     bool VisitVarDecl(clang::VarDecl * var);
     bool VisitBinaryOperator(clang::BinaryOperator * op);
+    bool VisitUnaryOperator(clang::UnaryOperator * op);
     bool VisitCallExpr(clang::CallExpr * call);
+    bool VisitReturnStmt(clang::ReturnStmt * ret);
     bool VisitDeclRefExpr(clang::DeclRefExpr * ref);
     bool VisitMemberExpr(clang::MemberExpr * member);
 
@@ -64,6 +69,10 @@ private:
         int * line,
         int * col) const;
     std::string ExtractAssignedSymbol(const clang::Expr * expr) const;
+    void CollectReferencedSymbols(
+        const clang::Expr * expr,
+        std::vector<std::string> * symbols) const;
+    std::vector<std::string> ExtractCallResultSymbols(clang::CallExpr * call) const;
     void RecordDataFlowRef(
         const std::string & symbol,
         const std::string & access_kind,
@@ -77,6 +86,7 @@ private:
     std::vector<ClangClassInfo> classes_;
     std::vector<ClangMethodInfo> free_functions_;
     std::vector<ClangCallRef> call_refs_;
+    std::vector<ClangReturnRef> return_refs_;
     std::vector<ClangDataFlowRef> data_flow_refs_;
     std::vector<std::string> namespaces_;
 

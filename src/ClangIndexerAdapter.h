@@ -62,6 +62,18 @@ struct ClangCallRef
 {
     std::string caller_name;
     std::string callee_name;
+    std::vector<std::string> argument_symbols;
+    std::vector<std::vector<std::string>> argument_symbol_groups;
+    std::vector<std::string> result_symbols;
+    std::string source_file;
+    int source_line = 0;
+    int source_col = 0;
+};
+
+struct ClangReturnRef
+{
+    std::string function_name;
+    std::vector<std::string> return_symbols;
     std::string source_file;
     int source_line = 0;
     int source_col = 0;
@@ -84,6 +96,7 @@ struct ClangAstParseResult
     std::string error;
     ApiSchema schema;
     std::vector<ClangCallRef> call_refs;
+    std::vector<ClangReturnRef> return_refs;
     std::vector<ClangDataFlowRef> data_flow_refs;
     std::vector<std::string> target_namespaces;
     int elapsed_ms = 0;

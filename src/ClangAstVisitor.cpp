@@ -151,6 +151,52 @@ std::string ClangApiVisitor::ExtractAssignedSymbol(const clang::Expr * expr) con
     return {};
 }
 
+void ClangApiVisitor::CollectReferencedSymbols(
+    const clang::Expr * expr,
+    std::vector<std::string> * symbols) const
+{
+    if (!expr || symbols == nullptr) {
+        return;
+    }
+    if (symbols->size() >= 32) {
+        return;
+    }
+
+    const clang::Expr * stripped = expr->IgnoreParenImpCasts();
+    if (const auto * decl_ref = clang::dyn_cast<clang::DeclRefExpr>(stripped)) {
+        const clang::NamedDecl * decl = decl_ref->getDecl();
+        if (decl && (clang::isa<clang::VarDecl>(decl) ||
+                     clang::isa<clang::ParmVarDecl>(decl) ||
+                     clang::isa<clang::FieldDecl>(decl))) {
+            symbols->push_back(decl->getNameAsString());
+        }
+        return;
+    } else if (const auto * member_expr = clang::dyn_cast<clang::MemberExpr>(stripped)) {
+        const clang::NamedDecl * decl = member_expr->getMemberDecl();
+        if (decl) {
+            symbols->push_back(decl->getNameAsString());
+        }
+        return;
+    }
+
+    int traversed_children = 0;
+    for (const clang::Stmt * child : stripped->children()) {
+        if (++traversed_children > 8 || symbols->size() >= 32) {
+            break;
+        }
+        if (const auto * child_expr = clang::dyn_cast_or_null<clang::Expr>(child)) {
+            CollectReferencedSymbols(child_expr, symbols);
+        }
+    }
+}
+
+std::vector<std::string> ClangApiVisitor::ExtractCallResultSymbols(clang::CallExpr * call) const
+{
+    std::vector<std::string> symbols;
+    (void)call;
+    return symbols;
+}
+
 void ClangApiVisitor::RecordDataFlowRef(
     const std::string & symbol,
     const std::string & access_kind,
@@ -336,7 +382,21 @@ bool ClangApiVisitor::VisitBinaryOperator(clang::BinaryOperator * op)
 
     RecordDataFlowRef(
         ExtractAssignedSymbol(op->getLHS()),
-        "def",
+        op->isCompoundAssignmentOp() ? "readwrite" : "def",
+        op->getStmtClassName(),
+        op->getOperatorLoc());
+    return true;
+}
+
+bool ClangApiVisitor::VisitUnaryOperator(clang::UnaryOperator * op)
+{
+    if (!op || !op->isIncrementDecrementOp()) {
+        return true;
+    }
+
+    RecordDataFlowRef(
+        ExtractAssignedSymbol(op->getSubExpr()),
+        "readwrite",
         op->getStmtClassName(),
         op->getOperatorLoc());
     return true;
@@ -390,6 +450,10 @@ bool ClangApiVisitor::VisitCXXRecordDecl(
 
 bool ClangApiVisitor::VisitCallExpr(clang::CallExpr * call)
 {
+    if (!call || !call->getCallee()) {
+        return true;
+    }
+
     const clang::Expr * callee = call->getCallee()->IgnoreParenCasts();
 
     std::string callee_name;
@@ -410,6 +474,28 @@ bool ClangApiVisitor::VisitCallExpr(clang::CallExpr * call)
         ClangCallRef ref;
         ref.caller_name = current_function_name_;
         ref.callee_name = callee_name;
+        int argument_index = 0;
+        for (const clang::Expr * arg : call->arguments()) {
+            if (++argument_index > 8 || ref.argument_symbols.size() >= 32) {
+                break;
+            }
+            std::vector<std::string> group_symbols;
+            CollectReferencedSymbols(arg, &group_symbols);
+            std::sort(group_symbols.begin(), group_symbols.end());
+            group_symbols.erase(
+                std::unique(group_symbols.begin(), group_symbols.end()),
+                group_symbols.end());
+            ref.argument_symbol_groups.push_back(group_symbols);
+            ref.argument_symbols.insert(
+                ref.argument_symbols.end(),
+                group_symbols.begin(),
+                group_symbols.end());
+        }
+        std::sort(ref.argument_symbols.begin(), ref.argument_symbols.end());
+        ref.argument_symbols.erase(
+            std::unique(ref.argument_symbols.begin(), ref.argument_symbols.end()),
+            ref.argument_symbols.end());
+        ref.result_symbols = ExtractCallResultSymbols(call);
 
         ExtractSourceLocation(
             call->getBeginLoc(),
@@ -420,6 +506,30 @@ bool ClangApiVisitor::VisitCallExpr(clang::CallExpr * call)
         call_refs_.push_back(ref);
     }
 
+    return true;
+}
+
+bool ClangApiVisitor::VisitReturnStmt(clang::ReturnStmt * ret)
+{
+    if (!ret) {
+        return true;
+    }
+
+    ClangReturnRef ref;
+    ref.function_name = current_dataflow_function_name_;
+    CollectReferencedSymbols(ret->getRetValue(), &ref.return_symbols);
+    std::sort(ref.return_symbols.begin(), ref.return_symbols.end());
+    ref.return_symbols.erase(
+        std::unique(ref.return_symbols.begin(), ref.return_symbols.end()),
+        ref.return_symbols.end());
+    ExtractSourceLocation(
+        ret->getBeginLoc(),
+        &ref.source_file,
+        &ref.source_line,
+        &ref.source_col);
+    if (!ref.source_file.empty() && ref.source_line > 0) {
+        return_refs_.push_back(ref);
+    }
     return true;
 }
 
@@ -477,6 +587,7 @@ ClangAstParseResult ClangApiVisitor::GetResult() const
     result.schema.classes = classes_;
     result.schema.namespaces = namespaces_;
     result.call_refs = call_refs_;
+    result.return_refs = return_refs_;
     result.data_flow_refs = data_flow_refs_;
     result.target_namespaces = target_namespaces_;
     return result;

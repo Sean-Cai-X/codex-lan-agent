@@ -171,6 +171,73 @@ bool CompilationDatabaseMentionsSource(
     return !normalized_source.empty() && content.find(normalized_source) != std::string::npos;
 }
 
+std::string FindCompilationDatabaseFromCandidateDirs(
+    const std::vector<std::filesystem::path> & dirs,
+    const std::string & source_file)
+{
+    std::set<std::string> visited;
+    std::error_code ec;
+    for (const auto & dir : dirs) {
+        const std::filesystem::path candidate = dir / "compile_commands.json";
+        const std::string key = NormalizePathString(candidate);
+        if (visited.find(key) != visited.end()) {
+            continue;
+        }
+        visited.insert(key);
+        if (std::filesystem::exists(candidate, ec) && !ec &&
+            CompilationDatabaseMentionsSource(candidate, source_file)) {
+            return NormalizePathString(candidate);
+        }
+    }
+    return {};
+}
+
+std::string FindCompilationDatabaseUnderProjectRoot(
+    const std::string & project_root,
+    const std::string & source_file)
+{
+    if (project_root.empty() || source_file.empty()) {
+        return {};
+    }
+
+    std::error_code ec;
+    const std::filesystem::path root = std::filesystem::absolute(project_root, ec);
+    if (ec || !std::filesystem::exists(root, ec) || ec) {
+        return {};
+    }
+
+    std::vector<std::filesystem::path> dirs = {
+        root,
+        root / "build",
+        root / "AIbuild",
+        root / "build_new",
+        root / "build01",
+        root / "build_vs",
+        root / "build_ninja",
+        root / "out" / "build",
+        root / "cmake-build-debug",
+        root / "cmake-build-release"
+    };
+
+    for (const auto & entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_directory(ec) || ec) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("build", 0) == 0 ||
+            name.rfind("cmake-build", 0) == 0 ||
+            name == "out") {
+            dirs.push_back(entry.path());
+            dirs.push_back(entry.path() / "build");
+        }
+    }
+
+    return FindCompilationDatabaseFromCandidateDirs(dirs, source_file);
+}
+
 std::string FindNearbyCompilationDatabase(const std::string & source_file)
 {
     if (source_file.empty()) {
@@ -188,15 +255,21 @@ std::string FindNearbyCompilationDatabase(const std::string & source_file)
 
     std::set<std::string> visited;
     while (!current.empty()) {
-        const std::vector<std::filesystem::path> candidates = {
-            current / "compile_commands.json",
-            current / "build" / "compile_commands.json",
-            current / "AIbuild" / "compile_commands.json",
-            current / "build_new" / "compile_commands.json",
-            current / "build01" / "compile_commands.json"
+        const std::vector<std::filesystem::path> candidate_dirs = {
+            current,
+            current / "build",
+            current / "AIbuild",
+            current / "build_new",
+            current / "build01",
+            current / "build_vs",
+            current / "build_ninja",
+            current / "out" / "build",
+            current / "cmake-build-debug",
+            current / "cmake-build-release"
         };
 
-        for (const auto & candidate : candidates) {
+        for (const auto & candidate_dir : candidate_dirs) {
+            const std::filesystem::path candidate = candidate_dir / "compile_commands.json";
             const std::string key = NormalizePathString(candidate);
             if (visited.find(key) != visited.end()) {
                 continue;
@@ -500,6 +573,167 @@ int CountSourceScopedCallRefs(
     return count;
 }
 
+int CountSourceScopedDataFlowRefsByAccess(
+    const ClangAstParseResult & ast_result,
+    const std::string & source_file,
+    const std::string & access_kind)
+{
+    const std::string normalized_source = NormalizePathTextForCompare(source_file);
+    int count = 0;
+    for (const auto & ref : ast_result.data_flow_refs) {
+        if (ref.access_kind == access_kind &&
+            NormalizePathTextForCompare(ref.source_file) == normalized_source) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::string BuildInterproceduralCallBindingsJson(
+    const ClangAstParseResult & ast_result,
+    const std::string & source_file,
+    const std::set<int> * source_lines,
+    int max_bindings,
+    int * binding_count,
+    int * original_binding_count)
+{
+    if (binding_count != nullptr) {
+        *binding_count = 0;
+    }
+    if (original_binding_count != nullptr) {
+        *original_binding_count = 0;
+    }
+    if (max_bindings < 0) {
+        max_bindings = 0;
+    }
+
+    const std::string normalized_source = NormalizePathTextForCompare(source_file);
+    std::map<int, std::vector<ClangDataFlowRef>> refs_by_line;
+    for (const auto & ref : ast_result.data_flow_refs) {
+        if (ref.source_line <= 0 ||
+            NormalizePathTextForCompare(ref.source_file) != normalized_source) {
+            continue;
+        }
+        refs_by_line[ref.source_line].push_back(ref);
+    }
+    std::map<std::string, std::vector<std::string>> return_symbols_by_function;
+    for (const auto & ret : ast_result.return_refs) {
+        if (ret.function_name.empty()) {
+            continue;
+        }
+        auto & symbols = return_symbols_by_function[ret.function_name];
+        symbols.insert(symbols.end(), ret.return_symbols.begin(), ret.return_symbols.end());
+        std::sort(symbols.begin(), symbols.end());
+        symbols.erase(std::unique(symbols.begin(), symbols.end()), symbols.end());
+    }
+
+    std::ostringstream json;
+    json << "[\n";
+    bool first = true;
+    for (const auto & call : ast_result.call_refs) {
+        if (call.source_line <= 0 ||
+            NormalizePathTextForCompare(call.source_file) != normalized_source) {
+            continue;
+        }
+        if (source_lines != nullptr &&
+            source_lines->find(call.source_line) == source_lines->end()) {
+            continue;
+        }
+        if (original_binding_count != nullptr) {
+            ++(*original_binding_count);
+        }
+        if (max_bindings > 0 &&
+            binding_count != nullptr &&
+            *binding_count >= max_bindings) {
+            continue;
+        }
+
+        std::vector<std::string> arg_symbols = call.argument_symbols;
+        std::vector<std::string> result_symbols = call.result_symbols;
+        if (arg_symbols.empty() || result_symbols.empty()) {
+            const auto refs_it = refs_by_line.find(call.source_line);
+            if (refs_it != refs_by_line.end()) {
+                for (const auto & ref : refs_it->second) {
+                    if (arg_symbols.empty() && ref.access_kind == "use") {
+                        arg_symbols.push_back(ref.symbol);
+                    } else if (result_symbols.empty() && ref.access_kind == "def") {
+                        result_symbols.push_back(ref.symbol);
+                    }
+                }
+            }
+        }
+        std::vector<std::string> callee_return_symbols;
+        const auto return_it = return_symbols_by_function.find(call.callee_name);
+        if (return_it != return_symbols_by_function.end()) {
+            callee_return_symbols = return_it->second;
+        }
+        std::sort(arg_symbols.begin(), arg_symbols.end());
+        arg_symbols.erase(std::unique(arg_symbols.begin(), arg_symbols.end()), arg_symbols.end());
+        std::sort(result_symbols.begin(), result_symbols.end());
+        result_symbols.erase(std::unique(result_symbols.begin(), result_symbols.end()), result_symbols.end());
+        std::vector<std::vector<std::string>> argument_groups = call.argument_symbol_groups;
+        if (argument_groups.empty() && !arg_symbols.empty()) {
+            argument_groups.push_back(arg_symbols);
+        }
+        for (auto & group : argument_groups) {
+            std::sort(group.begin(), group.end());
+            group.erase(std::unique(group.begin(), group.end()), group.end());
+        }
+
+        if (!first) {
+            json << ",\n";
+        }
+        first = false;
+        if (binding_count != nullptr) {
+            ++(*binding_count);
+        }
+
+        json << "  {\"caller\":\"" << EscapeJsonValue(call.caller_name) << "\","
+             << "\"callee\":\"" << EscapeJsonValue(call.callee_name) << "\","
+             << "\"source_file\":\"" << EscapeJsonValue(call.source_file) << "\","
+             << "\"source_line\":" << call.source_line << ","
+             << "\"source_col\":" << call.source_col << ","
+             << "\"argument_symbols\":[";
+        for (std::size_t i = 0; i < arg_symbols.size(); ++i) {
+            if (i > 0) {
+                json << ",";
+            }
+            json << "\"" << EscapeJsonValue(arg_symbols[i]) << "\"";
+        }
+        json << "],\"argument_bindings\":[";
+        for (std::size_t i = 0; i < argument_groups.size(); ++i) {
+            if (i > 0) {
+                json << ",";
+            }
+            json << "{\"index\":" << i << ",\"symbols\":[";
+            for (std::size_t si = 0; si < argument_groups[i].size(); ++si) {
+                if (si > 0) {
+                    json << ",";
+                }
+                json << "\"" << EscapeJsonValue(argument_groups[i][si]) << "\"";
+            }
+            json << "]}";
+        }
+        json << "],\"result_symbols\":[";
+        for (std::size_t i = 0; i < result_symbols.size(); ++i) {
+            if (i > 0) {
+                json << ",";
+            }
+            json << "\"" << EscapeJsonValue(result_symbols[i]) << "\"";
+        }
+        json << "],\"callee_return_symbols\":[";
+        for (std::size_t i = 0; i < callee_return_symbols.size(); ++i) {
+            if (i > 0) {
+                json << ",";
+            }
+            json << "\"" << EscapeJsonValue(callee_return_symbols[i]) << "\"";
+        }
+        json << "],\"binding_kind\":\"callsite_argument_return_candidate\"}";
+    }
+    json << "\n]";
+    return json.str();
+}
+
 bool BuildAstStatementDfg(
     const ClangAstParseResult & ast_result,
     const std::string & source_file,
@@ -523,6 +757,7 @@ bool BuildAstStatementDfg(
     const std::string normalized_source = NormalizePathTextForCompare(source_file);
     std::map<int, std::vector<std::string>> defs_by_line;
     std::map<int, std::vector<std::string>> uses_by_line;
+    int readwrite_count = 0;
 
     for (const auto & ref : ast_result.data_flow_refs) {
         if (ref.symbol.empty() ||
@@ -532,12 +767,16 @@ bool BuildAstStatementDfg(
         }
 
         nodes->insert(ref.symbol);
-        if (ref.access_kind == "def") {
+        if (ref.access_kind == "def" || ref.access_kind == "readwrite") {
             defs_by_line[ref.source_line].push_back(ref.symbol);
             ++(*definition_count);
-        } else if (ref.access_kind == "use") {
+        }
+        if (ref.access_kind == "use" || ref.access_kind == "readwrite") {
             uses_by_line[ref.source_line].push_back(ref.symbol);
             ++(*use_count);
+        }
+        if (ref.access_kind == "readwrite") {
+            ++readwrite_count;
         }
     }
 
@@ -557,6 +796,7 @@ bool BuildAstStatementDfg(
         }
     }
 
+    (void)readwrite_count;
     return *definition_count > 0;
 }
 
@@ -565,6 +805,9 @@ struct CfgPathSensitivityInfo
     int function_count = 0;
     int branch_count = 0;
     int cyclic_function_count = 0;
+    std::string path_conditions_json = "[]";
+    std::string control_dependencies_json = "[]";
+    std::string cyclic_functions_json = "[]";
 };
 
 CfgPathSensitivityInfo ComputeCfgPathSensitivityInfo(
@@ -572,6 +815,17 @@ CfgPathSensitivityInfo ComputeCfgPathSensitivityInfo(
     const std::set<std::string> & function_names)
 {
     CfgPathSensitivityInfo info;
+    std::ostringstream path_conditions;
+    std::ostringstream control_dependencies;
+    std::ostringstream cyclic_functions;
+    bool first_condition = true;
+    bool first_dependency = true;
+    bool first_cyclic = true;
+
+    path_conditions << "[\n";
+    control_dependencies << "[\n";
+    cyclic_functions << "[\n";
+
     for (const auto & function : cfg_result.functions) {
         const std::string name = function.qualified_name.empty()
             ? function.function_name
@@ -585,8 +839,68 @@ CfgPathSensitivityInfo ComputeCfgPathSensitivityInfo(
         info.branch_count += function.branch_count;
         if (function.has_cycle) {
             ++info.cyclic_function_count;
+            if (!first_cyclic) {
+                cyclic_functions << ",\n";
+            }
+            first_cyclic = false;
+            cyclic_functions
+                << "  {\"function\":\"" << EscapeJsonValue(name) << "\","
+                << "\"source_file\":\"" << EscapeJsonValue(function.source_file) << "\","
+                << "\"source_line\":" << function.source_line << ","
+                << "\"reason\":\"cfg_cycle_detected\"}";
+        }
+
+        for (const auto & block : function.blocks) {
+            if (block.successor_ids.size() <= 1) {
+                continue;
+            }
+            const std::string condition_text = !block.label.empty()
+                ? block.label
+                : (!block.statements.empty() ? block.statements.front() : std::string());
+
+            if (!first_condition) {
+                path_conditions << ",\n";
+            }
+            first_condition = false;
+            path_conditions
+                << "  {\"function\":\"" << EscapeJsonValue(name) << "\","
+                << "\"block_id\":" << block.block_id << ","
+                << "\"source_file\":\"" << EscapeJsonValue(block.source_file) << "\","
+                << "\"source_line\":" << block.source_line << ","
+                << "\"condition_kind\":\"branch_successors\","
+                << "\"path_condition_kind\":\"cfg_branch_successor_candidate\","
+                << "\"condition_text\":\"" << EscapeJsonValue(condition_text) << "\","
+                << "\"successor_ids\":[";
+            for (std::size_t i = 0; i < block.successor_ids.size(); ++i) {
+                if (i > 0) {
+                    path_conditions << ",";
+                }
+                path_conditions << block.successor_ids[i];
+            }
+            path_conditions << "]}";
+
+            for (int successor_id : block.successor_ids) {
+                if (!first_dependency) {
+                    control_dependencies << ",\n";
+                }
+                first_dependency = false;
+                control_dependencies
+                    << "  {\"function\":\"" << EscapeJsonValue(name) << "\","
+                    << "\"controller_block_id\":" << block.block_id << ","
+                    << "\"dependent_block_id\":" << successor_id << ","
+                    << "\"source_file\":\"" << EscapeJsonValue(block.source_file) << "\","
+                    << "\"source_line\":" << block.source_line << ","
+                    << "\"dependency_kind\":\"branch_successor_candidate\","
+                    << "\"control_dependency_precision\":\"cfg_branch_successor_v1\"}";
+            }
         }
     }
+    path_conditions << "\n]";
+    control_dependencies << "\n]";
+    cyclic_functions << "\n]";
+    info.path_conditions_json = path_conditions.str();
+    info.control_dependencies_json = control_dependencies.str();
+    info.cyclic_functions_json = cyclic_functions.str();
     return info;
 }
 
@@ -1631,6 +1945,9 @@ bool ResolveCompilationDatabaseLocation(
         candidate = options.compile_db_dir;
     }
     if (candidate.empty()) {
+        candidate = FindCompilationDatabaseUnderProjectRoot(options.project_root, options.source_file);
+    }
+    if (candidate.empty()) {
         candidate = FindNearbyCompilationDatabase(options.source_file);
     }
     if (candidate.empty()) {
@@ -2061,6 +2378,7 @@ CommandResult BuildRunCfgResult(
     options.source_file = params.GetString("source_file");
     options.compile_db_dir = params.GetString("compile_db_dir");
     options.compilation_database_path = params.GetString("compilation_database_path");
+    options.project_root = params.GetString("project_root");
     options.verbose = params.GetBool("verbose", false);
     options.output_json_path = params.GetString("output_json_path");
     const std::string output_dir = params.GetString("output_dir");
@@ -2375,6 +2693,8 @@ CommandResult BuildQueryCfgArtifactResult(
         artifact_summary_path,
         artifact_json_path_source,
         artifact_json_path_resolution_detail);
+    result.fields["artifact_parser"] = "structured_json_cfg_arrays_v1";
+    result.fields["artifact_parser_status"] = "success";
     result.fields["cfg_json"] = cfg_json;
     result.fields["include_dot"] = include_dot ? "true" : "false";
     if (include_dot) {
@@ -2735,9 +3055,11 @@ CommandResult BuildRunDfgResult(
     const std::string output_dir = params.GetString("output_dir");
     const bool include_dot = params.GetBool("include_dot", true);
     const bool include_path_metadata = params.GetBool("include_path_metadata", false);
+    int max_interprocedural_bindings = params.GetInt("max_interprocedural_bindings", 512);
     int max_nodes = params.GetInt("max_nodes", 0);
     int offset_edges = params.GetInt("offset_edges", 0);
     int max_edges = params.GetInt("max_edges", 0);
+    if (max_interprocedural_bindings < 0) max_interprocedural_bindings = 0;
     if (max_nodes < 0) max_nodes = 0;
     if (offset_edges < 0) offset_edges = 0;
     if (max_edges < 0) max_edges = 0;
@@ -2923,6 +3245,16 @@ CommandResult BuildRunDfgResult(
     }
     const int source_scoped_call_ref_count =
         CountSourceScopedCallRefs(ast_result, options.source_file, nullptr);
+    int interprocedural_binding_count = 0;
+    int original_interprocedural_binding_count = 0;
+    const std::string interprocedural_bindings_json =
+        BuildInterproceduralCallBindingsJson(
+            ast_result,
+            options.source_file,
+            nullptr,
+            max_interprocedural_bindings,
+            &interprocedural_binding_count,
+            &original_interprocedural_binding_count);
 
     const std::size_t original_node_count = node_list.size();
     const std::size_t original_edge_count = edges.size();
@@ -2967,17 +3299,32 @@ CommandResult BuildRunDfgResult(
     result.fields["dfg_precision"] = used_ast_statement_dfg ? "ast_statement_def_use_v1" : "lexical_v1_ast_anchored";
     result.fields["ast_statement_level_status"] = used_ast_statement_dfg ? "ast_statement_refs_available" : "ast_ready_function_scope";
     result.fields["ast_data_flow_ref_count"] = std::to_string(ast_result.data_flow_refs.size());
+    result.fields["ast_readwrite_ref_count"] =
+        std::to_string(CountSourceScopedDataFlowRefsByAccess(ast_result, options.source_file, "readwrite"));
     result.fields["ast_anchor_function_count"] = std::to_string(dfg_ast_functions.size());
     result.fields["ast_source_scoped_call_ref_count"] = std::to_string(source_scoped_call_ref_count);
     result.fields["include_path_metadata"] = include_path_metadata ? "true" : "false";
     result.fields["path_sensitive_status"] = include_path_metadata
         ? (dfg_cfg_result.success ? "cfg_branch_metadata_available" : "cfg_branch_metadata_unavailable")
         : "cfg_branch_metadata_deferred";
+    result.fields["path_sensitive_precision"] = include_path_metadata
+        ? (dfg_cfg_result.success ? "cfg_branch_successor_candidate_v1" : "unavailable")
+        : "deferred";
     result.fields["path_condition_candidate_count"] = std::to_string(dfg_path_info.branch_count);
     result.fields["control_dependency_candidate_count"] = std::to_string(dfg_path_info.branch_count);
     result.fields["cyclic_function_candidate_count"] = std::to_string(dfg_path_info.cyclic_function_count);
+    result.fields["path_conditions_json"] = dfg_path_info.path_conditions_json;
+    result.fields["control_dependencies_json"] = dfg_path_info.control_dependencies_json;
+    result.fields["cyclic_functions_json"] = dfg_path_info.cyclic_functions_json;
     result.fields["interprocedural_status"] = "call_graph_metadata_available";
     result.fields["interprocedural_call_ref_count"] = std::to_string(source_scoped_call_ref_count);
+    result.fields["interprocedural_binding_status"] = "callsite_argument_return_candidates_available";
+    result.fields["interprocedural_binding_count"] = std::to_string(interprocedural_binding_count);
+    result.fields["original_interprocedural_binding_count"] = std::to_string(original_interprocedural_binding_count);
+    result.fields["max_interprocedural_bindings"] = std::to_string(max_interprocedural_bindings);
+    result.fields["interprocedural_bindings_truncated"] =
+        (original_interprocedural_binding_count > interprocedural_binding_count) ? "true" : "false";
+    result.fields["interprocedural_bindings_json"] = interprocedural_bindings_json;
     result.fields["elapsed_ms"] = std::to_string(ast_result.elapsed_ms);
     result.fields["preflight_status"] = "ready";
     result.fields["dfg_json"] = dfg_json;
@@ -3041,7 +3388,12 @@ CommandResult BuildRunDfgResult(
             "  \"analysis_level\": \"" + EscapeJsonValue(result.fields["analysis_level"]) + "\",\n"
             "  \"dfg_precision\": \"" + EscapeJsonValue(result.fields["dfg_precision"]) + "\",\n"
             "  \"path_condition_candidate_count\": " + result.fields["path_condition_candidate_count"] + ",\n"
-            "  \"interprocedural_call_ref_count\": " + result.fields["interprocedural_call_ref_count"] + "\n"
+            "  \"path_conditions_json\": " + result.fields["path_conditions_json"] + ",\n"
+            "  \"control_dependencies_json\": " + result.fields["control_dependencies_json"] + ",\n"
+            "  \"cyclic_functions_json\": " + result.fields["cyclic_functions_json"] + ",\n"
+            "  \"interprocedural_call_ref_count\": " + result.fields["interprocedural_call_ref_count"] + ",\n"
+            "  \"interprocedural_binding_count\": " + result.fields["interprocedural_binding_count"] + ",\n"
+            "  \"interprocedural_bindings_json\": " + result.fields["interprocedural_bindings_json"] + "\n"
             "}";
         if (!WriteArtifactBundleAndRecordPaths(
                 output_dir,
@@ -3168,6 +3520,8 @@ CommandResult BuildQueryCallGraphArtifactResult(
         artifact_summary_path,
         artifact_json_path_source,
         artifact_json_path_resolution_detail);
+    result.fields["artifact_parser"] = "structured_json_call_graph_arrays_v1";
+    result.fields["artifact_parser_status"] = "success";
     result.fields["node_count"] = std::to_string(nodes.size());
     result.fields["edge_count"] = std::to_string(edges.size());
     result.fields["original_node_count"] = std::to_string(original_node_count);
@@ -3331,6 +3685,8 @@ CommandResult BuildQueryDfgArtifactResult(
         artifact_summary_path,
         artifact_json_path_source,
         artifact_json_path_resolution_detail);
+    result.fields["artifact_parser"] = "structured_json_dfg_arrays_v1";
+    result.fields["artifact_parser_status"] = "success";
     result.fields["node_count"] = std::to_string(nodes.size());
     result.fields["edge_count"] = std::to_string(edges.size());
     result.fields["original_node_count"] = std::to_string(original_node_count);
@@ -3410,9 +3766,11 @@ CommandResult BuildRunProgramSliceResult(
     const std::string output_dir = params.GetString("output_dir");
     const bool include_dot = params.GetBool("include_dot", true);
     const bool include_path_metadata = params.GetBool("include_path_metadata", false);
+    int max_interprocedural_bindings = params.GetInt("max_interprocedural_bindings", 512);
     int max_nodes = params.GetInt("max_nodes", 0);
     int offset_edges = params.GetInt("offset_edges", 0);
     int max_edges = params.GetInt("max_edges", 0);
+    if (max_interprocedural_bindings < 0) max_interprocedural_bindings = 0;
     if (max_nodes < 0) max_nodes = 0;
     if (offset_edges < 0) offset_edges = 0;
     if (max_edges < 0) max_edges = 0;
@@ -3669,6 +4027,16 @@ CommandResult BuildRunProgramSliceResult(
     const std::set<int> slice_line_set(slice_line_list.begin(), slice_line_list.end());
     const int slice_call_ref_count =
         CountSourceScopedCallRefs(ast_result, options.source_file, &slice_line_set);
+    int slice_interprocedural_binding_count = 0;
+    int original_slice_interprocedural_binding_count = 0;
+    const std::string slice_interprocedural_bindings_json =
+        BuildInterproceduralCallBindingsJson(
+            ast_result,
+            options.source_file,
+            &slice_line_set,
+            max_interprocedural_bindings,
+            &slice_interprocedural_binding_count,
+            &original_slice_interprocedural_binding_count);
 
     const std::string slice_json =
         SerializeProgramSliceJson(symbol, direction, slice_node_list, slice_edges, slice_line_list);
@@ -3695,6 +4063,8 @@ CommandResult BuildRunProgramSliceResult(
     result.fields["slice_precision"] = used_ast_statement_slice ? "ast_statement_def_use_cfg_callgraph_v1" : "lexical_v1_ast_cfg_callgraph_anchored";
     result.fields["ast_statement_level_status"] = used_ast_statement_slice ? "ast_statement_refs_available" : "ast_ready_function_scope";
     result.fields["ast_data_flow_ref_count"] = std::to_string(ast_result.data_flow_refs.size());
+    result.fields["ast_readwrite_ref_count"] =
+        std::to_string(CountSourceScopedDataFlowRefsByAccess(ast_result, options.source_file, "readwrite"));
     result.fields["ast_anchor_function_count"] = std::to_string(slice_ast_functions.size());
     result.fields["ast_source_scoped_call_ref_count"] =
         std::to_string(CountSourceScopedCallRefs(ast_result, options.source_file, nullptr));
@@ -3702,11 +4072,24 @@ CommandResult BuildRunProgramSliceResult(
     result.fields["path_sensitive_status"] = include_path_metadata
         ? (slice_cfg_result.success ? "cfg_branch_metadata_available" : "cfg_branch_metadata_unavailable")
         : "cfg_branch_metadata_deferred";
+    result.fields["path_sensitive_precision"] = include_path_metadata
+        ? (slice_cfg_result.success ? "cfg_branch_successor_candidate_v1" : "unavailable")
+        : "deferred";
     result.fields["path_condition_candidate_count"] = std::to_string(slice_path_info.branch_count);
     result.fields["control_dependency_candidate_count"] = std::to_string(slice_path_info.branch_count);
     result.fields["cyclic_function_candidate_count"] = std::to_string(slice_path_info.cyclic_function_count);
+    result.fields["path_conditions_json"] = slice_path_info.path_conditions_json;
+    result.fields["control_dependencies_json"] = slice_path_info.control_dependencies_json;
+    result.fields["cyclic_functions_json"] = slice_path_info.cyclic_functions_json;
     result.fields["interprocedural_status"] = "call_graph_metadata_available";
     result.fields["interprocedural_call_ref_count"] = std::to_string(slice_call_ref_count);
+    result.fields["interprocedural_binding_status"] = "callsite_argument_return_candidates_available";
+    result.fields["interprocedural_binding_count"] = std::to_string(slice_interprocedural_binding_count);
+    result.fields["original_interprocedural_binding_count"] = std::to_string(original_slice_interprocedural_binding_count);
+    result.fields["max_interprocedural_bindings"] = std::to_string(max_interprocedural_bindings);
+    result.fields["interprocedural_bindings_truncated"] =
+        (original_slice_interprocedural_binding_count > slice_interprocedural_binding_count) ? "true" : "false";
+    result.fields["interprocedural_bindings_json"] = slice_interprocedural_bindings_json;
     result.fields["preflight_status"] = "ready";
     result.fields["slice_json"] = slice_json;
     result.fields["include_dot"] = include_dot ? "true" : "false";
@@ -3768,7 +4151,12 @@ CommandResult BuildRunProgramSliceResult(
             "  \"analysis_level\": \"" + EscapeJsonValue(result.fields["analysis_level"]) + "\",\n"
             "  \"slice_precision\": \"" + EscapeJsonValue(result.fields["slice_precision"]) + "\",\n"
             "  \"path_condition_candidate_count\": " + result.fields["path_condition_candidate_count"] + ",\n"
-            "  \"interprocedural_call_ref_count\": " + result.fields["interprocedural_call_ref_count"] + "\n"
+            "  \"path_conditions_json\": " + result.fields["path_conditions_json"] + ",\n"
+            "  \"control_dependencies_json\": " + result.fields["control_dependencies_json"] + ",\n"
+            "  \"cyclic_functions_json\": " + result.fields["cyclic_functions_json"] + ",\n"
+            "  \"interprocedural_call_ref_count\": " + result.fields["interprocedural_call_ref_count"] + ",\n"
+            "  \"interprocedural_binding_count\": " + result.fields["interprocedural_binding_count"] + ",\n"
+            "  \"interprocedural_bindings_json\": " + result.fields["interprocedural_bindings_json"] + "\n"
             "}";
         if (!WriteArtifactBundleAndRecordPaths(
                 output_dir,
@@ -3919,6 +4307,8 @@ CommandResult BuildQueryProgramSliceArtifactResult(
         artifact_summary_path,
         artifact_json_path_source,
         artifact_json_path_resolution_detail);
+    result.fields["artifact_parser"] = "structured_json_program_slice_arrays_v1";
+    result.fields["artifact_parser_status"] = "success";
     result.fields["artifact_source_lines_json_path"] = source_lines_path;
     result.fields["artifact_source_lines_json_path_resolved_from"] = source_lines_path_source;
     result.fields["artifact_source_lines_json_path_resolution_detail"] = source_lines_path_resolution_detail;

@@ -184,6 +184,72 @@ void WriteCallRefJson(
     WriteIndent(oss, indent + 1);
     oss << "\"callee_name\": \"" << EscapeJsonString(ref.callee_name) << "\",\n";
     WriteIndent(oss, indent + 1);
+    oss << "\"argument_symbols\": [";
+    for (size_t i = 0; i < ref.argument_symbols.size(); ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << "\"" << EscapeJsonString(ref.argument_symbols[i]) << "\"";
+    }
+    oss << "],\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"argument_bindings\": [\n";
+    for (size_t ai = 0; ai < ref.argument_symbol_groups.size(); ++ai) {
+        WriteIndent(oss, indent + 2);
+        oss << "{\"index\": " << ai << ", \"symbols\": [";
+        const auto & symbols = ref.argument_symbol_groups[ai];
+        for (size_t si = 0; si < symbols.size(); ++si) {
+            if (si > 0) {
+                oss << ", ";
+            }
+            oss << "\"" << EscapeJsonString(symbols[si]) << "\"";
+        }
+        oss << "]}";
+        if (ai + 1 < ref.argument_symbol_groups.size()) {
+            oss << ",";
+        }
+        oss << "\n";
+    }
+    WriteIndent(oss, indent + 1);
+    oss << "],\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"result_symbols\": [";
+    for (size_t i = 0; i < ref.result_symbols.size(); ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << "\"" << EscapeJsonString(ref.result_symbols[i]) << "\"";
+    }
+    oss << "],\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"source_file\": \"" << EscapeJsonString(ref.source_file) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"source_line\": " << ref.source_line << ",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"source_col\": " << ref.source_col << "\n";
+    WriteIndent(oss, indent);
+    oss << "}";
+}
+
+void WriteReturnRefJson(
+    std::ostringstream & oss,
+    const ClangReturnRef & ref,
+    int indent)
+{
+    WriteIndent(oss, indent);
+    oss << "{\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"function_name\": \"" << EscapeJsonString(ref.function_name) << "\",\n";
+    WriteIndent(oss, indent + 1);
+    oss << "\"return_symbols\": [";
+    for (size_t i = 0; i < ref.return_symbols.size(); ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << "\"" << EscapeJsonString(ref.return_symbols[i]) << "\"";
+    }
+    oss << "],\n";
+    WriteIndent(oss, indent + 1);
     oss << "\"source_file\": \"" << EscapeJsonString(ref.source_file) << "\",\n";
     WriteIndent(oss, indent + 1);
     oss << "\"source_line\": " << ref.source_line << ",\n";
@@ -287,6 +353,16 @@ std::string SerializeAstParseResultToJson(
     for (size_t i = 0; i < result.call_refs.size(); ++i) {
         WriteCallRefJson(oss, result.call_refs[i], 2);
         if (i + 1 < result.call_refs.size()) {
+            oss << ",";
+        }
+        oss << "\n";
+    }
+    oss << "  ],\n";
+
+    oss << "  \"return_refs\": [\n";
+    for (size_t i = 0; i < result.return_refs.size(); ++i) {
+        WriteReturnRefJson(oss, result.return_refs[i], 2);
+        if (i + 1 < result.return_refs.size()) {
             oss << ",";
         }
         oss << "\n";
