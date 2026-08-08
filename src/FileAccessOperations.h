@@ -308,6 +308,25 @@ std::string ExtractLastJsonObjectLine(const std::string & text) {
     return last_json;
 }
 
+int CountNonOverlappingOccurrences(
+    const std::string & text,
+    const std::string & needle) {
+    if (text.empty() || needle.empty()) {
+        return 0;
+    }
+    int count = 0;
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        const std::size_t found = text.find(needle, offset);
+        if (found == std::string::npos) {
+            break;
+        }
+        ++count;
+        offset = found + needle.size();
+    }
+    return count;
+}
+
 bool BuildOptfileTargetArguments(
     const AgentConfig & config,
     const std::string & file_path,
@@ -530,6 +549,8 @@ CommandResult LocateTextLinesResult(
         result.ok = false;
         result.exit_code = 20;
         result.fields["error"] = "file_path is required";
+        result.fields["error_code"] = "missing_file_path";
+        result.fields["next_action"] = "retry lan_agent_probe_text_file with file_path";
         return result;
     }
     if (anchor_text.empty()) {
@@ -884,6 +905,17 @@ CommandResult DeleteContentAtomicResult(
         result.fields["error"] = path_error;
         return result;
     }
+    std::string before_content;
+    std::string before_read_error;
+    if (!ReadWholeFile(normalized_path, &before_content, &before_read_error)) {
+        result.ok = false;
+        result.exit_code = 23;
+        result.fields["error"] = before_read_error;
+        result.fields["error_code"] = "file_read_before_delete_failed";
+        return result;
+    }
+    const std::string old_hash = StableContentChecksum(before_content);
+    const int before_anchor_count = CountNonOverlappingOccurrences(before_content, anchor_text);
     arguments.push_back("--delete-content " + QuoteOptfileArgument(anchor_text));
     arguments.push_back("--occurrence " + std::to_string(std::max(1, occurrence)));
     if (!expected_anchor_hash.empty()) {
@@ -899,6 +931,54 @@ CommandResult DeleteContentAtomicResult(
     if (!request_id.empty()) result.fields["request_id"] = request_id;
     if (!trace_id.empty()) result.fields["trace_id"] = trace_id;
     if (!result.ok) {
+        const int helper_exit_code = result.exit_code;
+        const std::string helper_error = GetFieldOrDefault(result, "error", "");
+        std::string final_content;
+        std::string read_error;
+        if (ReadWholeFile(normalized_path, &final_content, &read_error)) {
+            const int after_anchor_count = CountNonOverlappingOccurrences(final_content, anchor_text);
+            result.fields["old_hash"] = old_hash;
+            result.fields["new_hash"] = StableContentChecksum(final_content);
+            result.fields["before_anchor_occurrence_count"] = std::to_string(before_anchor_count);
+            result.fields["after_anchor_occurrence_count"] = std::to_string(after_anchor_count);
+            result.fields["helper_exit_code"] = std::to_string(helper_exit_code);
+            result.fields["helper_error"] = helper_error;
+            result.fields["final_write_tool"] = "optfile.exe";
+            result.fields["content_payload_format"] = "json";
+            result.fields["content_payload_scope"] = "metadata_only";
+            result.fields["content_payload_boundary_safe"] = "true";
+            if (before_anchor_count > after_anchor_count) {
+                result.ok = true;
+                result.exit_code = 0;
+                result.fields["write_applied"] = "true";
+                result.fields["write_verified"] = "true";
+                result.fields["disk_write_completed"] = "true";
+                result.fields["result"] = "delete_content_atomic_applied_after_readback";
+                result.fields["summary"] = BuildOptfileTextMutationSummary(
+                    "delete_content_atomic",
+                    normalized_path,
+                    "verified_by_occurrence_count_after_helper_failure");
+                result.fields["recovered_after_helper_failure"] = "true";
+                result.fields["recovery_reason"] = "target content occurrence count decreased after helper returned a failed or incomplete envelope";
+                result.fields["verification_status"] = "verified_by_readback";
+                result.fields["verification_ok"] = "true";
+                result.fields["next_action"] = "rescan with lan_agent_scan_text_ranges(range_offset=0,max_ranges_per_call=1,scan_mode=comments) before the next edit";
+            } else {
+                result.fields["write_applied"] = "false";
+                result.fields["write_verified"] = "false";
+                result.fields["disk_write_completed"] = "false";
+                result.fields["error_code"] = FirstNonEmpty(
+                    GetFieldOrDefault(result, "error_code", ""),
+                    "delete_content_not_verified",
+                    "delete_content_not_verified");
+                result.fields["failure_mode"] = result.fields["error_code"];
+                result.fields["next_action"] = "do not retry blindly; rescan the current file and prepare a fresh single edit window";
+            }
+        } else {
+            result.fields["readback_error"] = read_error;
+            result.fields["error_code"] = "delete_content_readback_failed";
+            result.fields["failure_mode"] = result.fields["error_code"];
+        }
         return result;
     }
 
@@ -915,7 +995,11 @@ CommandResult DeleteContentAtomicResult(
     result.fields["status"] = ExtractJsonString(json_output, "status");
     result.fields["deleted_line"] = Trim(ExtractJsonRawValue(json_output, "deleted_line"));
     result.fields["deleted_line_hash_before"] = ExtractJsonString(json_output, "deleted_line_hash_before");
+    result.fields["old_hash"] = old_hash;
     result.fields["new_hash"] = StableContentChecksum(final_content);
+    result.fields["before_anchor_occurrence_count"] = std::to_string(before_anchor_count);
+    result.fields["after_anchor_occurrence_count"] = std::to_string(
+        CountNonOverlappingOccurrences(final_content, anchor_text));
     result.fields["written_text_bytes"] = "0";
     result.fields["write_applied"] = "true";
     result.fields["write_verified"] = "true";
@@ -1794,6 +1878,10 @@ CommandResult ReadTextFileResult(
         result.ok = false;
         result.exit_code = 21;
         result.fields["error"] = path_error;
+        result.fields["error_code"] = path_error == "path is outside allowed roots"
+            ? "path_outside_allowed_roots"
+            : "path_resolution_failed";
+        result.fields["next_action"] = "add the target project root to allowed_roots or retry with a path under an allowed root";
         return result;
     }
 
@@ -2039,6 +2127,8 @@ CommandResult ReadTextFileResult(
         result.ok = false;
         result.exit_code = 23;
         result.fields["error"] = "failed to open file";
+        result.fields["error_code"] = "file_open_failed";
+        result.fields["next_action"] = "verify the file exists, is readable, and is not locked";
         return result;
     }
 
@@ -2177,6 +2267,10 @@ CommandResult ProbeTextFileResult(
         result.ok = false;
         result.exit_code = 21;
         result.fields["error"] = path_error;
+        result.fields["error_code"] = path_error == "path is outside allowed roots"
+            ? "path_outside_allowed_roots"
+            : "path_resolution_failed";
+        result.fields["next_action"] = "add the target project root to allowed_roots or retry with a path under an allowed root";
         return result;
     }
 
@@ -2191,6 +2285,8 @@ CommandResult ProbeTextFileResult(
         result.ok = false;
         result.exit_code = 23;
         result.fields["error"] = "failed to open file";
+        result.fields["error_code"] = "file_open_failed";
+        result.fields["next_action"] = "verify the file exists, is readable, and is not locked";
         return result;
     }
 
@@ -3193,6 +3289,8 @@ CommandResult ScanTextRangesResult(
         result.ok = false;
         result.exit_code = 74;
         result.fields["error"] = "file_path is required";
+        result.fields["error_code"] = "missing_file_path";
+        result.fields["next_action"] = "retry lan_agent_scan_text_ranges with file_path";
         return result;
     }
 
@@ -3201,6 +3299,8 @@ CommandResult ScanTextRangesResult(
         result.ok = false;
         result.exit_code = 75;
         result.fields["error"] = "unsupported scan_mode; use comments, line_comments, or block_comments";
+        result.fields["error_code"] = "unsupported_scan_mode";
+        result.fields["next_action"] = "retry lan_agent_scan_text_ranges with scan_mode=comments for comment cleanup";
         return result;
     }
 
@@ -3210,6 +3310,10 @@ CommandResult ScanTextRangesResult(
         result.ok = false;
         result.exit_code = 76;
         result.fields["error"] = path_error;
+        result.fields["error_code"] = path_error == "path is outside allowed roots"
+            ? "path_outside_allowed_roots"
+            : "path_resolution_failed";
+        result.fields["next_action"] = "add the target project root to allowed_roots or retry with a path under an allowed root";
         return result;
     }
 
@@ -3260,7 +3364,8 @@ CommandResult ScanTextRangesResult(
         }
     }
 
-    const int bounded_max_ranges_per_call = std::max(1, max_ranges_per_call);
+    const int requested_max_ranges_per_call = std::max(1, max_ranges_per_call);
+    const int bounded_max_ranges_per_call = 1;
     const int bounded_range_offset = std::max(0, range_offset);
     const int total_range_count = static_cast<int>(all_ranges.size());
     const int end_index = std::min(total_range_count, bounded_range_offset + bounded_max_ranges_per_call);
@@ -3304,39 +3409,46 @@ CommandResult ScanTextRangesResult(
     result.fields["total_range_count"] = std::to_string(total_range_count);
     result.fields["returned_range_count"] = std::to_string(page_ranges.size());
     result.fields["range_offset"] = std::to_string(bounded_range_offset);
+    result.fields["requested_max_ranges_per_call"] = std::to_string(requested_max_ranges_per_call);
     result.fields["max_ranges_per_call"] = std::to_string(bounded_max_ranges_per_call);
     result.fields["next_range_offset"] = has_more ? std::to_string(next_range_offset) : "";
     result.fields["has_more"] = has_more ? "true" : "false";
+    result.fields["has_more_after_current_step"] = has_more ? "true" : "false";
     result.fields["cache_hit"] = cache_hit ? "true" : "false";
-    result.fields["task_completion"] = has_more ? "incomplete" : "complete";
-    result.fields["continue_required"] = has_more ? "true" : "false";
-    result.fields["auto_continue_required"] = has_more ? "true" : "false";
+    result.fields["task_completion"] = page_ranges.empty() ? "complete" : "single_item_ready";
+    result.fields["step_completion"] = page_ranges.empty() ? "no_item" : "current_item_ready";
+    result.fields["continue_required"] = page_ranges.empty() ? "false" : "true";
+    result.fields["auto_continue_required"] = "false";
     result.fields["analysis_allowed"] = "true";
+    result.fields["single_step_required"] = "true";
+    result.fields["operation_granularity"] = "single_text_range";
+    result.fields["max_items_per_call"] = "1";
+    result.fields["batch_mutation_allowed"] = "false";
     result.fields["content"] = summary_text;
     result.fields["content_text"] = summary_text;
     result.fields["content_payload_format"] = "plain_text";
     result.fields["content_payload_scope"] = "text_range_scan_summary";
     result.fields["content_payload_boundary_safe"] = "true";
     result.fields["ranges_json"] = ranges_json;
-    result.fields["next_action"] = has_more
-        ? "continue scanning range pages or pass current ranges_json into lan_agent_prepare_edit_windows"
-        : "pass ranges_json into lan_agent_prepare_edit_windows for localized edit windows";
-    result.fields["next_call_json"] = has_more
-        ? ("{\"name\":\"lan_agent_scan_text_ranges\",\"arguments\":{\"file_path\":\""
+    result.fields["next_action"] = page_ranges.empty()
+        ? "no matching range remains; stop the edit loop or verify final state"
+        : "process only the current range: call lan_agent_prepare_edit_windows with this ranges_json, apply one atomic edit, verify, then rescan from range_offset=0";
+    result.fields["next_call_json"] = page_ranges.empty()
+        ? ""
+        : ("{\"name\":\"lan_agent_prepare_edit_windows\",\"arguments\":{\"file_path\":\""
             + codex_lan_agent::JsonEscape(file_path)
-            + "\",\"scan_mode\":\"" + codex_lan_agent::JsonEscape(normalized_scan_mode)
-            + "\",\"max_ranges_per_call\":" + std::to_string(bounded_max_ranges_per_call)
-            + ",\"range_offset\":" + std::to_string(next_range_offset)
+            + "\",\"ranges_json\":\"" + codex_lan_agent::JsonEscape(ranges_json)
+            + "\",\"context_before\":2,\"context_after\":2,\"max_windows_per_call\":1,\"window_offset\":0"
             + (trace_id.empty() ? std::string() : ",\"trace_id\":\"" + codex_lan_agent::JsonEscape(trace_id) + "\"")
             + (probe_ref.empty() ? std::string() : ",\"probe_ref\":\"" + codex_lan_agent::JsonEscape(probe_ref) + "\",\"probe_ready\":true")
-            + "}}")
-        : "";
+            + "}}");
     result.fields["result_ref"] = result_path;
     result.fields["evidence_ref"] = result_path;
     result.fields["log_path"] = result_path;
     result.fields["scan_result_ref"] = result_path;
     result.fields["scan_contract"] =
-        "scan server-side text ranges first, then prepare localized edit windows instead of reading the whole file";
+        "single-step loop: scan one range, prepare one window, apply one atomic edit, verify, then rescan from offset 0";
+    result.fields["step_contract"] = result.fields["scan_contract"];
     result.fields["server_side_atomic_read"] = "true";
     return result;
 }
@@ -3396,7 +3508,8 @@ CommandResult PrepareEditWindowsResult(
     const int total_lines = static_cast<int>(lines.size());
     const int bounded_context_before = std::max(0, context_before);
     const int bounded_context_after = std::max(0, context_after);
-    const int bounded_max_windows_per_call = std::max(1, max_windows_per_call);
+    const int requested_max_windows_per_call = std::max(1, max_windows_per_call);
+    const int bounded_max_windows_per_call = 1;
     const int bounded_window_offset = std::max(0, window_offset);
     const std::size_t bounded_max_window_chars = std::max<std::size_t>(256, max_window_chars);
     const int total_window_count = static_cast<int>(all_ranges.size());
@@ -3477,39 +3590,35 @@ CommandResult PrepareEditWindowsResult(
     result.fields["total_window_count"] = std::to_string(total_window_count);
     result.fields["returned_window_count"] = std::to_string(page_ranges.size());
     result.fields["window_offset"] = std::to_string(bounded_window_offset);
+    result.fields["requested_max_windows_per_call"] = std::to_string(requested_max_windows_per_call);
     result.fields["max_windows_per_call"] = std::to_string(bounded_max_windows_per_call);
     result.fields["context_before"] = std::to_string(bounded_context_before);
     result.fields["context_after"] = std::to_string(bounded_context_after);
     result.fields["max_window_chars"] = std::to_string(bounded_max_window_chars);
     result.fields["windows_json"] = windows_json;
     result.fields["has_more"] = has_more ? "true" : "false";
+    result.fields["has_more_after_current_step"] = has_more ? "true" : "false";
     result.fields["next_window_offset"] = has_more ? std::to_string(next_window_offset) : "";
-    result.fields["task_completion"] = has_more ? "incomplete" : "complete";
-    result.fields["continue_required"] = has_more ? "true" : "false";
-    result.fields["auto_continue_required"] = has_more ? "true" : "false";
+    result.fields["task_completion"] = page_ranges.empty() ? "complete" : "single_item_ready";
+    result.fields["step_completion"] = page_ranges.empty() ? "no_item" : "current_item_ready";
+    result.fields["continue_required"] = page_ranges.empty() ? "false" : "true";
+    result.fields["auto_continue_required"] = "false";
     result.fields["analysis_allowed"] = page_ranges.empty() ? "false" : "true";
-    result.fields["next_action"] = has_more
-        ? "consume current windows_json, then continue with next_call_json for more windows"
-        : "consume windows_json and apply localized patch operations from the bottom-most windows upward";
-    result.fields["next_call_json"] = has_more
-        ? ("{\"name\":\"lan_agent_prepare_edit_windows\",\"arguments\":{\"file_path\":\""
-            + codex_lan_agent::JsonEscape(file_path)
-            + "\",\"ranges_json\":\"" + codex_lan_agent::JsonEscape(ranges_json)
-            + "\",\"context_before\":" + std::to_string(bounded_context_before)
-            + ",\"context_after\":" + std::to_string(bounded_context_after)
-            + ",\"max_windows_per_call\":" + std::to_string(bounded_max_windows_per_call)
-            + ",\"window_offset\":" + std::to_string(next_window_offset)
-            + ",\"max_window_chars\":" + std::to_string(bounded_max_window_chars)
-            + (trace_id.empty() ? std::string() : ",\"trace_id\":\"" + codex_lan_agent::JsonEscape(trace_id) + "\"")
-            + (probe_ref.empty() ? std::string() : ",\"probe_ref\":\"" + codex_lan_agent::JsonEscape(probe_ref) + "\",\"probe_ready\":true")
-            + "}}")
-        : "";
+    result.fields["single_step_required"] = "true";
+    result.fields["operation_granularity"] = "single_edit_window";
+    result.fields["max_items_per_call"] = "1";
+    result.fields["batch_mutation_allowed"] = "false";
+    result.fields["next_action"] = page_ranges.empty()
+        ? "no edit window was produced; rescan or stop"
+        : "apply exactly one atomic edit for this window, verify the file state, then call lan_agent_scan_text_ranges again with range_offset=0";
+    result.fields["next_call_json"] = "";
     result.fields["result_ref"] = result_path;
     result.fields["evidence_ref"] = result_path;
     result.fields["log_path"] = result_path;
     result.fields["edit_window_bundle_ref"] = result_path;
     result.fields["edit_window_contract"] =
-        "consume windows_json page by page and patch bottom-up instead of reading or rewriting the whole file";
+        "single-step loop: consume exactly one window, apply one atomic edit, verify, then rescan; do not batch windows or patch bottom-up in one call";
+    result.fields["step_contract"] = result.fields["edit_window_contract"];
     result.fields["server_side_atomic_read"] = "true";
     return result;
 }

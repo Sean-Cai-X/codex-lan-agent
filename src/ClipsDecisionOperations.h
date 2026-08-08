@@ -138,6 +138,10 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot revert_plan_ready (default "false"))
               (slot path_within_workspace (default "false"))
               (slot file_count (default "1"))
+              (slot max_items_per_call (default ""))
+              (slot single_step_required (default "false"))
+              (slot operation_granularity (default ""))
+              (slot batch_mutation_allowed (default "false"))
               (slot explicit_user_intent (default "false"))
               (slot probe_required (default "false"))
               (slot requires_preview (default "false"))
@@ -181,7 +185,13 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot log_path (default ""))
               (slot patch_id (default ""))
               (slot write_verified (default ""))
-              (slot disk_write_completed (default ""))))",
+              (slot disk_write_completed (default ""))
+              (slot single_step_required (default ""))
+              (slot operation_granularity (default ""))
+              (slot max_items_per_call (default ""))
+              (slot batch_mutation_allowed (default ""))
+              (slot step_completion (default ""))
+              (slot step_contract (default ""))))",
         R"((deftemplate mcp_tool_chain
               (slot chain_template_id (default "mcp_tool_chain_v1"))
               (slot tool_name)
@@ -287,6 +297,40 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (reason_code "missing_patch_intent")
                       (next_action "provide a non-empty reason or repair_candidate intent before apply")
                       (matched_rule "block-single-file-patch-apply-without-explicit-intent")))))",
+            R"((defrule block-stepwise-file-tool-multi-item-request
+                  (declare (salience 88))
+                  (mcp_tool_request (tool_name ?tool)
+                                    (single_step_required "true")
+                                    (max_items_per_call ?count&:(neq ?count "")&:(neq ?count "1")))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target ?tool)
+                      (decision "block")
+                      (verification "not_verified")
+                      (reason_code "multi_item_file_step_not_allowed")
+                      (next_action "redo this file operation with max_ranges_per_call=1 or max_windows_per_call=1; process one item, verify, then rescan")
+                      (matched_rule "block-stepwise-file-tool-multi-item-request")))))",
+            R"((defrule block-broad-file-mutation-for-stepwise-editing-intent
+                  (declare (salience 88))
+                  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_write_text_file")
+                                                          (eq ?tool "lan_agent_apply_single_file_patch")
+                                                          (eq ?tool "lan_agent_apply_diff_patch")))
+                                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
+                                                                 (eq ?intent "text_cleaning")
+                                                                 (eq ?intent "localized_edit")
+                                                                 (eq ?intent "source_edit_planning")
+                                                                 (eq ?intent "remove_comments")
+                                                                 (eq ?intent "strip_comments"))))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target ?tool)
+                      (decision "block")
+                      (verification "not_verified")
+                      (reason_code "bulk_file_mutation_not_allowed_for_stepwise_edit")
+                      (next_action "use the single-step loop: lan_agent_scan_text_ranges(max_ranges_per_call=1), lan_agent_prepare_edit_windows(max_windows_per_call=1), one atomic delete/replace, verify, then rescan")
+                      (matched_rule "block-broad-file-mutation-for-stepwise-editing-intent")))))",
             R"((defrule block-multi-file-patch-in-phase1
                   (declare (salience 87))
                   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_preview_patch")
@@ -1158,6 +1202,25 @@ std::string BuildMcpToolChainFact(
         + ")";
 }
 
+int CountUnifiedDiffHunks(const std::string & diff_text) {
+    if (diff_text.empty()) {
+        return 0;
+    }
+    int count = 0;
+    bool at_line_start = true;
+    for (std::size_t index = 0; index + 1 < diff_text.size(); ++index) {
+        if (at_line_start && diff_text[index] == '@' && diff_text[index + 1] == '@') {
+            ++count;
+        }
+        at_line_start = diff_text[index] == '\n' || diff_text[index] == '\r';
+        if (diff_text[index] == '\r' && index + 1 < diff_text.size() && diff_text[index + 1] == '\n') {
+            ++index;
+            at_line_start = true;
+        }
+    }
+    return count;
+}
+
 std::string BuildMcpToolRequestFact(
     const AgentConfig & config,
     const std::string & tool_name,
@@ -1203,6 +1266,44 @@ std::string BuildMcpToolRequestFact(
         tool_name == "lan_agent_apply_single_file_patch"
         || tool_name == "lan_agent_apply_diff_patch"
         || tool_name == "lan_agent_revert_single_file_patch";
+    const bool single_step_required =
+        tool_name == "lan_agent_scan_text_ranges"
+        || tool_name == "lan_agent_prepare_edit_windows"
+        || tool_name == "lan_agent_find_line_metadata"
+        || tool_name == "lan_agent_find_content_matches"
+        || tool_name == "lan_agent_locate_text_lines"
+        || tool_name == "lan_agent_delete_line_atomic"
+        || tool_name == "lan_agent_delete_content_atomic"
+        || tool_name == "lan_agent_insert_after_anchor_atomic"
+        || tool_name == "lan_agent_replace_line_range_atomic"
+        || tool_name == "lan_agent_write_text_file"
+        || tool_name == "lan_agent_apply_single_file_patch"
+        || tool_name == "lan_agent_apply_diff_patch";
+    std::string max_items_per_call;
+    std::string operation_granularity;
+    if (tool_name == "lan_agent_scan_text_ranges") {
+        max_items_per_call = params.GetRawJson("max_ranges_per_call");
+        operation_granularity = "single_text_range";
+    } else if (tool_name == "lan_agent_prepare_edit_windows") {
+        max_items_per_call = params.GetRawJson("max_windows_per_call");
+        operation_granularity = "single_edit_window";
+    } else if (tool_name == "lan_agent_delete_line_atomic"
+               || tool_name == "lan_agent_delete_content_atomic"
+               || tool_name == "lan_agent_insert_after_anchor_atomic"
+               || tool_name == "lan_agent_replace_line_range_atomic") {
+        max_items_per_call = "1";
+        operation_granularity = "single_atomic_mutation";
+    } else if (tool_name == "lan_agent_apply_diff_patch") {
+        const int diff_hunk_count = CountUnifiedDiffHunks(params.GetString("diff_text"));
+        max_items_per_call = diff_hunk_count > 0
+            ? std::to_string(diff_hunk_count)
+            : params.GetRawJson("mutation_count", "1");
+        operation_granularity = "single_diff_hunk";
+    } else if (tool_name == "lan_agent_write_text_file"
+               || tool_name == "lan_agent_apply_single_file_patch") {
+        max_items_per_call = params.GetRawJson("mutation_count", "1");
+        operation_granularity = "broad_file_mutation";
+    }
     const std::string preflight_status = FirstNonEmpty(
         params.GetString("preflight_status"),
         params.GetString("cxparser_preflight_status"),
@@ -1237,6 +1338,10 @@ std::string BuildMcpToolRequestFact(
         + ClipsBoolSlot("revert_plan_ready", is_patch_tool) + " "
         + ClipsBoolSlot("path_within_workspace", path_within_workspace) + " "
         + ClipsStringSlot("file_count", file_path.empty() ? "0" : "1") + " "
+        + ClipsStringSlot("max_items_per_call", max_items_per_call) + " "
+        + ClipsBoolSlot("single_step_required", single_step_required) + " "
+        + ClipsStringSlot("operation_granularity", operation_granularity) + " "
+        + ClipsBoolSlot("batch_mutation_allowed", false) + " "
         + ClipsBoolSlot("explicit_user_intent", explicit_user_intent) + " "
         + ClipsBoolSlot("probe_required", probe_required) + " "
         + ClipsBoolSlot("requires_preview", tool_name == "lan_agent_preview_patch") + " "
@@ -1367,7 +1472,16 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("log_path", GetFieldOrDefault(result, "log_path", "")) + " "
         + ClipsStringSlot("patch_id", GetFieldOrDefault(result, "patch_id", "")) + " "
         + ClipsStringSlot("write_verified", GetFieldOrDefault(result, "write_verified", "")) + " "
-        + ClipsStringSlot("disk_write_completed", GetFieldOrDefault(result, "disk_write_completed", ""))
+        + ClipsStringSlot("disk_write_completed", GetFieldOrDefault(result, "disk_write_completed", "")) + " "
+        + ClipsStringSlot("single_step_required", GetFieldOrDefault(result, "single_step_required", "")) + " "
+        + ClipsStringSlot("operation_granularity", GetFieldOrDefault(result, "operation_granularity", "")) + " "
+        + ClipsStringSlot("max_items_per_call", GetFieldOrDefault(result, "max_items_per_call", "")) + " "
+        + ClipsStringSlot("batch_mutation_allowed", GetFieldOrDefault(result, "batch_mutation_allowed", "")) + " "
+        + ClipsStringSlot("step_completion", GetFieldOrDefault(result, "step_completion", "")) + " "
+        + ClipsStringSlot("step_contract", FirstNonEmpty(
+            GetFieldOrDefault(result, "step_contract", ""),
+            GetFieldOrDefault(result, "scan_contract", ""),
+            GetFieldOrDefault(result, "edit_window_contract", "")))
         + ")";
 }
 
@@ -1938,6 +2052,12 @@ bool MaybeApplyClipsPreflightBlock(
             tool_decision.reason_code,
             "clips_tool_call_blocked",
             "clips_tool_call_blocked");
+        result->fields["error_code"] = result->fields["error"];
+        result->fields["error_message"] = FirstNonEmpty(
+            tool_decision.next_action,
+            tool_decision.reason_code,
+            "CLIPS pre-guard blocked the tool call before execution.");
+        result->fields["failure_mode"] = result->fields["error"];
         if (!tool_decision.next_action.empty()) {
             result->fields["next_action"] = tool_decision.next_action;
         }
@@ -2001,6 +2121,12 @@ bool MaybeApplyClipsPreflightBlock(
             decision.reason_code,
             "clips_pre_call_blocked",
             "clips_pre_call_blocked");
+        result->fields["error_code"] = result->fields["error"];
+        result->fields["error_message"] = FirstNonEmpty(
+            decision.next_action,
+            decision.reason_code,
+            "CLIPS pre-guard blocked the tool call before execution.");
+        result->fields["failure_mode"] = result->fields["error"];
         if (!decision.next_action.empty()) {
             result->fields["next_action"] = decision.next_action;
         }

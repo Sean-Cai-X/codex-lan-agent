@@ -383,7 +383,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "file_probe",
             "text file probe returned",
-            "ok,exit_code,status,result,summary,file_path,current_file_path,normalized_path,file_bytes,total_bytes,total_lines,line_count,returned_lines,remaining_lines,probe_mode,probe_complete,probe_ref,probe_ready,analysis_allowed,file_length_class,content_payload_format,content_payload_scope,content_payload_boundary_safe,structured_body_read_mode,structured_body_helper_bypassed,pagination_basis,recommended_next_tool,recommended_read_max_lines,recommended_scan_mode,next_call_json,next_tool_name,next_action,task_completion,continue_required,auto_continue_required,read_complete,file_complete,has_more,result_ref,evidence_ref,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,file_path,current_file_path,normalized_path,file_bytes,total_bytes,total_lines,line_count,returned_lines,remaining_lines,probe_mode,probe_complete,probe_ref,probe_ready,analysis_allowed,file_length_class,content_payload_format,content_payload_scope,content_payload_boundary_safe,structured_body_read_mode,structured_body_helper_bypassed,pagination_basis,recommended_next_tool,recommended_read_max_lines,recommended_scan_mode,next_call_json,next_tool_name,next_action,task_completion,continue_required,auto_continue_required,read_complete,file_complete,has_more,result_ref,evidence_ref,provider_id,capability_id",
             "public"
         },
         {
@@ -415,7 +415,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "text_range_scan",
             "text range scan returned",
-            "ok,exit_code,status,result,summary,file_path,normalized_path,scan_mode,total_lines,total_range_count,returned_range_count,range_offset,max_ranges_per_call,next_range_offset,has_more,task_completion,continue_required,auto_continue_required,analysis_allowed,probe_ref,probe_ready,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,ranges_json,scan_result_ref,scan_contract,next_call_json,result_ref,evidence_ref,cache_hit,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,file_path,normalized_path,scan_mode,total_lines,total_range_count,returned_range_count,range_offset,requested_max_ranges_per_call,max_ranges_per_call,next_range_offset,has_more,has_more_after_current_step,task_completion,step_completion,continue_required,auto_continue_required,analysis_allowed,single_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,probe_ref,probe_ready,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,ranges_json,scan_result_ref,scan_contract,step_contract,next_call_json,result_ref,evidence_ref,cache_hit,clips_gate,clips_pre_call_tool_decision,clips_pre_call_tool_reason_code,clips_pre_call_tool_next_action,clips_pre_call_tool_matched_rule,verification_status,verification_ok,supervision_alarm,supervision_alarm_code,supervision_alarm_message,provider_id,capability_id",
             "public"
         },
         {
@@ -423,7 +423,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "edit_window_bundle",
             "edit window bundle returned",
-            "ok,exit_code,status,result,summary,file_path,normalized_path,total_lines,total_window_count,returned_window_count,window_offset,max_windows_per_call,context_before,context_after,max_window_chars,windows_json,has_more,next_window_offset,task_completion,continue_required,auto_continue_required,analysis_allowed,probe_ref,probe_ready,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,edit_window_bundle_ref,edit_window_contract,next_call_json,result_ref,evidence_ref,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,file_path,normalized_path,total_lines,total_window_count,returned_window_count,window_offset,requested_max_windows_per_call,max_windows_per_call,context_before,context_after,max_window_chars,windows_json,has_more,has_more_after_current_step,next_window_offset,task_completion,step_completion,continue_required,auto_continue_required,analysis_allowed,single_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,probe_ref,probe_ready,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,edit_window_bundle_ref,edit_window_contract,step_contract,next_call_json,result_ref,evidence_ref,clips_gate,clips_pre_call_tool_decision,clips_pre_call_tool_reason_code,clips_pre_call_tool_next_action,clips_pre_call_tool_matched_rule,verification_status,verification_ok,supervision_alarm,supervision_alarm_code,supervision_alarm_message,provider_id,capability_id",
             "public"
         },
         {
@@ -463,7 +463,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "file_write",
             "content delete returned",
-            "ok,exit_code,status,result,summary,file_path,normalized_path,anchor_text,occurrence,expected_anchor_hash,operation,deleted_line,deleted_line_hash_before,new_hash,written_text_bytes,write_applied,write_verified,disk_write_completed,final_write_tool,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,result_ref,evidence_ref,request_id,trace_id,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,file_path,normalized_path,anchor_text,occurrence,expected_anchor_hash,operation,deleted_line,deleted_line_hash_before,old_hash,new_hash,before_anchor_occurrence_count,after_anchor_occurrence_count,written_text_bytes,write_applied,write_verified,disk_write_completed,final_write_tool,recovered_after_helper_failure,recovery_reason,helper_exit_code,helper_error,readback_error,verification_status,verification_ok,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,result_ref,evidence_ref,request_id,trace_id,provider_id,capability_id",
             "public"
         },
         {

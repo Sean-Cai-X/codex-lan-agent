@@ -487,7 +487,22 @@ struct CommOperations final {
 
         const std::filesystem::path logs_root = std::filesystem::path(config.log_root);
         const std::filesystem::path workspace_root = std::filesystem::path(config.workspace_root);
-        if (!StartsWithPath(normalized, logs_root) && !StartsWithPath(normalized, workspace_root)) {
+        bool is_allowed = StartsWithPath(normalized, logs_root) || StartsWithPath(normalized, workspace_root);
+        std::size_t start = 0;
+        while (!is_allowed && start <= config.allowed_roots.size()) {
+            const std::size_t end = config.allowed_roots.find(';', start);
+            const std::string root_text = Trim(config.allowed_roots.substr(
+                start,
+                end == std::string::npos ? std::string::npos : end - start));
+            if (!root_text.empty()) {
+                is_allowed = StartsWithPath(normalized, std::filesystem::path(root_text));
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+        if (!is_allowed) {
             if (error_message) {
                 *error_message = "path is outside allowed roots";
             }

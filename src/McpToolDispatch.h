@@ -739,7 +739,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 config,
                 params.GetString("file_path"),
                 params.GetString("scan_mode", "comments"),
-                std::max(1, params.GetInt("max_ranges_per_call", 64)),
+                std::max(1, params.GetInt("max_ranges_per_call", 1)),
                 std::max(0, params.GetInt("range_offset", 0)),
                 params.GetString("trace_id"),
                 params.GetString("probe_ref"));
@@ -751,7 +751,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("ranges_json"),
                 std::max(0, params.GetInt("context_before", 6)),
                 std::max(0, params.GetInt("context_after", 6)),
-                std::max(1, params.GetInt("max_windows_per_call", 12)),
+                std::max(1, params.GetInt("max_windows_per_call", 1)),
                 std::max(0, params.GetInt("window_offset", 0)),
                 static_cast<std::size_t>(std::max(256, params.GetInt("max_window_chars", 12000))),
                 params.GetString("trace_id"),
@@ -988,6 +988,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("target_resolution_reason"),
                 params.GetBool("allow_empty_content", false));
         }},
+        {"lan_agent_format_code_file", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildFormatCodeFileResult(config, params);
+        }},
         {"lan_agent_ensure_directory", [](const AgentConfig & config, const JsonRequestView & params) {
             return EnsureDirectoryResult(
                 config,
@@ -1190,6 +1193,7 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_preview_patch", "single_file_patch_preview", "preview_patch", "high", "file,write,preview,audited"},
         {"lan_agent_apply_single_file_patch", "single_file_patch", "apply_single_file_patch", "high", "file,write,replace,audited"},
         {"lan_agent_write_text_file", "file_write", "write_file", "medium", "file,write,audited"},
+        {"lan_agent_format_code_file", "code_format", "format_code_file", "medium", "file,format,clang-format,audited"},
         {"lan_agent_ensure_directory", "directory_write", "ensure_directory", "low", "directory,create,audited"},
         {"lan_agent_revert_single_file_patch", "single_file_patch_revert", "revert_patch", "high", "file,write,revert,audited"},
         {"lan_agent_verify_single_file_patch", "single_file_patch_verify", "verify_patch", "low", "file,write,verify,read_only"},

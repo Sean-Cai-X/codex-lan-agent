@@ -40,6 +40,7 @@
 #include "ClangAstVisitor.h"
 #include "ClangAstParser.h"
 #include "ClangAstTool.h"
+#include "CodeFormatOperations.h"
 #include "SemanticGridOperations.h"
 
 bool ReadWholeFile(

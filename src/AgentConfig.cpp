@@ -96,6 +96,32 @@ std::string NormalizePathValue(
     return candidate.lexically_normal().string();
 }
 
+std::string NormalizePathListValue(
+    const std::string & raw_value,
+    const std::string & config_dir) {
+    std::ostringstream output;
+    std::size_t start = 0;
+    bool first = true;
+    while (start <= raw_value.size()) {
+        const std::size_t end = raw_value.find(';', start);
+        const std::string item = Trim(raw_value.substr(
+            start,
+            end == std::string::npos ? std::string::npos : end - start));
+        if (!item.empty()) {
+            if (!first) {
+                output << ";";
+            }
+            output << NormalizePathValue(item, config_dir);
+            first = false;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return output.str();
+}
+
 bool ParseInt(
     const std::string & text,
     int * parsed_value) {
@@ -158,6 +184,8 @@ bool LoadAgentConfig(
 
         if (key == "workspace_root") {
             loaded.workspace_root = value;
+        } else if (key == "allowed_roots") {
+            loaded.allowed_roots = value;
         } else if (key == "listen_host") {
             loaded.listen_host = value;
         } else if (key == "listen_port") {
@@ -274,6 +302,7 @@ bool LoadAgentConfig(
     }
 
     loaded.workspace_root = NormalizePathValue(loaded.workspace_root, loaded.config_dir);
+    loaded.allowed_roots = NormalizePathListValue(loaded.allowed_roots, loaded.config_dir);
     loaded.log_root = NormalizePathValue(loaded.log_root, loaded.config_dir);
     loaded.data_root = NormalizePathValue(
         loaded.data_root.empty() ? loaded.log_root : loaded.data_root,

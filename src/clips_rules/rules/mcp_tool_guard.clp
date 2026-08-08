@@ -29,6 +29,42 @@
     (next_action "provide a non-empty reason or repair_candidate intent before apply")
     (matched_rule "block-single-file-patch-apply-without-explicit-intent"))))
 
+(defrule block-stepwise-file-tool-multi-item-request
+  (declare (salience 88))
+  (mcp_tool_request (tool_name ?tool)
+                    (single_step_required "true")
+                    (max_items_per_call ?count&:(neq ?count "")&:(neq ?count "1")))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target ?tool)
+    (decision "block")
+    (verification "not_verified")
+    (reason_code "multi_item_file_step_not_allowed")
+    (next_action "redo this file operation with max_ranges_per_call=1 or max_windows_per_call=1; process one item, verify, then rescan")
+    (matched_rule "block-stepwise-file-tool-multi-item-request"))))
+
+(defrule block-broad-file-mutation-for-stepwise-editing-intent
+  (declare (salience 88))
+  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_write_text_file")
+                                          (eq ?tool "lan_agent_apply_single_file_patch")
+                                          (eq ?tool "lan_agent_apply_diff_patch")))
+                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
+                                                 (eq ?intent "text_cleaning")
+                                                 (eq ?intent "localized_edit")
+                                                 (eq ?intent "source_edit_planning")
+                                                 (eq ?intent "remove_comments")
+                                                 (eq ?intent "strip_comments"))))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target ?tool)
+    (decision "block")
+    (verification "not_verified")
+    (reason_code "bulk_file_mutation_not_allowed_for_stepwise_edit")
+    (next_action "use the single-step loop: lan_agent_scan_text_ranges(max_ranges_per_call=1), lan_agent_prepare_edit_windows(max_windows_per_call=1), one atomic delete/replace, verify, then rescan")
+    (matched_rule "block-broad-file-mutation-for-stepwise-editing-intent"))))
+
 (defrule block-multi-file-patch-in-phase1
   (declare (salience 87))
   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_preview_patch")
