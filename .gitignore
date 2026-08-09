@@ -90,3 +90,8 @@ temp/
 tmp/
 *.dot
 test_*_output*
+
+# --- GN universal build pipeline whitelist (last-match-wins overrides build* deny) ---
+!scripts/**
+!build/
+!build/*.args

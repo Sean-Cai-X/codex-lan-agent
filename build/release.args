@@ -1,0 +1,5 @@
+is_optimized = true
+is_debug = false
+use_debug_dwarf = false
+symbol_level = 0
+strip_output = true
