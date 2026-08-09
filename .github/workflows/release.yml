@@ -2,7 +2,8 @@
 
 # ================================================================
 # Fully-online release pipeline (NO local uploads, NO vendored libs).
-# Third-party LLVM/Clang is downloaded from official GitHub releases.
+# LLVM/Clang 18.1.8 is built from official source on the runner.
+# Static libs cached for subsequent runs (keyed by version + toolchain).
 # ================================================================
 
 on:
@@ -26,128 +27,125 @@ env:
 
 jobs:
   build-and-release:
-    name: Build + Release (Windows x64 · LLVM/Clang 18.1.8)
+    name: Build + Release (Windows x64 · LLVM/Clang 18.1.8 from source)
     runs-on: windows-latest
 
     steps:
-      - name: Checkout sources (CMakeLists.txt + src/ only, per repo policy)
+      - name: Checkout codex-lan-agent sources (CMakeLists.txt + src/ only)
         uses: actions/checkout@v4
 
-      - name: Probe VS version available on runner & set CMAKE_GENERATOR
+      - name: Probe host toolchain & set CMAKE_GENERATOR
         shell: pwsh
         run: |
           cmake --version
+          # Ninja is preinstalled on windows-latest; prefer it for LLVM build speed.
+          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          Write-Host "ninja: $ninja"
+          # Find vcvars64.bat
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $VS_INSTALL = $null
-          if (Test-Path $vswhere) {
-            $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            Write-Host "VS install: $VS_INSTALL"
-            $verLine = & $vswhere -latest -products * -property catalog_productLineVersion
-            Write-Host "VS productLineVersion: $verLine"
-          }
-          # Map to a CMake Visual Studio generator string known to cmake --help
-          $GEN = $null
-          $gens = cmake --help | Select-String 'Visual Studio \d+' | ForEach-Object { $_.Line }
-          $gens | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
-          # Prefer VS17 (2022) since it's the generator our CMakeLists was tested with;
-          # fall back to the newest available on the runner.
-          foreach ($g in @("Visual Studio 17 2022", "Visual Studio 18 2022")) {
-            if ($gens -match [regex]::Escape($g)) { $GEN = $g; break }
-          }
-          if (-not $GEN) {
-            # pick the first Visual Studio NN YYYY from the list
-            $m = $gens -match 'Visual Studio (\d+) (\d+)' | Select-Object -First 1
-            if ($m) { $GEN = ($m -split '\s{2,}')[0].Trim() }
-          }
-          if (-not $GEN) { throw "No Visual Studio generator found" }
-          Write-Host "Using CMAKE_GENERATOR=$GEN"
-          "CMAKE_GENERATOR=$GEN" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "VS install: $VS_INSTALL"
+          $vcvars = Join-Path $VS_INSTALL "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          Write-Host "vcvars: $vcvars"
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Cache LLVM/Clang download & extract
+      - name: Cache flat LLVM/Clang 18.1.8 static libs (built from source)
         id: cache-llvm
         uses: actions/cache@v4
         with:
-          path: ${{ runner.workspace }}/llvm-18.1.8-win64
-          key: llvm-18.1.8-win64-vs2022-flat
+          path: ${{ runner.workspace }}/llvm_root
+          key: llvm-18.1.8-static-flat-msvc-ninja-v1
 
-      - name: Download LLVM/Clang 18.1.8 (official network source) & flatten
+      - name: Build LLVM/Clang 18.1.8 static libs from source & assemble flat LLVM_ROOT
         if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          echo on
+          set LLVM_SRC=%RUNNER_WORKSPACE%\llvm-project-src
+          set LLVM_BUILD=%RUNNER_WORKSPACE%\llvm-project-build
+          set LLVM_ROOT_FLAT=%RUNNER_WORKSPACE%\llvm_root
+          if exist %LLVM_SRC% rmdir /s /q %LLVM_SRC%
+          if exist %LLVM_BUILD% rmdir /s /q %LLVM_BUILD%
+          if exist %LLVM_ROOT_FLAT% rmdir /s /q %LLVM_ROOT_FLAT%
+          :: Shallow clone the official LLVM monorepo at the exact release tag.
+          git clone --depth 1 --branch llvmorg-%LLVM_VERSION% https://github.com/llvm/llvm-project.git %LLVM_SRC%
+          if errorlevel 1 exit /b 1
+          :: Configure with Ninja + MSVC. Static libs only (no shared), X86 target only,
+          :: tests/examples/benchmarks/docs disabled to minimize build time.
+          cmake -G Ninja -S %LLVM_SRC%\llvm -B %LLVM_BUILD% ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLVM_ENABLE_PROJECTS=clang ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DLLVM_TARGETS_TO_BUILD=X86 ^
+            -DLLVM_INCLUDE_TESTS=OFF ^
+            -DLLVM_INCLUDE_EXAMPLES=OFF ^
+            -DLLVM_INCLUDE_BENCHMARKS=OFF ^
+            -DLLVM_INCLUDE_DOCS=OFF ^
+            -DCLANG_INCLUDE_TESTS=OFF ^
+            -DCLANG_INCLUDE_DOCS=OFF ^
+            -DLLVM_BUILD_TOOLS=OFF ^
+            -DCLANG_BUILD_TOOLS=OFF ^
+            -DLLVM_ENABLE_DIA_SDK=OFF
+          if errorlevel 1 exit /b 1
+          :: Build all default targets (lib/*.lib, no tools since LLVM_BUILD_TOOLS=OFF).
+          :: Using /parallel with ninja picks up %NUMBER_OF_PROCESSORS%.
+          cmake --build %LLVM_BUILD% --config Release --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          :: Assemble flat LLVM_ROOT: <ROOT>/include + <ROOT>/lib
+          mkdir %LLVM_ROOT_FLAT%\include
+          mkdir %LLVM_ROOT_FLAT%\lib
+          :: Clang public headers (source)
+          xcopy /y /e /i %LLVM_SRC%\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          if exist %LLVM_SRC%\clang\include\clang-c xcopy /y /e /i %LLVM_SRC%\clang\include\clang-c %LLVM_ROOT_FLAT%\include\clang-c >nul
+          :: LLVM public headers (source)
+          xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
+          if exist %LLVM_SRC%\llvm\include\llvm-c xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm-c %LLVM_ROOT_FLAT%\include\llvm-c >nul
+          :: Generated config headers (llvm/Config/llvm-config.h, config.h, abi-breaking.h)
+          xcopy /y /e /i %LLVM_BUILD%\include\llvm\Config %LLVM_ROOT_FLAT%\include\llvm\Config >nul
+          :: Clang generated config (clang/Config/...) if present
+          if exist %LLVM_BUILD%\tools\clang\include\clang\Config xcopy /y /e /i %LLVM_BUILD%\tools\clang\include\clang\Config %LLVM_ROOT_FLAT%\include\clang\Config >nul
+          :: All static .lib produced by the build
+          copy /y %LLVM_BUILD%\lib\*.lib %LLVM_ROOT_FLAT%\lib\ >nul
+          :: Sanity verification
+          if not exist %LLVM_ROOT_FLAT%\include\clang\AST\ASTConsumer.h (
+            echo ERROR: clang AST header missing & exit /b 1
+          )
+          if not exist %LLVM_ROOT_FLAT%\lib\clangTooling.lib (
+            echo ERROR: clangTooling.lib missing & exit /b 1
+          )
+          dir /b %LLVM_ROOT_FLAT%\lib\*.lib | find /c /v "" > %TEMP%\libcount.txt
+          set /p LIBCOUNT=<%TEMP%\libcount.txt
+          echo LLVM flat root assembled at %LLVM_ROOT_FLAT% (%LIBCOUNT% .lib files)
+
+      - name: Verify cached LLVM_ROOT integrity
         shell: pwsh
         run: |
-          $Version = "$env:LLVM_VERSION"
-          $BaseUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$Version"
-          $Exe = "LLVM-$Version-win64.exe"
-          $Url = "$BaseUrl/$Exe"
-          $Dest = Join-Path $env:RUNNER_TEMP $Exe
-          Write-Host "Downloading $Url -> $Dest"
-          $ProgressPreference = 'SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          $maxRetries = 5
-          for ($i=1; $i -le $maxRetries; $i++) {
-            try {
-              Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
-              $sz = [math]::Round((Get-Item $Dest).Length/1MB,2)
-              Write-Host "Download OK: ${sz} MB"
-              break
-            } catch {
-              Write-Host "Attempt $i/$maxRetries failed: $_"
-              if ($i -eq $maxRetries) { throw }
-              Start-Sleep -Seconds (5 * $i)
-            }
-          }
-          $Root = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
-          $Extract = Join-Path $Root "_sfx_extract"
-          New-Item -ItemType Directory -Force -Path $Extract | Out-Null
-          $SevenZip = "${env:ProgramFiles}\7-Zip\7z.exe"
-          if (-not (Test-Path $SevenZip)) { $SevenZip = "${env:ProgramFiles(x86)}\7-Zip\7z.exe" }
-          if (Test-Path $SevenZip) {
-            Write-Host "Extracting via 7z -> $Extract"
-            & $SevenZip x -y -o"$Extract" $Dest | Select-Object -Last 3
-            if ($LASTEXITCODE -ne 0) { Write-Error "7z extract failed"; exit 1 }
-          } else {
-            Write-Host "7z missing; fall back to SFX silent extraction"
-            $proc = Start-Process -FilePath $Dest -ArgumentList "/S /D=$Extract" -PassThru -Wait
-            Write-Host "SFX exit $($proc.ExitCode)"
-            Start-Sleep -Seconds 5
-          }
-          # SFX / 7z may place files under a "LLVM" subdir or "lib/clang/..." subdir.
-          # Locate the directory that directly contains include/ and lib/ by searching
-          # for lib/clangTooling.lib up to 3 levels deep.
-          $candidates = Get-ChildItem -Path $Extract -Recurse -Depth 4 -Filter "clangTooling.lib" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DirectoryName
-          if (-not $candidates) {
-            Write-Error "clangTooling.lib not found under $Extract"
-            Get-ChildItem $Extract -Depth 2 | ForEach-Object { Write-Host "  $($_.FullName.Replace($Extract, ''))" }
-            exit 1
-          }
-          # llvm lib directory
-          $libDir = $candidates[0]
-          $llvmDir = Split-Path $libDir -Parent
-          Write-Host "LLVM root detected at: $llvmDir"
-          # Move contents of $llvmDir UP to $Root (flatten to $Root/include, $Root/lib)
-          Get-ChildItem -Force $llvmDir | Move-Item -Destination $Root -Force
-          # Clean temporary extraction leftovers
-          Remove-Item -Recurse -Force $Extract -ErrorAction SilentlyContinue
-          # Verify
-          if (-not (Test-Path (Join-Path $Root "include\clang\AST\ASTConsumer.h")) -or
-              -not (Test-Path (Join-Path $Root "lib\clangTooling.lib"))) {
-            Write-Error "Post-flatten verification failed for $Root"
-            Get-ChildItem $Root | ForEach-Object { Write-Host "  $($_.Name)" }
-            exit 1
-          }
-          Write-Host "LLVM $Version ready at $Root"
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
+          $h = Join-Path $Root "include\clang\AST\ASTConsumer.h"
+          $l = Join-Path $Root "lib\clangTooling.lib"
+          if (-not (Test-Path $h)) { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $l)) { Write-Error "Missing $l"; exit 1 }
+          $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
+          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount)"
 
-      - name: Configure CMake (with Clang AST enabled, network LLVM)
+      - name: Configure codex_lan_agent (with Clang AST, network-built LLVM_ROOT)
         shell: pwsh
         run: |
           $Repo = Get-Location
-          $InstallDir = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
-          if (-not (Test-Path (Join-Path $InstallDir "lib\clangTooling.lib"))) {
-            Write-Error "LLVM libs missing in $InstallDir"; exit 1
-          }
+          $InstallDir = Join-Path "${{ runner.workspace }}" "llvm_root"
           $Build = Join-Path $Repo "build_release_x64"
-          Write-Host "Using generator: $env:CMAKE_GENERATOR"
+          # Use VS generator for codex_lan_agent (matches CMakeLists assumptions).
+          $gens = cmake --help | Select-String 'Visual Studio \d+' | ForEach-Object { $_.Line }
+          $GEN = $null
+          foreach ($g in @("Visual Studio 17 2022", "Visual Studio 18 2022")) {
+            if ($gens -match [regex]::Escape($g)) { $GEN = $g; break }
+          }
+          if (-not $GEN) { throw "No Visual Studio generator available" }
+          Write-Host "Using generator: $GEN"
           cmake -S $Repo -B $Build `
-            -G $env:CMAKE_GENERATOR `
+            -G $GEN `
             -A $env:ARCH `
             -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON `
             -DCODEX_LAN_AGENT_BUILD_CLANG_INDEXER=OFF `
@@ -156,27 +154,21 @@ jobs:
             -DCODEX_LLVM_ROOT="$InstallDir"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
-      - name: Build Release
+      - name: Build codex_lan_agent (Release)
         shell: pwsh
         run: |
           $Build = Join-Path (Get-Location) "build_release_x64"
           cmake --build $Build --config Release --parallel $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
           $Exe = Join-Path $Build "Release\codex_lan_agent.exe"
-          if (-not (Test-Path $Exe)) {
-            # also try plain (single-config generator fallback)
-            $Exe = Join-Path $Build "codex_lan_agent.exe"
-          }
-          if (-not (Test-Path $Exe)) { Write-Error "codex_lan_agent.exe not built"; exit 1 }
+          if (-not (Test-Path $Exe)) { Write-Error "codex_lan_agent.exe not built at $Exe"; exit 1 }
           Write-Host "Build OK: $Exe  $([math]::Round((Get-Item $Exe).Length/1MB,2)) MB"
 
       - name: Stage release package
         shell: pwsh
         run: |
           $Repo = Get-Location
-          $Build = Join-Path $Repo "build_release_x64"
-          $Exe = Join-Path $Build "Release\codex_lan_agent.exe"
-          if (-not (Test-Path $Exe)) { $Exe = Join-Path $Build "codex_lan_agent.exe" }
+          $Exe = Join-Path $Repo "build_release_x64\Release\codex_lan_agent.exe"
           $Stage = Join-Path $Repo "stage\codex_lan_agent-windows-x64"
           New-Item -ItemType Directory -Force -Path (Join-Path $Stage "bin") | Out-Null
           Copy-Item $Exe (Join-Path $Stage "bin\codex_lan_agent.exe")
@@ -215,27 +207,31 @@ jobs:
           $Body = @"
           ## codex_lan_agent $Tag (Windows x64)
 
-          ### Online build (GitHub-hosted runner, fully online)
-          - Runner: windows-latest (Visual Studio pre-installed image)
-          - CMake generator used by runner: $env:CMAKE_GENERATOR
-          - Target arch: x64
-          - Standard: C++17 / C99
-          - Clang AST parsing: enabled (-DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON)
+          ### Fully-online build (GitHub-hosted runner)
+          - Runner: windows-latest (Visual Studio preinstalled)
+          - LLVM/Clang 18.1.8: built from source on the runner (tag llvmorg-18.1.8)
+          - Static linkage: all LLVM/Clang .lib statically linked into the exe
           - Commit sha: $Sha
 
-          ### Third-party dependencies (ALL from network sources, nothing vendored in repo)
-          - **LLVM/Clang 18.1.8** (official prebuilt Windows x64, network download)
-            - Download URL: https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8
-            - Artifact: LLVM-18.1.8-win64.exe
+          ### Third-party dependencies (ALL from network sources, NOTHING vendored in repo)
+          - **LLVM/Clang 18.1.8** built from official source:
+            - Source: https://github.com/llvm/llvm-project/tree/llvmorg-18.1.8
+            - Configure: -DBUILD_SHARED_LIBS=OFF -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_PROJECTS=clang
             - License: Apache-2.0 WITH LLVM-exception  https://llvm.org/LICENSE.txt
-          - Static linkage: every LLVM/Clang .lib is statically linked into the exe.
-            Release ZIP contains NO .lib/.dll. Repo NEVER ships third-party binaries.
+          - Static .lib cached on GitHub Actions cache (key: llvm-18.1.8-static-flat-msvc-ninja-v1)
+          - Release ZIP contains NO .lib/.dll. Repo NEVER ships third-party binaries.
 
           ### Reproduce locally
           ```powershell
           git clone https://github.com/${{ github.repository }}.git
           cd codex-lan-agent
-          # Download + extract LLVM 18.1.8 (network source) -> third_party\llvm\
+          # Build LLVM 18.1.8 from source (network):
+          #   git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project.git
+          #   cmake -G Ninja -S llvm-project\llvm -B llvm-build ^
+          #     -DLLVM_ENABLE_PROJECTS=clang -DBUILD_SHARED_LIBS=OFF -DLLVM_TARGETS_TO_BUILD=X86 ^
+          #     -DCMAKE_BUILD_TYPE=Release
+          #   cmake --build llvm-build --parallel
+          # Then assemble third_party\llvm\{include,lib} from build output + source headers.
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
           cmake --build build --config Release --parallel
           ```
@@ -250,7 +246,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Creating release $Tag..."
             gh release create $Tag --repo '${{ github.repository }}' `
-              --title "codex_lan_agent $Tag · Windows x64 (LLVM 18.1.8, online build)" `
+              --title "codex_lan_agent $Tag · Windows x64 (LLVM 18.1.8 from source, online build)" `
               --notes-file $NotesFile `
               --target '${{ github.sha }}' `
               $Zip
