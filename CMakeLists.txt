@@ -14,6 +14,18 @@ option(
   OFF
 )
 
+option(
+  CODEX_LAN_AGENT_WITH_ROCKSDB
+  "Enable optional native RocksDB mirror backend for task_memory KV snapshots"
+  OFF
+)
+set(CODEX_LAN_AGENT_ROCKSDB_INCLUDE_DIR
+  "D:/Codex-WorkDir/Sean_WorkDir/analysis_workspace/rocksdb-11.0.4/include"
+  CACHE PATH "RocksDB include directory")
+set(CODEX_LAN_AGENT_ROCKSDB_LIBRARY
+  "D:/Codex-WorkDir/Sean_WorkDir/rocksdb-build/Release/rocksdb.lib"
+  CACHE FILEPATH "RocksDB import/static library")
+
 file(GLOB CODEX_LAN_AGENT_CLIPS_CORE_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/clips_core/*.c"
 )
@@ -34,6 +46,7 @@ add_executable(codex_lan_agent
   src/GraphSerialization.cpp
   src/ProcessRunner.cpp
   src/HttpClient.cpp
+  src/TaskMemoryRocksDbOperations.cpp
   src/main.cpp
   ${CODEX_LAN_AGENT_CLIPS_CORE_SOURCES}
 )
@@ -47,6 +60,34 @@ find_package(Threads REQUIRED)
 target_link_libraries(codex_lan_agent PRIVATE
   Threads::Threads
 )
+
+if(CODEX_LAN_AGENT_WITH_ROCKSDB)
+  if(NOT EXISTS "${CODEX_LAN_AGENT_ROCKSDB_INCLUDE_DIR}/rocksdb/db.h")
+    message(FATAL_ERROR
+      "CODEX_LAN_AGENT_WITH_ROCKSDB=ON but rocksdb/db.h was not found at "
+      "${CODEX_LAN_AGENT_ROCKSDB_INCLUDE_DIR}")
+  endif()
+  if(NOT EXISTS "${CODEX_LAN_AGENT_ROCKSDB_LIBRARY}")
+    message(FATAL_ERROR
+      "CODEX_LAN_AGENT_WITH_ROCKSDB=ON but RocksDB library was not found at "
+      "${CODEX_LAN_AGENT_ROCKSDB_LIBRARY}")
+  endif()
+  target_compile_features(codex_lan_agent PRIVATE cxx_std_20)
+  target_compile_definitions(codex_lan_agent PRIVATE CODEX_LAN_AGENT_WITH_ROCKSDB=1)
+  target_include_directories(codex_lan_agent PRIVATE
+    "${CODEX_LAN_AGENT_ROCKSDB_INCLUDE_DIR}"
+  )
+  target_link_libraries(codex_lan_agent PRIVATE
+    "${CODEX_LAN_AGENT_ROCKSDB_LIBRARY}"
+  )
+  if(MSVC)
+    target_link_libraries(codex_lan_agent PRIVATE
+      shlwapi
+      rpcrt4
+      iphlpapi
+    )
+  endif()
+endif()
 
 if(WIN32)
   target_compile_definitions(codex_lan_agent PRIVATE

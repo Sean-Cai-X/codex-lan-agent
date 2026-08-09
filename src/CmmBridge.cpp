@@ -92,7 +92,7 @@ std::string MakeCmmBridgeLogPath(
     const std::string base = MakeCmmBridgeBaseDirectory(config);
     const int sequence = ++g_cmm_bridge_sequence;
     std::ostringstream path;
-    path << base << std::filesystem::path::preferred_separator << tool_name << "_"
+    path << base << "\\" << tool_name << "_"
          << CmmBridgeTimestampTag() << "_" << sequence << ".log";
     return path.str();
 }

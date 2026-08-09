@@ -259,7 +259,7 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
         },
         {
             "task_memory_execute_continuation_budget",
-            "Execute or dry-run a bounded continuation budget from latest resume_context, append each verified step to the MCP ledger, and refresh resume_context without loading full chat history.",
+            "Execute or dry-run a bounded continuation budget from latest resume_context, append each verified step to the MCP ledger, and refresh resume_context without loading full chat history. Local AI clients should use this for long has_more/next_call_json loops instead of carrying the loop in model context.",
             "lan_agent_task_memory_execute_continuation_budget",
             "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"max_steps\":\"optional integer capped at 64\",\"step_budget\":\"optional integer alias\",\"dry_run\":\"optional bool default true\",\"execute\":\"optional bool; execute=true and dry_run=false runs allowlisted continuation tools\"}",
             "{\"record_model\":\"mcp_task_memory_execute_continuation_budget_response_v1\",\"budget_plan_path\":\"non_empty\",\"executed_step_count\":\"integer\",\"next_call_json\":\"optional string\"}",
@@ -294,16 +294,76 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "none"
         },
         {
+            "task_memory_rocksdb_mirror",
+            "Mirror a task_memory KV snapshot into the optional native RocksDB read backend without replacing file_object_store as source of truth.",
+            "lan_agent_task_memory_rocksdb_mirror",
+            "{\"goal_id\":\"required string\",\"rocksdb_path\":\"optional path\"}",
+            "{\"record_model\":\"mcp_task_memory_rocksdb_mirror_response_v1\",\"rocksdb_status\":\"enabled\",\"mirrored_count\":\"integer\"}",
+            "{\"tool\":\"lan_agent_task_memory_rocksdb_parity_check\",\"reason\":\"validate native mirror read parity\"}",
+            "[\"goal_id\",\"task_memory_root\",\"source_of_truth\",\"native_backend_role\",\"rocksdb_status\",\"rocksdb_path\",\"rocksdb_manifest_path\",\"kv_index_path\",\"kv_manifest_path\",\"kv_record_count\",\"mirrored_count\",\"mirror_complete\",\"safe_to_replace_source_of_truth\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_write"
+        },
+        {
+            "task_memory_rocksdb_lookup",
+            "Lookup the optional native RocksDB task_memory mirror by exact key or prefix selectors.",
+            "lan_agent_task_memory_rocksdb_lookup",
+            "{\"goal_id\":\"required string\",\"rocksdb_path\":\"optional path\",\"key\":\"optional string\",\"kind\":\"optional string: goal|latest|trace|trace_step|slice|budget|trace_budget\",\"trace_id\":\"optional string\",\"step_id\":\"optional string\",\"slice_id\":\"optional string\",\"budget_run_id\":\"optional string\",\"prefix\":\"optional bool\",\"limit\":\"optional integer\",\"offset\":\"optional integer\",\"include_value\":\"optional bool\"}",
+            "{\"record_model\":\"mcp_task_memory_rocksdb_lookup_response_v1\",\"matches_jsonl\":\"JSONL string\",\"rocksdb_status\":\"enabled\"}",
+            "{\"tool\":\"lan_agent_task_memory_rocksdb_mirror\",\"reason\":\"native mirror missing\"}",
+            "[\"goal_id\",\"lookup_key\",\"prefix_match\",\"kv_backend\",\"source_of_truth\",\"native_backend_role\",\"rocksdb_status\",\"rocksdb_path\",\"limit\",\"offset\",\"matched_count\",\"returned_count\",\"has_more\",\"next_offset\",\"matches_jsonl\",\"include_value\",\"value_ref\",\"value_text\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "task_memory_rocksdb_parity_check",
+            "Validate that file KV lookup and RocksDB native mirror lookup return the same record set for one selector.",
+            "lan_agent_task_memory_rocksdb_parity_check",
+            "{\"goal_id\":\"required string\",\"rocksdb_path\":\"optional path\",\"key\":\"optional string\",\"kind\":\"optional string\",\"trace_id\":\"optional string\",\"step_id\":\"optional string\",\"slice_id\":\"optional string\",\"budget_run_id\":\"optional string\",\"prefix\":\"optional bool\",\"limit\":\"optional integer\",\"offset\":\"optional integer\",\"include_value\":\"optional bool\"}",
+            "{\"record_model\":\"mcp_task_memory_rocksdb_parity_check_response_v1\",\"parity_ok\":\"true|false\"}",
+            "{\"tool\":\"lan_agent_task_memory_build_kv_snapshot\",\"reason\":\"rebuild source snapshot before remirroring if parity fails\"}",
+            "[\"goal_id\",\"lookup_key\",\"source_of_truth\",\"native_backend_role\",\"file_lookup_ok\",\"rocksdb_lookup_ok\",\"file_matched_count\",\"rocksdb_matched_count\",\"file_matches_hash\",\"rocksdb_matches_hash\",\"parity_ok\",\"safe_to_replace_source_of_truth\",\"rocksdb_status\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
             "task_memory_migration_assess",
             "Assess whether one task_memory goal is ready to move from file object storage and KV snapshot toward an optional RocksDB backend.",
             "lan_agent_task_memory_migration_assess",
             "{\"goal_id\":\"required string\"}",
             "{\"record_model\":\"mcp_task_memory_migration_assessment_v1\",\"adaptation_decision\":\"non_empty\"}",
             "{\"tool\":\"lan_agent_task_memory_build_kv_snapshot\",\"reason\":\"KV contract is missing or stale\"}",
-            "[\"goal_id\",\"migration_stage\",\"adaptation_decision\",\"active_backend\",\"source_of_truth\",\"backend_order\",\"file_object_ready\",\"migration_bundle_ready\",\"kv_snapshot_ready\",\"kv_contract_ready\",\"rocksdb_native_ready\",\"safe_to_enable_rocksdb_adapter\",\"safe_to_replace_source_of_truth\",\"kv_record_count\",\"missing_file_objects_csv\",\"missing_migration_files_csv\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "[\"goal_id\",\"migration_stage\",\"adaptation_decision\",\"active_backend\",\"source_of_truth\",\"backend_order\",\"file_object_ready\",\"migration_bundle_ready\",\"kv_snapshot_ready\",\"kv_contract_ready\",\"rocksdb_native_ready\",\"rocksdb_status\",\"rocksdb_path\",\"rocksdb_manifest_path\",\"rocksdb_mirrored_count\",\"safe_to_enable_rocksdb_adapter\",\"safe_to_replace_source_of_truth\",\"kv_record_count\",\"missing_file_objects_csv\",\"missing_migration_files_csv\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
             "low",
             "true",
             "none"
+        },
+        {
+            "task_memory_structure_manifest",
+            "Materialize and validate the canonical post-migration MCP memory structure for one goal.",
+            "lan_agent_task_memory_structure_manifest",
+            "{\"goal_id\":\"required string\"}",
+            "{\"record_model\":\"mcp_task_memory_structure_manifest_response_v1\",\"memory_structure_path\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"fresh models should read compact resume context first\"}",
+            "[\"goal_id\",\"structure_version\",\"task_memory_root\",\"memory_structure_path\",\"source_of_truth\",\"active_read_backend\",\"write_backend\",\"native_backend_role\",\"read_backend_order\",\"required_model_read\",\"structure_ready\",\"fresh_model_bootstrap_ready\",\"backend_policy_ready\",\"safe_to_replace_source_of_truth\",\"parity_required_for_native_reads\",\"migration_bundle_ready\",\"kv_snapshot_ready\",\"rocksdb_native_ready\",\"rocksdb_status\",\"rocksdb_manifest_path\",\"rocksdb_path\",\"step_count\",\"slice_count\",\"budget_file_count\",\"evidence_file_count\",\"kv_record_count\",\"rocksdb_mirrored_count\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_write"
+        },
+        {
+            "task_memory_migration_acceptance",
+            "Run the full task_memory migration acceptance chain inside MCP without an external script.",
+            "lan_agent_task_memory_migration_acceptance",
+            "{\"goal_id\":\"optional string\",\"trace_id\":\"optional string\",\"max_final_steps\":\"optional integer\"}",
+            "{\"record_model\":\"mcp_task_memory_migration_acceptance_response_v1\",\"migration_acceptance_status\":\"ACCEPTED\",\"acceptance_status\":\"complete\",\"semantic_outcome\":\"TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS\"}",
+            "{\"tool\":\"lan_agent_task_memory_structure_manifest\",\"reason\":\"inspect last materialized memory structure when acceptance is partial\"}",
+            "[\"goal_id\",\"trace_id\",\"migration_acceptance_status\",\"acceptance_status\",\"semantic_outcome\",\"summary_path\",\"memory_structure_path\",\"source_of_truth\",\"active_read_backend\",\"write_backend\",\"safe_to_replace_source_of_truth\",\"parity_required_for_native_reads\",\"partial_budget_terminal_state\",\"final_budget_terminal_state\",\"validated_chain\",\"result_ref\",\"evidence_ref\"]",
+            "medium",
+            "false",
+            "file_write"
         },
         {
             "task_memory_resume_context",
@@ -711,9 +771,9 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
         },
         {
             "clips_decide",
-            "Run one CLIPS rule decision over MCP request facts, MCP result facts, slice ingest facts, or cxparser preflight facts without executing the guarded tool.",
+            "Run one CLIPS rule decision over MCP request facts, MCP result facts, slice ingest facts, or cxparser preflight facts without executing the guarded tool. Local AI clients should use this before uncertain write/edit/build/test routing and before trusting non-terminal results.",
             "lan_agent_clips_decide",
-            "{\"decision_domain\":\"mcp_tool_guard|mcp_result_guard|slice_ingest_guard|cxparser_preflight_guard\",\"tool_name\":\"optional string\",\"task_id\":\"optional string\",\"session_id\":\"optional string\",\"turn_id\":\"optional string\",\"provider_id\":\"optional string\",\"capability_id\":\"optional string\",\"build_dir\":\"optional string\",\"project_root\":\"optional string\",\"test_regex\":\"optional string\",\"preflight_status\":\"optional string\",\"cxparser_preflight_status\":\"optional string\",\"dedup_status\":\"optional string\",\"canonical_slice_id\":\"optional string\",\"dup_of\":\"optional string\",\"route_hint\":\"optional string\",\"source_type\":\"optional string\",\"file_path\":\"optional string\",\"probe_ref\":\"optional string\",\"probe_ready\":\"optional bool\",\"patch_id\":\"optional string\",\"request_id\":\"optional string\",\"trace_id\":\"optional string\",\"old_hash\":\"optional string\",\"reasoning_level\":\"optional string\",\"primary_intent\":\"optional string\",\"reason\":\"optional string\",\"repair_candidate_id\":\"optional string\",\"business_user_text\":\"optional string\",\"business_assistant_text\":\"optional string\",\"slice_summary\":\"optional string\",\"direct_answer\":\"optional string\",\"summary\":\"optional string\",\"assistant_text\":\"optional string\",\"error\":\"optional string\",\"ai_conclusion_valid\":\"optional bool\"}",
+            "{\"decision_domain\":\"mcp_tool_guard|mcp_result_guard|slice_ingest_guard|cxparser_preflight_guard\",\"tool_name\":\"optional string\",\"task_id\":\"optional string\",\"session_id\":\"optional string\",\"turn_id\":\"optional string\",\"provider_id\":\"optional string\",\"capability_id\":\"optional string\",\"build_dir\":\"optional string\",\"project_root\":\"optional string\",\"test_regex\":\"optional string\",\"preflight_status\":\"optional string\",\"cxparser_preflight_status\":\"optional string\",\"dedup_status\":\"optional string\",\"canonical_slice_id\":\"optional string\",\"dup_of\":\"optional string\",\"route_hint\":\"optional string\",\"source_type\":\"optional string\",\"file_path\":\"optional string\",\"scan_mode\":\"optional string\",\"probe_ref\":\"optional string\",\"probe_ready\":\"optional bool\",\"patch_id\":\"optional string\",\"request_id\":\"optional string\",\"trace_id\":\"optional string\",\"old_hash\":\"optional string\",\"reasoning_level\":\"optional string\",\"primary_intent\":\"optional string\",\"reason\":\"optional string\",\"repair_candidate_id\":\"optional string\",\"business_user_text\":\"optional string\",\"business_assistant_text\":\"optional string\",\"slice_summary\":\"optional string\",\"direct_answer\":\"optional string\",\"summary\":\"optional string\",\"assistant_text\":\"optional string\",\"error\":\"optional string\",\"terminal_state\":\"optional bool/string\",\"completion_claim_allowed\":\"optional bool/string\",\"final_answer_allowed\":\"optional bool/string\",\"ai_conclusion_valid\":\"optional bool\"}",
             "{\"decision\":\"allow|block|route\",\"verification\":\"verified|not_verified\",\"matched_rule\":\"non_empty\",\"decision_schema_id\":\"clips_decision_schema_v1\"}",
             "{\"tool\":\"lan_agent_runtime_overview\",\"reason\":\"CLIPS rule root or embedded rule load failed\"}",
             "[\"decision_domain\",\"decision\",\"verification\",\"reason_code\",\"matched_rule\",\"next_action\",\"route_target\",\"clips_explicit_fact_schema_id\",\"clips_explicit_decision_schema_id\",\"clips_explicit_engine_status\"]",
@@ -723,7 +783,7 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
         },
         {
             "clips_chain_template",
-            "Return the standard mcp_tool_chain CLIPS fact projection for one MCP tool so tool-specific rules can be added without recompiling the agent.",
+            "Return the standard mcp_tool_chain CLIPS fact projection for one MCP tool so tool-specific rules can be added without recompiling the agent. Use it as local-AI guidance for ordinary file operations, long loops, builds, tests, and acceptance checks.",
             "lan_agent_clips_chain_template",
             "{\"tool_name\":\"required string\",\"chain_phase\":\"optional pre_call|post_result\",\"task_id\":\"optional string\",\"result_ref\":\"optional string\",\"evidence_ref\":\"optional string\"}",
             "{\"chain_template_id\":\"mcp_tool_chain_v1\",\"input_fact\":\"mcp_tool_chain fact\",\"evidence_policy\":\"non_empty\"}",
@@ -987,6 +1047,39 @@ const std::vector<McpCapabilitySpec> & GetMcpCapabilitySpecs() {
             "Read-side contract for goal/latest/trace/slice/budget memory keys; native RocksDB should preserve this observable behavior."
         },
         {
+            "task_memory_rocksdb_mirror",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,rocksdb_path?",
+            "rocksdb_status,rocksdb_path,rocksdb_manifest_path,kv_record_count,mirrored_count,mirror_complete,source_of_truth,native_backend_role,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/rocksdb_native",
+            "native RocksDB key-value mirror + manifest",
+            "rocksdb_native_mirror",
+            "Optional native read backend. It mirrors the file KV snapshot but does not replace file_object_store as the task memory source of truth."
+        },
+        {
+            "task_memory_rocksdb_lookup",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,rocksdb_path?,key?,kind?,trace_id?,step_id?,slice_id?,budget_run_id?,prefix?,limit?,offset?,include_value?",
+            "lookup_key,prefix_match,rocksdb_status,matched_count,returned_count,has_more,next_offset,matches_jsonl,value_ref,value_text,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/rocksdb_native",
+            "native RocksDB query result",
+            "rocksdb_native_query",
+            "High-frequency read path for task memory keys after mirror build. Observable key behavior must match task_memory_kv_lookup."
+        },
+        {
+            "task_memory_rocksdb_parity_check",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,rocksdb_path?,key?,kind?,trace_id?,step_id?,slice_id?,budget_run_id?,prefix?,limit?,offset?,include_value?",
+            "parity_ok,file_matched_count,rocksdb_matched_count,file_matches_hash,rocksdb_matches_hash,source_of_truth,safe_to_replace_source_of_truth,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/kv_snapshot/index.jsonl + rocksdb_native",
+            "file KV vs RocksDB parity result",
+            "rocksdb_native_parity",
+            "Validation gate proving native RocksDB mirror returns the same records as the source file KV snapshot for a selector."
+        },
+        {
             "task_memory_migration_assess",
             "codex_lan_agent_task_memory",
             "codex-lan-agent",
@@ -996,6 +1089,28 @@ const std::vector<McpCapabilitySpec> & GetMcpCapabilitySpecs() {
             "structured JSON",
             "pre_rocksdb_adapter_gate",
             "Stage 4 adaptation judgment. It keeps file object storage as source of truth and only marks RocksDB adapter implementation safe after file objects and KV snapshot are ready."
+        },
+        {
+            "task_memory_structure_manifest",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id",
+            "memory_structure_path,source_of_truth,active_read_backend,write_backend,native_backend_role,read_backend_order,required_model_read,structure_ready,fresh_model_bootstrap_ready,backend_policy_ready,safe_to_replace_source_of_truth,parity_required_for_native_reads,step_count,slice_count,budget_file_count,evidence_file_count,kv_record_count,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/memory_structure.json",
+            "structured JSON",
+            "post_migration_memory_structure",
+            "Stage 5 canonical layout contract: fresh models read latest_resume_context first; ledger, slices, evidence refs, budget runs, and KV snapshot are support assets."
+        },
+        {
+            "task_memory_migration_acceptance",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id?,trace_id?,max_final_steps?",
+            "migration_acceptance_status,acceptance_status,semantic_outcome,summary_path,memory_structure_path,source_of_truth,active_read_backend,write_backend,safe_to_replace_source_of_truth,parity_required_for_native_reads,validated_chain,result_ref,evidence_ref",
+            "data_root/task_memory_acceptance/{goal_id}/acceptance_summary.json",
+            "structured JSON",
+            "mcp_side_migration_acceptance",
+            "Single MCP-call acceptance for the task_memory migration chain. It proves freeze, compact resume, bounded continuation budget, KV snapshot, RocksDB mirror, parity, and memory_structure without requiring a client-side script."
         },
         {
             "task_memory_resume_context",

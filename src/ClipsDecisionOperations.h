@@ -128,6 +128,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot route_hint (default ""))
               (slot source_type (default ""))
               (slot file_path (default ""))
+              (slot scan_mode (default ""))
               (slot probe_ref (default ""))
               (slot patch_id (default ""))
               (slot request_id (default ""))
@@ -178,6 +179,9 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot directory_listing_complete (default ""))
               (slot content_read_completion (default ""))
               (slot incomplete_scope (default ""))
+              (slot terminal_state (default ""))
+              (slot completion_claim_allowed (default ""))
+              (slot final_answer_allowed (default ""))
               (slot result_hash (default ""))
               (slot schema_version (default ""))
               (slot result_schema_id (default ""))
@@ -431,8 +435,33 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (route_target "lan_agent_delete_text_range_window_atomic")
                       (next_action "call lan_agent_delete_text_range_window_atomic with max_lines=200; do not use read/scan/prepare for comment cleanup")
                       (matched_rule "route-read-text-file-to-window-delete-for-comment-cleanup")))))",
-            R"((defrule route-read-text-file-to-range-scan-for-editing-intent
+            R"((defrule route-comment-cleanup-scaffold-to-window-delete
                   (declare (salience 83))
+                  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_scan_text_ranges")
+                                                          (eq ?tool "lan_agent_prepare_edit_windows")
+                                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
+                                                                 (eq ?intent "remove_comments")
+                                                                 (eq ?intent "strip_comments")
+                                                                 (eq ?intent "delete_comments")
+                                                                 (eq ?intent "删除注释")
+                                                                 (eq ?intent "清理注释")
+                                                                 (eq ?intent "去除注释")
+                                                                 (eq ?intent "移除注释")
+                                                                 (eq ?intent "删注释")))
+                                    (probe_ready "true"))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "verified")
+                      (reason_code "comment_cleanup_scaffold_prefers_bounded_window")
+                      (route_target "lan_agent_delete_text_range_window_atomic")
+                      (next_action "use lan_agent_delete_text_range_window_atomic with max_lines=200 as the default bounded comment cleanup step; reserve single-range delete for boundary-spanning leftovers")
+                      (matched_rule "route-comment-cleanup-scaffold-to-window-delete")))))",
+            R"((defrule route-read-text-file-to-range-scan-for-editing-intent
+                  (declare (salience 82))
                   (mcp_tool_request (tool_name "lan_agent_read_text_file")
                                     (primary_intent ?intent&:(or (eq ?intent "text_cleaning")
                                                                  (eq ?intent "localized_edit")
@@ -611,6 +640,35 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (next_action "tool_call_only: continue the delete loop; current write was verified but the overall comment deletion task is not complete")
                       (route_target ?tool)
                       (matched_rule "text-range-delete-result-still-pending-by-continuation")))))",
+            R"((defrule non-terminal-result-forbids-final-answer
+                  (declare (salience 47))
+                  (mcp_tool_result (tool_name ?tool)
+                                   (terminal_state "false")
+                                   (completion_claim_allowed "false"))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "non_terminal_result_forbids_final_answer")
+                      (next_action "tool_call_only: result is non-terminal; continue with next_call_json or move the continuation into task_memory budget runner before any completion claim")
+                      (route_target ?tool)
+                      (matched_rule "non-terminal-result-forbids-final-answer")))))",
+            R"((defrule final-answer-disallowed-by-result
+                  (declare (salience 46))
+                  (mcp_tool_result (tool_name ?tool)
+                                   (final_answer_allowed "false"))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "final_answer_disallowed_by_result")
+                      (next_action "tool_call_only: the tool result explicitly disallows final answer; execute the required MCP continuation or use task_memory_execute_continuation_budget")
+                      (route_target ?tool)
+                      (matched_rule "final-answer-disallowed-by-result")))))",
             R"((defrule invalid-result-missing-hash
                   (declare (salience 35))
                   (mcp_tool_result (tool_name ?tool) (result_hash ""))
@@ -1387,6 +1445,7 @@ std::string BuildMcpToolRequestFact(
         + ClipsStringSlot("route_hint", params.GetString("route_hint")) + " "
         + ClipsStringSlot("source_type", params.GetString("source_type")) + " "
         + ClipsStringSlot("file_path", file_path) + " "
+        + ClipsStringSlot("scan_mode", params.GetString("scan_mode")) + " "
         + ClipsStringSlot("probe_ref", probe_ref) + " "
         + ClipsStringSlot("patch_id", patch_id) + " "
         + ClipsStringSlot("request_id", params.GetString("request_id")) + " "
@@ -1524,6 +1583,9 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("directory_listing_complete", GetFieldOrDefault(result, "directory_listing_complete", "")) + " "
         + ClipsStringSlot("content_read_completion", GetFieldOrDefault(result, "content_read_completion", "")) + " "
         + ClipsStringSlot("incomplete_scope", GetFieldOrDefault(result, "incomplete_scope", "")) + " "
+        + ClipsStringSlot("terminal_state", GetFieldOrDefault(result, "terminal_state", "")) + " "
+        + ClipsStringSlot("completion_claim_allowed", GetFieldOrDefault(result, "completion_claim_allowed", "")) + " "
+        + ClipsStringSlot("final_answer_allowed", GetFieldOrDefault(result, "final_answer_allowed", "")) + " "
         + ClipsStringSlot("result_hash", GetFieldOrDefault(result, "result_hash", "")) + " "
         + ClipsStringSlot("schema_version", GetFieldOrDefault(result, "schema_version", "")) + " "
         + ClipsStringSlot("result_schema_id", GetFieldOrDefault(result, "result_schema_id", "")) + " "
@@ -1814,6 +1876,9 @@ CommandResult BuildClipsDecisionResult(
     seed_result.fields["directory_listing_complete"] = params.GetString("directory_listing_complete");
     seed_result.fields["content_read_completion"] = params.GetString("content_read_completion");
     seed_result.fields["incomplete_scope"] = params.GetString("incomplete_scope");
+    seed_result.fields["terminal_state"] = params.GetString("terminal_state");
+    seed_result.fields["completion_claim_allowed"] = params.GetString("completion_claim_allowed");
+    seed_result.fields["final_answer_allowed"] = params.GetString("final_answer_allowed");
     seed_result.fields["task_id"] = params.GetString("task_id");
     seed_result.fields["session_id"] = params.GetString("session_id");
     seed_result.fields["turn_id"] = params.GetString("turn_id");

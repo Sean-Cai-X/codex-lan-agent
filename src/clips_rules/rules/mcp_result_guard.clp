@@ -157,6 +157,37 @@
     (route_target ?tool)
     (matched_rule "text-range-delete-result-still-pending-by-continuation"))))
 
+(defrule non-terminal-result-forbids-final-answer
+  (declare (salience 47))
+  (mcp_tool_result (tool_name ?tool)
+                   (terminal_state "false")
+                   (completion_claim_allowed "false"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "non_terminal_result_forbids_final_answer")
+    (next_action "tool_call_only: result is non-terminal; continue with next_call_json or move the continuation into task_memory budget runner before any completion claim")
+    (route_target ?tool)
+    (matched_rule "non-terminal-result-forbids-final-answer"))))
+
+(defrule final-answer-disallowed-by-result
+  (declare (salience 46))
+  (mcp_tool_result (tool_name ?tool)
+                   (final_answer_allowed "false"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "final_answer_disallowed_by_result")
+    (next_action "tool_call_only: the tool result explicitly disallows final answer; execute the required MCP continuation or use task_memory_execute_continuation_budget")
+    (route_target ?tool)
+    (matched_rule "final-answer-disallowed-by-result"))))
+
 (defrule invalid-result-missing-hash
   (declare (salience 35))
   (mcp_tool_result (tool_name ?tool) (result_hash ""))

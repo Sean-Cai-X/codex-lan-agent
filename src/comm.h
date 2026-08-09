@@ -27,6 +27,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOWINUSER
+#define NOWINUSER
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>

@@ -151,7 +151,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "mcp_overview",
             "mcp overview returned",
-            "ok,exit_code,status,mcp_endpoint,mcp_transport,tool_count,tool_names_json,semantic_action_count,profile_count,tool_config_exists,tool_config_mode,local_chat_ready,browser_section_id,browser_section_title,browser_http_get_path,browser_route_hint,browser_status,browser_primary_count,browser_payload_field,browser_card_json,result,summary,provider_id,capability_id",
+            "ok,exit_code,status,mcp_endpoint,mcp_transport,tool_count,tool_names_json,semantic_action_count,profile_count,tool_config_exists,tool_config_mode,local_chat_ready,local_ai_mcp_guidance_version,local_ai_required_entry,local_ai_common_file_operation_policy,local_ai_comment_cleanup_policy,local_ai_long_loop_policy,local_ai_completion_gate,local_ai_guidance_json,browser_section_id,browser_section_title,browser_http_get_path,browser_route_hint,browser_status,browser_primary_count,browser_payload_field,browser_card_json,result,summary,provider_id,capability_id",
             "public"
         },
         {
@@ -419,11 +419,51 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "public"
         },
         {
+            "lan_agent_task_memory_rocksdb_mirror",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory RocksDB native mirror returned",
+            "ok,exit_code,status,record_model,goal_id,task_memory_root,source_of_truth,native_backend_role,rocksdb_status,rocksdb_path,rocksdb_manifest_path,kv_index_path,kv_manifest_path,kv_record_count,mirrored_count,mirror_complete,safe_to_replace_source_of_truth,compile_required,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_rocksdb_lookup",
+            "codex-lan-agent",
+            "task_memory_read",
+            "task memory RocksDB native lookup returned",
+            "ok,exit_code,status,record_model,goal_id,task_memory_root,lookup_key,prefix_match,kv_backend,source_of_truth,native_backend_role,rocksdb_status,rocksdb_path,limit,offset,matched_count,returned_count,has_more,next_offset,matches_jsonl,include_value,value_ref,value_text,compile_required,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_rocksdb_parity_check",
+            "codex-lan-agent",
+            "task_memory_read",
+            "task memory RocksDB parity check returned",
+            "ok,exit_code,status,record_model,goal_id,lookup_key,source_of_truth,native_backend_role,file_lookup_ok,rocksdb_lookup_ok,file_matched_count,rocksdb_matched_count,file_matches_hash,rocksdb_matches_hash,parity_ok,safe_to_replace_source_of_truth,rocksdb_status,semantic_outcome,next_action,result_ref,evidence_ref,file_error,rocksdb_error,error,provider_id,capability_id",
+            "public"
+        },
+        {
             "lan_agent_task_memory_migration_assess",
             "codex-lan-agent",
             "task_memory_read",
             "task memory migration assessment returned",
-            "ok,exit_code,status,record_model,goal_id,task_memory_root,migration_stage,adaptation_decision,active_backend,source_of_truth,backend_order,file_object_ready,migration_bundle_ready,kv_snapshot_ready,kv_contract_ready,rocksdb_native_ready,rocksdb_status,safe_to_enable_rocksdb_adapter,safe_to_replace_source_of_truth,ready_file_count,required_file_count,ready_migration_file_count,required_migration_file_count,missing_file_objects_csv,missing_migration_files_csv,kv_record_count,step_record_count,slice_record_count,budget_record_count,resume_context_path,step_ledger_path,slices_path,index_manifest_path,kv_index_path,kv_manifest_path,terminal_state,completion_claim_allowed,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "ok,exit_code,status,record_model,goal_id,task_memory_root,migration_stage,adaptation_decision,active_backend,source_of_truth,backend_order,file_object_ready,migration_bundle_ready,kv_snapshot_ready,kv_contract_ready,rocksdb_native_ready,rocksdb_status,rocksdb_path,rocksdb_manifest_path,rocksdb_mirrored_count,safe_to_enable_rocksdb_adapter,safe_to_replace_source_of_truth,ready_file_count,required_file_count,ready_migration_file_count,required_migration_file_count,missing_file_objects_csv,missing_migration_files_csv,kv_record_count,step_record_count,slice_record_count,budget_record_count,resume_context_path,step_ledger_path,slices_path,index_manifest_path,kv_index_path,kv_manifest_path,terminal_state,completion_claim_allowed,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_structure_manifest",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory structure manifest returned",
+            "ok,exit_code,status,record_model,goal_id,structure_version,task_memory_root,memory_structure_path,source_of_truth,active_read_backend,write_backend,native_backend_role,read_backend_order,required_model_read,structure_ready,fresh_model_bootstrap_ready,backend_policy_ready,safe_to_replace_source_of_truth,parity_required_for_native_reads,migration_bundle_ready,kv_snapshot_ready,rocksdb_native_ready,rocksdb_status,rocksdb_manifest_path,rocksdb_path,task_memory_path,step_ledger_path,slices_path,index_manifest_path,resume_context_path,evidence_refs_dir,budget_runs_dir,kv_snapshot_dir,kv_index_path,kv_manifest_path,step_count,slice_count,budget_file_count,evidence_file_count,kv_record_count,rocksdb_mirrored_count,terminal_state,completion_claim_allowed,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_migration_acceptance",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory migration acceptance returned",
+            "ok,exit_code,status,record_model,goal_id,trace_id,migration_acceptance_status,acceptance_status,semantic_outcome,sample_path,output_dir,summary_path,memory_structure_path,resume_context_path,kv_index_path,rocksdb_path,rocksdb_manifest_path,source_of_truth,active_read_backend,write_backend,safe_to_replace_source_of_truth,parity_required_for_native_reads,partial_budget_terminal_state,partial_budget_completion_claim_allowed,final_budget_terminal_state,kv_record_count,rocksdb_mirrored_count,validated_chain,completion_claim_allowed,final_answer_allowed,next_action,result_ref,evidence_ref,failed_stage,failed_field,expected_value,actual_value,failed_step_error,error,provider_id,capability_id",
             "public"
         },
         {

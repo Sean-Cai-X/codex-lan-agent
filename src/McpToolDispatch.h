@@ -519,8 +519,23 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_task_memory_kv_lookup", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildTaskMemoryKvLookupResult(config, params);
         }},
+        {"lan_agent_task_memory_rocksdb_mirror", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryRocksDbMirrorResult(config, params);
+        }},
+        {"lan_agent_task_memory_rocksdb_lookup", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryRocksDbLookupResult(config, params);
+        }},
+        {"lan_agent_task_memory_rocksdb_parity_check", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryRocksDbParityCheckResult(config, params);
+        }},
         {"lan_agent_task_memory_migration_assess", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildTaskMemoryMigrationAssessResult(config, params);
+        }},
+        {"lan_agent_task_memory_structure_manifest", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryStructureManifestResult(config, params);
+        }},
+        {"lan_agent_task_memory_migration_acceptance", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildTaskMemoryMigrationAcceptanceResult(config, params);
         }},
         {"lan_agent_task_memory_resume_context", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildTaskMemoryResumeContextResult(config, params);
@@ -1175,7 +1190,11 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_task_memory_execute_continuation_budget", "task_memory_write", "task_memory_execute_continuation_budget", "medium", "task-memory,continuation-budget,step-ledger,write,audited"},
         {"lan_agent_task_memory_build_kv_snapshot", "task_memory_write", "task_memory_build_kv_snapshot", "medium", "task-memory,kv-snapshot,index,write,audited"},
         {"lan_agent_task_memory_kv_lookup", "task_memory_read", "task_memory_kv_lookup", "low", "task-memory,kv-snapshot,index,lookup,read_only"},
+        {"lan_agent_task_memory_rocksdb_mirror", "task_memory_write", "task_memory_rocksdb_mirror", "medium", "task-memory,rocksdb,native,mirror,write,audited"},
+        {"lan_agent_task_memory_rocksdb_lookup", "task_memory_read", "task_memory_rocksdb_lookup", "low", "task-memory,rocksdb,native,lookup,read_only"},
+        {"lan_agent_task_memory_rocksdb_parity_check", "task_memory_read", "task_memory_rocksdb_parity_check", "low", "task-memory,rocksdb,parity,read_only"},
         {"lan_agent_task_memory_migration_assess", "task_memory_read", "task_memory_migration_assess", "low", "task-memory,migration,backend-readiness,read_only"},
+        {"lan_agent_task_memory_structure_manifest", "task_memory_write", "task_memory_structure_manifest", "medium", "task-memory,structure,manifest,write,audited"},
         {"lan_agent_task_memory_resume_context", "task_memory_read", "task_memory_resume_context", "low", "task-memory,resume-context,read_only"},
         {"lan_agent_remote_session_semantic_catalog", "remote_session_semantic_catalog", "remote_session_semantic_catalog", "low", "remote-session,semantic-catalog,read_only"},
         {"lan_agent_semantic_grid_ingest_text", "semantic_grid_ingest", "semantic_grid_ingest_text", "low", "semantic-grid,ingest,text,read_only"},

@@ -168,8 +168,34 @@
     (next_action "call lan_agent_delete_text_range_window_atomic with max_lines=200; do not use read/scan/prepare for comment cleanup")
     (matched_rule "route-read-text-file-to-window-delete-for-comment-cleanup"))))
 
-(defrule route-read-text-file-to-range-scan-for-editing-intent
+(defrule route-comment-cleanup-scaffold-to-window-delete
   (declare (salience 83))
+  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_scan_text_ranges")
+                                          (eq ?tool "lan_agent_prepare_edit_windows")
+                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
+                                                 (eq ?intent "remove_comments")
+                                                 (eq ?intent "strip_comments")
+                                                 (eq ?intent "delete_comments")
+                                                 (eq ?intent "删除注释")
+                                                 (eq ?intent "清理注释")
+                                                 (eq ?intent "去除注释")
+                                                 (eq ?intent "移除注释")
+                                                 (eq ?intent "删注释")))
+                    (probe_ready "true"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "verified")
+    (reason_code "comment_cleanup_scaffold_prefers_bounded_window")
+    (route_target "lan_agent_delete_text_range_window_atomic")
+    (next_action "use lan_agent_delete_text_range_window_atomic with max_lines=200 as the default bounded comment cleanup step; reserve single-range delete for boundary-spanning leftovers")
+    (matched_rule "route-comment-cleanup-scaffold-to-window-delete"))))
+
+(defrule route-read-text-file-to-range-scan-for-editing-intent
+  (declare (salience 82))
   (mcp_tool_request (tool_name "lan_agent_read_text_file")
                     (primary_intent ?intent&:(or (eq ?intent "text_cleaning")
                                                  (eq ?intent "localized_edit")

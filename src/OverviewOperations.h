@@ -423,6 +423,24 @@ CommandResult BuildMcpOverviewResult(const AgentConfig & config) {
     result.fields["tool_config_exists"] = GetFieldOrDefault(runtime, "tool_config_exists", "false");
     result.fields["tool_config_mode"] = GetFieldOrDefault(runtime, "tool_config_mode", "");
     result.fields["local_chat_ready"] = GetFieldOrDefault(runtime, "local_chat_ready", "false");
+    result.fields["local_ai_mcp_guidance_version"] = "local_ai_mcp_guidance_v1";
+    result.fields["local_ai_required_entry"] =
+        "start with lan_agent_mcp_overview and tools/list; use lan_agent_clips_decide before uncertain write/edit/build/test routing";
+    result.fields["local_ai_common_file_operation_policy"] =
+        "probe first, operate on one file, use bounded windows or one atomic mutation, verify each step, and follow next_call_json until terminal";
+    result.fields["local_ai_comment_cleanup_policy"] =
+        "for comment deletion use lan_agent_probe_text_file then lan_agent_delete_text_range_window_atomic max_lines=200; do not read the whole file and batch edit from model memory";
+    result.fields["local_ai_long_loop_policy"] =
+        "when continuation may exceed model context, freeze task_memory and use lan_agent_task_memory_execute_continuation_budget; the model may reset but MCP memory remains source state";
+    result.fields["local_ai_completion_gate"] =
+        "only claim completion when terminal_state=true, completion_claim_allowed=true, final_answer_allowed=true, and verification_ok=true";
+    result.fields["local_ai_guidance_json"] =
+        "{\"version\":\"local_ai_mcp_guidance_v1\","
+        "\"entry\":[\"lan_agent_mcp_overview\",\"tools/list\",\"lan_agent_clips_decide when routing is uncertain\"],"
+        "\"file_ops\":[\"probe first\",\"single file\",\"bounded window or one atomic mutation\",\"verify each step\",\"follow next_call_json until terminal\"],"
+        "\"comment_cleanup\":[\"lan_agent_probe_text_file\",\"lan_agent_delete_text_range_window_atomic max_lines=200\",\"repeat next_call_json until has_more=false\"],"
+        "\"long_loop\":[\"lan_agent_task_memory_freeze\",\"lan_agent_task_memory_execute_continuation_budget\",\"lan_agent_task_memory_resume_context\"],"
+        "\"completion_gate\":[\"terminal_state=true\",\"completion_claim_allowed=true\",\"final_answer_allowed=true\",\"verification_ok=true\"]}";
     result.fields["result"] = "mcp_overview";
     result.fields["summary"] = "mcp overview returned";
     if (result.fields["tool_config_exists"] != "true" || result.fields["local_chat_ready"] != "true") {

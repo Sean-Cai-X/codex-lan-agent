@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -367,6 +368,35 @@ inline std::string TaskMemoryJoinCsv(const std::vector<std::string> & items) {
     return output.str();
 }
 
+inline int TaskMemoryCountJsonlRecords(const std::filesystem::path & path) {
+    std::istringstream lines(ReadTaskMemoryTextFile(path));
+    std::string line;
+    int count = 0;
+    while (std::getline(lines, line)) {
+        if (!Trim(line).empty()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+inline int TaskMemoryCountRegularFiles(const std::filesystem::path & path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_directory(path, ec) || ec) {
+        return 0;
+    }
+    int count = 0;
+    for (const auto & entry : std::filesystem::directory_iterator(path, ec)) {
+        if (ec) {
+            break;
+        }
+        if (entry.is_regular_file(ec) && !ec) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 inline std::string TaskMemoryJsonPreview(const std::string & value, std::size_t max_chars = 240) {
     std::string compact;
     compact.reserve(std::min(value.size(), max_chars));
@@ -462,6 +492,32 @@ inline std::string TaskMemoryBuildLookupKey(
         return "trace/" + params.GetString("trace_id") + "/";
     }
     return std::string();
+}
+
+inline std::filesystem::path TaskMemoryRocksDbPath(
+    const AgentConfig & config,
+    const std::string & goal_id,
+    const JsonRequestView & params) {
+    const std::string explicit_path = params.GetString("rocksdb_path");
+    if (!Trim(explicit_path).empty()) {
+        return std::filesystem::path(explicit_path);
+    }
+    return BuildTaskMemoryRoot(config, goal_id) / "rocksdb_native";
+}
+
+inline std::filesystem::path TaskMemoryRocksDbManifestPath(
+    const AgentConfig & config,
+    const std::string & goal_id) {
+    return BuildTaskMemoryRoot(config, goal_id) / "rocksdb_mirror_manifest.json";
+}
+
+inline bool TaskMemoryRocksDbManifestReady(
+    const AgentConfig & config,
+    const std::string & goal_id) {
+    const std::string manifest = ReadTaskMemoryTextFile(
+        TaskMemoryRocksDbManifestPath(config, goal_id));
+    const std::string mirrored_count = Trim(ExtractJsonRawValue(manifest, "mirrored_count"));
+    return !mirrored_count.empty() && mirrored_count != "0";
 }
 
 inline CommandResult BuildTaskMemoryFreezeResult(
@@ -1092,6 +1148,18 @@ inline CommandResult BuildTaskMemoryKvLookupResult(
     return result;
 }
 
+CommandResult BuildTaskMemoryRocksDbMirrorResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
+
+CommandResult BuildTaskMemoryRocksDbLookupResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
+
+CommandResult BuildTaskMemoryRocksDbParityCheckResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
+
 inline CommandResult BuildTaskMemoryMigrationAssessResult(
     const AgentConfig & config,
     const JsonRequestView & params) {
@@ -1159,7 +1227,11 @@ inline CommandResult BuildTaskMemoryMigrationAssessResult(
     const int slice_record_count = TaskMemoryExtractIntField(kv_manifest, "slice_record_count", 0);
     const int budget_record_count = TaskMemoryExtractIntField(kv_manifest, "budget_record_count", 0);
     const bool kv_contract_ready = kv_snapshot_ready && kv_record_count > 0;
-    const bool rocksdb_native_ready = false;
+    const bool rocksdb_native_ready = TaskMemoryRocksDbManifestReady(config, goal_id);
+    const std::filesystem::path rocksdb_manifest_path = TaskMemoryRocksDbManifestPath(config, goal_id);
+    const std::string rocksdb_manifest = ReadTaskMemoryTextFile(rocksdb_manifest_path);
+    const std::string rocksdb_path = ExtractJsonString(rocksdb_manifest, "rocksdb_path");
+    const int rocksdb_mirrored_count = TaskMemoryExtractIntField(rocksdb_manifest, "mirrored_count", 0);
     const bool safe_to_enable_rocksdb_adapter = file_object_ready && migration_bundle_ready && kv_contract_ready;
     const bool safe_to_replace_source_of_truth = false;
 
@@ -1174,12 +1246,17 @@ inline CommandResult BuildTaskMemoryMigrationAssessResult(
     } else if (!kv_contract_ready) {
         adaptation_decision = "BLOCKED_KV_SNAPSHOT_MISSING_OR_EMPTY";
         next_action = "call lan_agent_task_memory_build_kv_snapshot";
+    } else if (rocksdb_native_ready) {
+        adaptation_decision = "ROCKSDB_NATIVE_MIRROR_READY";
+        next_action = "use lan_agent_task_memory_rocksdb_lookup for high-frequency reads and parity-check critical keys; keep file_object_store as source of truth";
     } else {
         adaptation_decision = "READY_FOR_ROCKSDB_ADAPTER_IMPLEMENTATION";
-        next_action = "implement RocksDB adapter as optional dual-write/read-parity backend; keep file object store as source of truth until parity passes";
+        next_action = "call lan_agent_task_memory_rocksdb_mirror to populate the optional native mirror; keep file object store as source of truth";
     }
 
-    const std::string active_backend = kv_contract_ready ? "file_jsonl_snapshot" : "file_object_store";
+    const std::string active_backend = rocksdb_native_ready
+        ? "rocksdb_native_mirror"
+        : (kv_contract_ready ? "file_jsonl_snapshot" : "file_object_store");
     const std::string resume_context = ReadTaskMemoryTextFile(resume_path);
     result.fields["record_model"] = "mcp_task_memory_migration_assessment_v1";
     result.fields["goal_id"] = goal_id;
@@ -1194,7 +1271,10 @@ inline CommandResult BuildTaskMemoryMigrationAssessResult(
     result.fields["kv_snapshot_ready"] = kv_snapshot_ready ? "true" : "false";
     result.fields["kv_contract_ready"] = kv_contract_ready ? "true" : "false";
     result.fields["rocksdb_native_ready"] = rocksdb_native_ready ? "true" : "false";
-    result.fields["rocksdb_status"] = "deferred_optional_backend";
+    result.fields["rocksdb_status"] = rocksdb_native_ready ? "enabled" : "deferred_optional_backend";
+    result.fields["rocksdb_path"] = rocksdb_path;
+    result.fields["rocksdb_manifest_path"] = rocksdb_manifest_path.string();
+    result.fields["rocksdb_mirrored_count"] = std::to_string(rocksdb_mirrored_count);
     result.fields["safe_to_enable_rocksdb_adapter"] = safe_to_enable_rocksdb_adapter ? "true" : "false";
     result.fields["safe_to_replace_source_of_truth"] = safe_to_replace_source_of_truth ? "true" : "false";
     result.fields["ready_file_count"] = std::to_string(ready_file_count);
@@ -1221,6 +1301,227 @@ inline CommandResult BuildTaskMemoryMigrationAssessResult(
     result.fields["next_action"] = next_action;
     result.fields["result_ref"] = kv_manifest_path.string();
     result.fields["evidence_ref"] = root.string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryStructureManifestResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    if (!std::filesystem::exists(root)) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "task memory root not found";
+        result.fields["task_memory_root"] = root.string();
+        result.fields["next_action"] = "call lan_agent_task_memory_freeze first";
+        return result;
+    }
+
+    const std::filesystem::path migration_dir = root / "rag_thread_migration";
+    const std::filesystem::path evidence_dir = root / "evidence_refs";
+    const std::filesystem::path budget_dir = root / "budget_runs";
+    const std::filesystem::path kv_dir = root / "kv_snapshot";
+    const std::filesystem::path structure_path = root / "memory_structure.json";
+    const std::filesystem::path rocksdb_manifest_path = TaskMemoryRocksDbManifestPath(config, goal_id);
+    const std::filesystem::path resume_path = root / "latest_resume_context.json";
+    const std::filesystem::path ledger_path = root / "step_ledger.jsonl";
+    const std::filesystem::path slices_path = root / "slices.jsonl";
+    const std::filesystem::path task_memory_path = root / "task_memory.json";
+    const std::filesystem::path index_manifest_path = root / "index_manifest.json";
+    const std::filesystem::path kv_index_path = kv_dir / "index.jsonl";
+    const std::filesystem::path kv_manifest_path = kv_dir / "manifest.json";
+
+    std::error_code ec;
+    std::filesystem::create_directories(evidence_dir, ec);
+    if (!ec) {
+        std::filesystem::create_directories(budget_dir, ec);
+    }
+    if (!ec) {
+        std::filesystem::create_directories(kv_dir, ec);
+    }
+    if (ec) {
+        result.ok = false;
+        result.exit_code = 501;
+        result.fields["error"] = "failed to create task memory structure directories: " + ec.message();
+        return result;
+    }
+
+    const bool task_memory_ready = TaskMemoryFileExistsNonEmpty(task_memory_path);
+    const bool ledger_ready = TaskMemoryFileExistsNonEmpty(ledger_path);
+    const bool slices_ready = TaskMemoryFileExistsNonEmpty(slices_path);
+    const bool index_manifest_ready = TaskMemoryFileExistsNonEmpty(index_manifest_path);
+    const bool resume_ready = TaskMemoryFileExistsNonEmpty(resume_path);
+    const bool kv_ready = TaskMemoryFileExistsNonEmpty(kv_index_path) && TaskMemoryFileExistsNonEmpty(kv_manifest_path);
+    const bool rocksdb_ready = TaskMemoryRocksDbManifestReady(config, goal_id);
+    const bool migration_ready =
+        TaskMemoryFileExistsNonEmpty(migration_dir / "1_current_state.md") &&
+        TaskMemoryFileExistsNonEmpty(migration_dir / "2_key_slices.jsonl") &&
+        TaskMemoryFileExistsNonEmpty(migration_dir / "3_incremental_index_manifest.json") &&
+        TaskMemoryFileExistsNonEmpty(migration_dir / "4_migration_handover.md");
+    const bool structure_ready =
+        task_memory_ready && ledger_ready && slices_ready && index_manifest_ready && resume_ready && migration_ready;
+
+    const std::string resume_context = ReadTaskMemoryTextFile(resume_path);
+    const std::string kv_manifest = ReadTaskMemoryTextFile(kv_manifest_path);
+    const std::string rocksdb_manifest = ReadTaskMemoryTextFile(rocksdb_manifest_path);
+    const int step_count = TaskMemoryCountJsonlRecords(ledger_path);
+    const int slice_count = TaskMemoryCountJsonlRecords(slices_path);
+    const int budget_file_count = TaskMemoryCountRegularFiles(budget_dir);
+    const int evidence_file_count = TaskMemoryCountRegularFiles(evidence_dir);
+    const int kv_record_count = TaskMemoryExtractIntField(kv_manifest, "record_count", 0);
+    const int rocksdb_mirrored_count = TaskMemoryExtractIntField(rocksdb_manifest, "mirrored_count", 0);
+    const std::string active_read_backend = rocksdb_ready
+        ? "rocksdb_native_mirror"
+        : (kv_ready ? "kv_snapshot" : "file_object_store");
+    const std::string read_backend_order = rocksdb_ready
+        ? "[\"rocksdb_native_mirror\",\"kv_snapshot\",\"file_object_store\"]"
+        : (kv_ready ? "[\"kv_snapshot\",\"file_object_store\"]" : "[\"file_object_store\"]");
+    const bool fresh_model_bootstrap_ready = structure_ready && resume_ready;
+    const bool backend_policy_ready =
+        structure_ready &&
+        (active_read_backend == "file_object_store" || kv_ready || rocksdb_ready);
+
+    std::ostringstream manifest;
+    manifest
+        << "{\n"
+        << "  \"record_model\":\"mcp_task_memory_structure_manifest_v1\",\n"
+        << "  \"structure_version\":\"stage5.memory_structure.v1\",\n"
+        << "  \"goal_id\":\"" << JsonEscape(goal_id) << "\",\n"
+        << "  \"created_at\":\"" << JsonEscape(IsoTimestampNow()) << "\",\n"
+        << "  \"source_of_truth\":\"file_object_store\",\n"
+        << "  \"active_read_backend\":\"" << active_read_backend << "\",\n"
+        << "  \"write_backend\":\"file_object_store\",\n"
+        << "  \"native_backend_role\":\"mirror_read_backend\",\n"
+        << "  \"read_backend_order\":" << read_backend_order << ",\n"
+        << "  \"required_model_read\":\"latest_resume_context.json\",\n"
+        << "  \"rocksdb_status\":\"" << (rocksdb_ready ? "enabled" : "deferred_optional_backend") << "\",\n"
+        << "  \"structure_ready\":" << (structure_ready ? "true" : "false") << ",\n"
+        << "  \"fresh_model_bootstrap_ready\":" << (fresh_model_bootstrap_ready ? "true" : "false") << ",\n"
+        << "  \"backend_policy_ready\":" << (backend_policy_ready ? "true" : "false") << ",\n"
+        << "  \"safe_to_replace_source_of_truth\":false,\n"
+        << "  \"parity_required_for_native_reads\":true,\n"
+        << "  \"kv_snapshot_ready\":" << (kv_ready ? "true" : "false") << ",\n"
+        << "  \"rocksdb_native_ready\":" << (rocksdb_ready ? "true" : "false") << ",\n"
+        << "  \"fresh_model_bootstrap\":{\n"
+        << "    \"first_read\":\"latest_resume_context.json\",\n"
+        << "    \"second_read\":\"memory_structure.json\",\n"
+        << "    \"query_read\":\"" << (rocksdb_ready ? "lan_agent_task_memory_rocksdb_lookup" : (kv_ready ? "lan_agent_task_memory_kv_lookup" : "lan_agent_task_memory_resume_context")) << "\",\n"
+        << "    \"evidence_read\":\"on_demand_only\",\n"
+        << "    \"full_history_read\":\"forbidden_by_default\"\n"
+        << "  },\n"
+        << "  \"backend_policy\":{\n"
+        << "    \"source_of_truth\":\"file_object_store\",\n"
+        << "    \"write_backend\":\"file_object_store\",\n"
+        << "    \"primary_read_backend\":\"" << active_read_backend << "\",\n"
+        << "    \"native_backend_role\":\"mirror_read_backend\",\n"
+        << "    \"safe_to_replace_source_of_truth\":false,\n"
+        << "    \"parity_required_for_native_reads\":true\n"
+        << "  },\n"
+        << "  \"query_contract\":{\n"
+        << "    \"key_schema\":[\"goal/{goal_id}\",\"latest/{goal_id}\",\"trace/{trace_id}/step/{step_id}\",\"slice/{slice_id}\",\"budget/{budget_run_id}\",\"trace/{trace_id}/budget/{budget_run_id}\"],\n"
+        << "    \"file_lookup_tool\":\"lan_agent_task_memory_kv_lookup\",\n"
+        << "    \"native_lookup_tool\":\"lan_agent_task_memory_rocksdb_lookup\",\n"
+        << "    \"native_parity_tool\":\"lan_agent_task_memory_rocksdb_parity_check\"\n"
+        << "  },\n"
+        << "  \"paths\":{\n"
+        << "    \"task_memory_root\":\"" << JsonEscape(root.string()) << "\",\n"
+        << "    \"memory_structure\":\"" << JsonEscape(structure_path.string()) << "\",\n"
+        << "    \"task_memory\":\"" << JsonEscape(task_memory_path.string()) << "\",\n"
+        << "    \"step_ledger\":\"" << JsonEscape(ledger_path.string()) << "\",\n"
+        << "    \"slices\":\"" << JsonEscape(slices_path.string()) << "\",\n"
+        << "    \"index_manifest\":\"" << JsonEscape(index_manifest_path.string()) << "\",\n"
+        << "    \"latest_resume_context\":\"" << JsonEscape(resume_path.string()) << "\",\n"
+        << "    \"evidence_refs\":\"" << JsonEscape(evidence_dir.string()) << "\",\n"
+        << "    \"budget_runs\":\"" << JsonEscape(budget_dir.string()) << "\",\n"
+        << "    \"kv_snapshot\":\"" << JsonEscape(kv_dir.string()) << "\",\n"
+        << "    \"kv_index\":\"" << JsonEscape(kv_index_path.string()) << "\",\n"
+        << "    \"kv_manifest\":\"" << JsonEscape(kv_manifest_path.string()) << "\",\n"
+        << "    \"rocksdb_manifest\":\"" << JsonEscape(rocksdb_manifest_path.string()) << "\",\n"
+        << "    \"rocksdb_path\":\"" << JsonEscape(ExtractJsonString(rocksdb_manifest, "rocksdb_path")) << "\",\n"
+        << "    \"rag_thread_migration\":\"" << JsonEscape(migration_dir.string()) << "\"\n"
+        << "  },\n"
+        << "  \"counts\":{\n"
+        << "    \"step_count\":" << step_count << ",\n"
+        << "    \"slice_count\":" << slice_count << ",\n"
+        << "    \"budget_file_count\":" << budget_file_count << ",\n"
+        << "    \"evidence_file_count\":" << evidence_file_count << ",\n"
+        << "    \"kv_record_count\":" << kv_record_count << ",\n"
+        << "    \"rocksdb_mirrored_count\":" << rocksdb_mirrored_count << "\n"
+        << "  },\n"
+        << "  \"resume\":{\n"
+        << "    \"terminal_state\":" << (TaskMemoryExtractBoolField(resume_context, "terminal_state", false) ? "true" : "false") << ",\n"
+        << "    \"completion_claim_allowed\":" << (TaskMemoryExtractBoolField(resume_context, "completion_claim_allowed", false) ? "true" : "false") << ",\n"
+        << "    \"last_verified_step\":" << TaskMemoryExtractIntField(resume_context, "last_verified_step", 0) << ",\n"
+        << "    \"next_call_json_present\":" << (!Trim(ExtractJsonString(resume_context, "next_call_json")).empty() ? "true" : "false") << "\n"
+        << "  }\n"
+        << "}\n";
+
+    std::string error;
+    if (!WriteTaskMemoryTextFile(structure_path, manifest.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 502;
+        result.fields["error"] = error;
+        result.fields["failed_path"] = structure_path.string();
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_structure_manifest_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["structure_version"] = "stage5.memory_structure.v1";
+    result.fields["task_memory_root"] = root.string();
+    result.fields["memory_structure_path"] = structure_path.string();
+    result.fields["source_of_truth"] = "file_object_store";
+    result.fields["active_read_backend"] = active_read_backend;
+    result.fields["write_backend"] = "file_object_store";
+    result.fields["native_backend_role"] = "mirror_read_backend";
+    result.fields["read_backend_order"] = read_backend_order;
+    result.fields["required_model_read"] = "latest_resume_context.json";
+    result.fields["structure_ready"] = structure_ready ? "true" : "false";
+    result.fields["fresh_model_bootstrap_ready"] = fresh_model_bootstrap_ready ? "true" : "false";
+    result.fields["backend_policy_ready"] = backend_policy_ready ? "true" : "false";
+    result.fields["safe_to_replace_source_of_truth"] = "false";
+    result.fields["parity_required_for_native_reads"] = "true";
+    result.fields["migration_bundle_ready"] = migration_ready ? "true" : "false";
+    result.fields["kv_snapshot_ready"] = kv_ready ? "true" : "false";
+    result.fields["rocksdb_status"] = rocksdb_ready ? "enabled" : "deferred_optional_backend";
+    result.fields["rocksdb_native_ready"] = rocksdb_ready ? "true" : "false";
+    result.fields["rocksdb_manifest_path"] = rocksdb_manifest_path.string();
+    result.fields["rocksdb_path"] = ExtractJsonString(rocksdb_manifest, "rocksdb_path");
+    result.fields["task_memory_path"] = task_memory_path.string();
+    result.fields["step_ledger_path"] = ledger_path.string();
+    result.fields["slices_path"] = slices_path.string();
+    result.fields["index_manifest_path"] = index_manifest_path.string();
+    result.fields["resume_context_path"] = resume_path.string();
+    result.fields["evidence_refs_dir"] = evidence_dir.string();
+    result.fields["budget_runs_dir"] = budget_dir.string();
+    result.fields["kv_snapshot_dir"] = kv_dir.string();
+    result.fields["kv_index_path"] = kv_index_path.string();
+    result.fields["kv_manifest_path"] = kv_manifest_path.string();
+    result.fields["step_count"] = std::to_string(step_count);
+    result.fields["slice_count"] = std::to_string(slice_count);
+    result.fields["budget_file_count"] = std::to_string(budget_file_count);
+    result.fields["evidence_file_count"] = std::to_string(evidence_file_count);
+    result.fields["kv_record_count"] = std::to_string(kv_record_count);
+    result.fields["rocksdb_mirrored_count"] = std::to_string(rocksdb_mirrored_count);
+    result.fields["terminal_state"] = ExtractJsonRawValue(resume_context, "terminal_state");
+    result.fields["completion_claim_allowed"] = ExtractJsonRawValue(resume_context, "completion_claim_allowed");
+    result.fields["semantic_outcome"] = structure_ready
+        ? "task_memory_structure_manifest_ready"
+        : "task_memory_structure_manifest_incomplete";
+    result.fields["next_action"] = structure_ready
+        ? "fresh models should read latest_resume_context.json first, then use memory_structure.json and native/file KV lookup only as needed"
+        : "repair missing task memory artifacts before relying on this goal";
+    result.fields["result_ref"] = structure_path.string();
+    result.fields["evidence_ref"] = structure_path.string();
     return result;
 }
 

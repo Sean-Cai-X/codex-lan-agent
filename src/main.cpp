@@ -1,3 +1,12 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOWINUSER
+#define NOWINUSER
+#endif
+#endif
+
 #include "AgentConfig.h"
 #include "CapabilityRegistry.h"
 #include "HttpClient.h"
@@ -77,6 +86,9 @@ bool StartsWithPath(
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOWINUSER
+#define NOWINUSER
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -525,7 +537,13 @@ private:
 #include "CommandResultConclusions.h"
 #include "JsonRequestView.h"
 #include "ResultFieldCatalog.h"
+#ifdef _WIN32
+#define GetFocus CodexLanAgentClipsGetFocusDeclarationOnly
+#endif
 #include "ClipsDecisionOperations.h"
+#ifdef _WIN32
+#undef GetFocus
+#endif
 bool Base64Decode(
     const std::string & input,
     std::string * output,
@@ -536,6 +554,9 @@ std::string ResolveTextPayloadFromParams(
     const std::string & base64_field,
     CommandResult * result = nullptr);
 CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
+CommandResult BuildTaskMemoryMigrationAcceptanceResult(
     const AgentConfig & config,
     const JsonRequestView & params);
 #include "McpToolDispatch.h"
@@ -1858,6 +1879,374 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         result.fields["required_tool_name"] = ExtractJsonString(current_call_json, "name");
         result.fields["required_tool_arguments_json"] = current_call_json;
     }
+    return result;
+}
+
+std::string BuildTaskMemoryAcceptanceParamsJson(
+    const std::vector<std::pair<std::string, std::string>> & strings,
+    const std::vector<std::pair<std::string, int>> & integers = {},
+    const std::vector<std::pair<std::string, bool>> & booleans = {}) {
+    std::ostringstream output;
+    output << "{";
+    bool first = true;
+    auto comma = [&]() {
+        if (!first) {
+            output << ",";
+        }
+        first = false;
+    };
+    for (const auto & item : strings) {
+        comma();
+        output << "\"" << codex_lan_agent::JsonEscape(item.first) << "\":\""
+               << codex_lan_agent::JsonEscape(item.second) << "\"";
+    }
+    for (const auto & item : integers) {
+        comma();
+        output << "\"" << codex_lan_agent::JsonEscape(item.first) << "\":" << item.second;
+    }
+    for (const auto & item : booleans) {
+        comma();
+        output << "\"" << codex_lan_agent::JsonEscape(item.first) << "\":"
+               << (item.second ? "true" : "false");
+    }
+    output << "}";
+    return output.str();
+}
+
+std::string BuildTaskMemoryAcceptanceDeleteNextCallJson(
+    const std::string & file_path,
+    const std::string & trace_id) {
+    std::ostringstream output;
+    output
+        << "{"
+        << "\"name\":\"lan_agent_delete_next_text_range_atomic\","
+        << "\"arguments\":{"
+        << "\"file_path\":\"" << codex_lan_agent::JsonEscape(file_path) << "\","
+        << "\"scan_mode\":\"comments\","
+        << "\"primary_intent\":\"delete_comments\","
+        << "\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\","
+        << "\"probe_ref\":\"" << codex_lan_agent::JsonEscape(file_path) << "\","
+        << "\"probe_ready\":true"
+        << "}"
+        << "}";
+    return output.str();
+}
+
+bool TaskMemoryAcceptanceExpectField(
+    const CommandResult & step,
+    const std::string & field,
+    const std::string & expected,
+    const std::string & stage,
+    CommandResult * result) {
+    const std::string actual = GetFieldOrDefault(step, field, "");
+    if (actual == expected) {
+        return true;
+    }
+    if (result != nullptr) {
+        result->ok = false;
+        result->exit_code = 422;
+        result->fields["acceptance_status"] = "PARTIAL";
+        result->fields["migration_acceptance_status"] = "PARTIAL";
+        result->fields["failed_stage"] = stage;
+        result->fields["failed_field"] = field;
+        result->fields["expected_value"] = expected;
+        result->fields["actual_value"] = actual;
+        result->fields["completion_claim_allowed"] = "false";
+        result->fields["final_answer_allowed"] = "false";
+    }
+    return false;
+}
+
+bool TaskMemoryAcceptanceExpectOk(
+    const CommandResult & step,
+    const std::string & stage,
+    CommandResult * result) {
+    if (step.ok && step.exit_code == 0) {
+        return true;
+    }
+    if (result != nullptr) {
+        result->ok = false;
+        result->exit_code = step.exit_code == 0 ? 422 : step.exit_code;
+        result->fields["acceptance_status"] = "PARTIAL";
+        result->fields["migration_acceptance_status"] = "PARTIAL";
+        result->fields["failed_stage"] = stage;
+        result->fields["failed_step_error"] = GetFieldOrDefault(step, "error", "");
+        result->fields["completion_claim_allowed"] = "false";
+        result->fields["final_answer_allowed"] = "false";
+    }
+    return false;
+}
+
+CommandResult BuildTaskMemoryMigrationAcceptanceResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string default_stamp = CommOperations::TimeStampForFileName();
+    const std::string goal_id = params.GetString(
+        "goal_id",
+        "task-memory-migration-acceptance-" + default_stamp);
+    const std::string trace_id = params.GetString("trace_id", goal_id + "-trace");
+    const int max_final_steps = std::min(64, std::max(2, params.GetInt("max_final_steps", 8)));
+    const std::filesystem::path out_dir =
+        std::filesystem::path(config.data_root) /
+        "task_memory_acceptance" /
+        codex_lan_agent::SanitizeTaskMemoryToken(goal_id);
+    const std::filesystem::path sample_path = out_dir / "acceptance_delete_comments.cpp";
+
+    std::string write_error;
+    const std::string sample_text =
+        "int keep0 = 0;\n"
+        "// acceptance delete one\n"
+        "int keep1 = 1;\n"
+        "// acceptance delete two\n"
+        "int keep2 = 2;\n";
+    if (!codex_lan_agent::WriteTaskMemoryTextFile(sample_path, sample_text, &write_error)) {
+        result.ok = false;
+        result.exit_code = 502;
+        result.fields["acceptance_status"] = "PARTIAL";
+        result.fields["migration_acceptance_status"] = "PARTIAL";
+        result.fields["failed_stage"] = "sample_write";
+        result.fields["error"] = write_error;
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        return result;
+    }
+
+    const std::string next_call_json = BuildTaskMemoryAcceptanceDeleteNextCallJson(
+        sample_path.string(),
+        trace_id);
+    const std::string freeze_params_json = BuildTaskMemoryAcceptanceParamsJson(
+        {
+            {"goal_id", goal_id},
+            {"trace_id", trace_id},
+            {"current_goal", "task memory migration acceptance"},
+            {"current_scope", "fresh model bootstrap + budget runner + KV/RocksDB mirror"},
+            {"current_file", sample_path.string()},
+            {"current_tool", "lan_agent_delete_next_text_range_atomic"},
+            {"next_call_json", next_call_json},
+            {"compact_summary", "acceptance starts with two comment cleanup continuations"},
+            {"remaining_work", "execute budget runner, build KV snapshot, mirror to RocksDB, verify parity, materialize memory_structure"},
+            {"key_slices_jsonl", "{\"slice_id\":\"slice-task-memory-acceptance\",\"slice_type\":\"acceptance_chain\",\"summary\":\"task memory migration acceptance slice\",\"trace_id\":\"" + trace_id + "\"}"}
+        },
+        {{"completed_step_count", 0}},
+        {{"terminal_state", false}, {"completion_claim_allowed", false}});
+    CommandResult freeze = codex_lan_agent::BuildTaskMemoryFreezeResult(
+        config,
+        JsonRequestView(freeze_params_json));
+    if (!TaskMemoryAcceptanceExpectOk(freeze, "freeze", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult resume_before = codex_lan_agent::BuildTaskMemoryResumeContextResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson({{"goal_id", goal_id}})));
+    if (!TaskMemoryAcceptanceExpectOk(resume_before, "resume_before_budget", &result) ||
+        !TaskMemoryAcceptanceExpectField(resume_before, "terminal_state", "false", "resume_before_budget", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult budget_partial = BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson(
+            {{"goal_id", goal_id}, {"trace_id", trace_id}},
+            {{"max_steps", 1}},
+            {{"dry_run", false}, {"execute", true}})));
+    if (!TaskMemoryAcceptanceExpectOk(budget_partial, "budget_partial", &result) ||
+        !TaskMemoryAcceptanceExpectField(budget_partial, "executed_step_count", "1", "budget_partial", &result) ||
+        !TaskMemoryAcceptanceExpectField(budget_partial, "terminal_state", "false", "budget_partial", &result) ||
+        !TaskMemoryAcceptanceExpectField(budget_partial, "completion_claim_allowed", "false", "budget_partial", &result) ||
+        !TaskMemoryAcceptanceExpectField(budget_partial, "final_answer_allowed", "false", "budget_partial", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult budget_final = BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson(
+            {{"goal_id", goal_id}, {"trace_id", trace_id}},
+            {{"max_steps", max_final_steps}},
+            {{"dry_run", false}, {"execute", true}})));
+    if (!TaskMemoryAcceptanceExpectOk(budget_final, "budget_final", &result) ||
+        !TaskMemoryAcceptanceExpectField(budget_final, "terminal_state", "true", "budget_final", &result) ||
+        !TaskMemoryAcceptanceExpectField(budget_final, "completion_claim_allowed", "true", "budget_final", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    const std::string final_sample = codex_lan_agent::ReadTaskMemoryTextFile(sample_path);
+    if (final_sample.find("// acceptance delete") != std::string::npos) {
+        result.ok = false;
+        result.exit_code = 422;
+        result.fields["acceptance_status"] = "PARTIAL";
+        result.fields["migration_acceptance_status"] = "PARTIAL";
+        result.fields["failed_stage"] = "sample_delete_verification";
+        result.fields["error"] = "bounded continuation did not delete all sample comments";
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        return result;
+    }
+
+    const std::string goal_params_json = BuildTaskMemoryAcceptanceParamsJson({{"goal_id", goal_id}});
+    CommandResult kv_snapshot = codex_lan_agent::BuildTaskMemoryBuildKvSnapshotResult(
+        config,
+        JsonRequestView(goal_params_json));
+    if (!TaskMemoryAcceptanceExpectOk(kv_snapshot, "kv_snapshot", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult kv_lookup = codex_lan_agent::BuildTaskMemoryKvLookupResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson(
+            {{"goal_id", goal_id}, {"kind", "latest"}},
+            {},
+            {{"include_value", true}})));
+    if (!TaskMemoryAcceptanceExpectOk(kv_lookup, "kv_lookup_latest", &result) ||
+        !TaskMemoryAcceptanceExpectField(kv_lookup, "matched_count", "1", "kv_lookup_latest", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult mirror = codex_lan_agent::BuildTaskMemoryRocksDbMirrorResult(
+        config,
+        JsonRequestView(goal_params_json));
+    if (!TaskMemoryAcceptanceExpectOk(mirror, "rocksdb_mirror", &result) ||
+        !TaskMemoryAcceptanceExpectField(mirror, "rocksdb_status", "enabled", "rocksdb_mirror", &result) ||
+        !TaskMemoryAcceptanceExpectField(mirror, "mirror_complete", "true", "rocksdb_mirror", &result) ||
+        !TaskMemoryAcceptanceExpectField(mirror, "source_of_truth", "file_object_store", "rocksdb_mirror", &result) ||
+        !TaskMemoryAcceptanceExpectField(mirror, "safe_to_replace_source_of_truth", "false", "rocksdb_mirror", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult rocks_lookup = codex_lan_agent::BuildTaskMemoryRocksDbLookupResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson(
+            {{"goal_id", goal_id}, {"kind", "latest"}},
+            {},
+            {{"include_value", true}})));
+    if (!TaskMemoryAcceptanceExpectOk(rocks_lookup, "rocksdb_lookup_latest", &result) ||
+        !TaskMemoryAcceptanceExpectField(rocks_lookup, "kv_backend", "rocksdb_native_mirror", "rocksdb_lookup_latest", &result) ||
+        !TaskMemoryAcceptanceExpectField(rocks_lookup, "matched_count", "1", "rocksdb_lookup_latest", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult parity = codex_lan_agent::BuildTaskMemoryRocksDbParityCheckResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson(
+            {{"goal_id", goal_id}, {"kind", "latest"}},
+            {},
+            {{"include_value", false}})));
+    if (!TaskMemoryAcceptanceExpectOk(parity, "rocksdb_parity_latest", &result) ||
+        !TaskMemoryAcceptanceExpectField(parity, "parity_ok", "true", "rocksdb_parity_latest", &result) ||
+        !TaskMemoryAcceptanceExpectField(parity, "safe_to_replace_source_of_truth", "false", "rocksdb_parity_latest", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult assess = codex_lan_agent::BuildTaskMemoryMigrationAssessResult(
+        config,
+        JsonRequestView(goal_params_json));
+    if (!TaskMemoryAcceptanceExpectOk(assess, "migration_assess", &result) ||
+        !TaskMemoryAcceptanceExpectField(assess, "adaptation_decision", "ROCKSDB_NATIVE_MIRROR_READY", "migration_assess", &result) ||
+        !TaskMemoryAcceptanceExpectField(assess, "active_backend", "rocksdb_native_mirror", "migration_assess", &result) ||
+        !TaskMemoryAcceptanceExpectField(assess, "source_of_truth", "file_object_store", "migration_assess", &result) ||
+        !TaskMemoryAcceptanceExpectField(assess, "safe_to_replace_source_of_truth", "false", "migration_assess", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    CommandResult structure = codex_lan_agent::BuildTaskMemoryStructureManifestResult(
+        config,
+        JsonRequestView(goal_params_json));
+    if (!TaskMemoryAcceptanceExpectOk(structure, "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "structure_ready", "true", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "fresh_model_bootstrap_ready", "true", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "backend_policy_ready", "true", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "active_read_backend", "rocksdb_native_mirror", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "write_backend", "file_object_store", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "source_of_truth", "file_object_store", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "safe_to_replace_source_of_truth", "false", "memory_structure", &result) ||
+        !TaskMemoryAcceptanceExpectField(structure, "parity_required_for_native_reads", "true", "memory_structure", &result)) {
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        return result;
+    }
+
+    const std::filesystem::path summary_path = out_dir / "acceptance_summary.json";
+    std::ostringstream summary;
+    summary
+        << "{\n"
+        << "  \"status\":\"TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS\",\n"
+        << "  \"goal_id\":\"" << codex_lan_agent::JsonEscape(goal_id) << "\",\n"
+        << "  \"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\",\n"
+        << "  \"output_dir\":\"" << codex_lan_agent::JsonEscape(out_dir.string()) << "\",\n"
+        << "  \"memory_structure_path\":\"" << codex_lan_agent::JsonEscape(GetFieldOrDefault(structure, "memory_structure_path", "")) << "\",\n"
+        << "  \"source_of_truth\":\"file_object_store\",\n"
+        << "  \"active_read_backend\":\"rocksdb_native_mirror\",\n"
+        << "  \"write_backend\":\"file_object_store\",\n"
+        << "  \"safe_to_replace_source_of_truth\":false,\n"
+        << "  \"parity_required_for_native_reads\":true\n"
+        << "}\n";
+    if (!codex_lan_agent::WriteTaskMemoryTextFile(summary_path, summary.str(), &write_error)) {
+        result.ok = false;
+        result.exit_code = 502;
+        result.fields["acceptance_status"] = "PARTIAL";
+        result.fields["migration_acceptance_status"] = "PARTIAL";
+        result.fields["failed_stage"] = "summary_write";
+        result.fields["error"] = write_error;
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_migration_acceptance_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["trace_id"] = trace_id;
+    result.fields["acceptance_status"] = "ACCEPTED";
+    result.fields["migration_acceptance_status"] = "ACCEPTED";
+    result.fields["semantic_outcome"] = "TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS";
+    result.fields["sample_path"] = sample_path.string();
+    result.fields["output_dir"] = out_dir.string();
+    result.fields["summary_path"] = summary_path.string();
+    result.fields["memory_structure_path"] = GetFieldOrDefault(structure, "memory_structure_path", "");
+    result.fields["resume_context_path"] = GetFieldOrDefault(structure, "resume_context_path", "");
+    result.fields["kv_index_path"] = GetFieldOrDefault(structure, "kv_index_path", "");
+    result.fields["rocksdb_path"] = GetFieldOrDefault(structure, "rocksdb_path", "");
+    result.fields["rocksdb_manifest_path"] = GetFieldOrDefault(structure, "rocksdb_manifest_path", "");
+    result.fields["source_of_truth"] = "file_object_store";
+    result.fields["active_read_backend"] = "rocksdb_native_mirror";
+    result.fields["write_backend"] = "file_object_store";
+    result.fields["safe_to_replace_source_of_truth"] = "false";
+    result.fields["parity_required_for_native_reads"] = "true";
+    result.fields["partial_budget_terminal_state"] = GetFieldOrDefault(budget_partial, "terminal_state", "");
+    result.fields["partial_budget_completion_claim_allowed"] = GetFieldOrDefault(budget_partial, "completion_claim_allowed", "");
+    result.fields["final_budget_terminal_state"] = GetFieldOrDefault(budget_final, "terminal_state", "");
+    result.fields["kv_record_count"] = GetFieldOrDefault(structure, "kv_record_count", "");
+    result.fields["rocksdb_mirrored_count"] = GetFieldOrDefault(structure, "rocksdb_mirrored_count", "");
+    result.fields["validated_chain"] = "freeze,resume_context,budget_partial,budget_final,kv_snapshot,kv_lookup,rocksdb_mirror,rocksdb_lookup,parity,assess,structure";
+    result.fields["completion_claim_allowed"] = "true";
+    result.fields["final_answer_allowed"] = "true";
+    result.fields["next_action"] = "MCP-side migration acceptance is available; external PowerShell smoke remains optional for CI or operator verification";
+    result.fields["result_ref"] = summary_path.string();
+    result.fields["evidence_ref"] = GetFieldOrDefault(structure, "memory_structure_path", "");
     return result;
 }
 

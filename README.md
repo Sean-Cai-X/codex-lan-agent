@@ -1,6 +1,6 @@
 # codex-lan-agent
 
-基于 Clang AST 的 C/C++ 代码分析 MCP 工具链，提供 AST 解析、控制流图（CFG）、调用图（Call Graph）、数据流图（DFG）、程序切片（Program Slice）能力，并内置语义网格（Semantic Grid）长文本解构、归纳、检索、溯源与上下文重构能力，通过 MCP 协议（Streamable HTTP）对外服务。
+基于 Clang AST 的 C/C++ 代码分析 MCP 工具链，提供 AST 解析、控制流图（CFG）、调用图（Call Graph）、数据流图（DFG）、程序切片（Program Slice）能力，并内置语义网格（Semantic Grid）长文本解构、归纳、检索、溯源与上下文重构能力，以及面向长会话上下文压力的 **Task Memory（任务记忆）** 工具链 —— 在 MCP 服务端文件对象层持久化任务状态、步骤账本、关键切片、KV 快照、RocksDB 镜像与一致性校验，使全新模型只需读取 `latest_resume_context.json` 即可续接长任务，无需加载完整历史对话。通过 MCP 协议（Streamable HTTP）对外服务。
 
 ---
 
@@ -14,11 +14,12 @@
 6. [完整使用案例](#6-完整使用案例)
 7. [Artifact 二次查询与分页](#7-artifact-二次查询与分页)
 8. [语义网格工具：长文本解构与上下文重构](#8-语义网格工具长文本解构与上下文重构)
-9. [测试脚本与一键验证](#9-测试脚本与一键验证)
-10. [测试结论](#10-测试结论)
-11. [CMM 工具清单](#11-cmm-工具清单)
-12. [Clang 分析工具 vs CMM 工具功能对比](#12-clang-分析工具-vs-cmm-工具功能对比)
-13. [常见问题排查](#13-常见问题排查)
+9. [Task Memory 工具：长任务记忆与跨模型续接](#9-task-memory-工具长任务记忆与跨模型续接)
+10. [测试脚本与一键验证](#10-测试脚本与一键验证)
+11. [测试结论](#11-测试结论)
+12. [CMM 工具清单](#12-cmm-工具清单)
+13. [Clang 分析工具 vs CMM 工具功能对比](#13-clang-分析工具-vs-cmm-工具功能对比)
+14. [常见问题排查](#14-常见问题排查)
 
 ---
 
@@ -40,10 +41,13 @@ AI Agent / IDE / 本地模型
 │  CfGBuilder.cpp                   │  ← CFG 构建
 │  GraphSerialization.cpp           │  ← CallGraph / DFG / Slice
 ├───────────────────────────────────┤
-│  SemanticGridOperations.cpp       │  ← 语义网格（解构/归纳/检索/溯源/增量）
+│  SemanticGridOperations.h         │  ← 语义网格（解构/归纳/检索/溯源/增量）
+├───────────────────────────────────┤
+│  TaskMemoryOperations.h           │  ← Task Memory（freeze/step/kv/rocksdb/parity）
 ├───────────────────────────────────┤
 │  compile_commands.json            │  ← 编译数据库（项目侧）
 │  Clang / LLVM                     │  ← 底层解析引擎
+│  logs/task_memory/{goal_id}       │  ← 任务记忆文件对象层（source of truth）
 └───────────────────────────────────┘
 ```
 
@@ -53,6 +57,7 @@ AI Agent / IDE / 本地模型
 - 每个工具产出标准化 JSON artifact，支持二次查询（artifact query）。
 - 分页（`offset_*` / `max_*`）和邻域提取（`focus_symbol` / `neighborhood_depth`）在 artifact 层完成，无需重跑 Clang。
 - 语义网格工具独立于 Clang 工具链，可单独用于长文本/规则文档的解构与检索，为本地模型提供上下文重构能力。
+- Task Memory 把"长任务记忆"从模型上下文外移到 MCP 服务端文件对象层：源真（source of truth）始终是 `logs/task_memory/{goal_id}/` 下的文件对象，RocksDB 仅作可选读镜像，需通过 parity check 校验后才允许替换读路径。
 
 ---
 
@@ -92,6 +97,7 @@ cd AIbuild\Release
 |---|---|
 | `listen_host` / `listen_port` | 监听地址，默认 `0.0.0.0:18080` |
 | `workspace_root` | 工作区根目录 |
+| `data_root` | **Task Memory 文件对象层根目录**（默认 `logs/`，所有任务记忆写入 `<data_root>/task_memory/{goal_id}/`） |
 | `generation_endpoint` | 本地模型 chat completions 端点 |
 | `embedding_endpoint` | 本地模型 embeddings 端点 |
 | `local_chat_endpoint` | 本地对话端点 |
@@ -188,7 +194,26 @@ $response.result.tools.Count  # 应输出工具总数
 | `lan_agent_semantic_grid_context_bundle` | 根据任务意图生成 LLM 上下文 bundle | `artifact_summary_path` |
 | `lan_agent_semantic_grid_incremental_update` | 多轮增量追加，支持 content_hash 去重 | `artifact_summary_path`, `source_text` |
 
-### 4.3 通用参数说明
+### 4.3 Task Memory 工具（12 个）
+
+Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上下文中的"任务进度/下一步调用/已验证步骤/关键切片"外移到文件对象层，使全新模型只需读取 `latest_resume_context.json` 即可续接。
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_task_memory_freeze` | 冻结一次长任务当前状态：写 `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `index_manifest.json` / `rag_thread_migration/*` | `goal_id` |
+| `lan_agent_task_memory_append_step` | 追加一条已验证 continuation step 到 `step_ledger.jsonl`，并刷新 `latest_resume_context.json` | `goal_id` |
+| `lan_agent_task_memory_execute_continuation_budget` | 在 MCP 服务端执行 N 步 allowlisted continuation（默认 dry-run 写预算计划，`execute=true` 才真正执行）；预算耗尽时返回 `next_call_json`、`completion_claim_allowed=false` | `goal_id` |
+| `lan_agent_task_memory_resume_context` | 读取 `latest_resume_context.json`，作为新模型的首读入口（默认禁止读全历史） | `goal_id` |
+| `lan_agent_task_memory_build_kv_snapshot` | 把 goal/latest/trace/slice/budget 索引到 `kv_snapshot/index.jsonl`，键 schema 与后续 RocksDB 后端一致 | `goal_id` |
+| `lan_agent_task_memory_kv_lookup` | 在文件 KV 快照上按 key 或 `kind=latest\|trace\|slice\|budget\|...` 查询 | `goal_id` |
+| `lan_agent_task_memory_rocksdb_mirror` | 把文件 KV 快照镜像到可选 RocksDB 读后端（`CODEX_LAN_AGENT_WITH_ROCKSDB=ON` 时启用）；写 `rocksdb_mirror_manifest.json`；**不替换文件对象层源真地位** | `goal_id` |
+| `lan_agent_task_memory_rocksdb_lookup` | 在 RocksDB 镜像上按 key 或 selector 查询（仅在 `rocksdb_mirror` 完成后可用） | `goal_id` |
+| `lan_agent_task_memory_rocksdb_parity_check` | 对同一 selector 比对文件 KV 与 RocksDB 镜像结果；pass 证明镜像读路径一致 | `goal_id` |
+| `lan_agent_task_memory_migration_assess` | 评估某 goal 是否可进入下一后端阶段：报告文件对象/KV 快照/RocksDB 状态、源真策略、是否可换源 | `goal_id` |
+| `lan_agent_task_memory_structure_manifest` | 写 `memory_structure.json`，固化"新模型首读 → 二读 → 查询读 → 全历史读禁用"契约 | `goal_id` |
+| `lan_agent_task_memory_migration_acceptance` | 在 MCP 内一站式跑完整迁移验收链（freeze → budget → kv → mirror → parity → manifest），返回 `migration_acceptance_status=ACCEPTED/PARTIAL` | — |
+
+### 4.4 通用参数说明
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
@@ -210,7 +235,7 @@ $response.result.tools.Count  # 应输出工具总数
 | `include_path_metadata` | boolean | 是否计算 path-sensitive 元数据（CFG 分支/环） |
 | `max_interprocedural_bindings` | integer | 过程间绑定候选最大数，默认 512 |
 
-### 4.4 语义网格参数说明
+### 4.5 语义网格参数说明
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
@@ -240,14 +265,49 @@ $response.result.tools.Count  # 应输出工具总数
 | `max_chars` | integer | 上下文 bundle 最大字符数 |
 | `dedupe_existing` | boolean | 增量更新时按 content_hash 去重，默认 true |
 
-### 4.5 compile_commands.json 发现顺序
+### 4.6 Task Memory 参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `goal_id` | string | 任务目标稳定 ID（仅 `[A-Za-z0-9._-]`，其余字符自动替换为 `_`）；空值降级为 `default_goal` |
+| `trace_id` | string | 单次执行追踪 ID（同一 `goal_id` 可有多条 trace） |
+| `step_id` | string | 步骤 ID（append_step 写入 `step_ledger.jsonl`） |
+| `step_index` | integer | 步骤序号 |
+| `step_kind` | string | 步骤类型（如 `tool_call`/`analysis`/`review`） |
+| `current_tool` | string | 当前调用的 MCP 工具名 |
+| `status` | string | 步骤状态（`success`/`partial`/`failed`/`pending` 等） |
+| `summary` | string | 步骤自然语言摘要 |
+| `result_ref` | string | 步骤结果引用路径（artifact 路径或 JSON 文件） |
+| `evidence_ref` | string | 步骤证据引用路径 |
+| `next_call_json` | string | 下一步 MCP 调用 JSON（`{"name":"...","arguments":{...}}`） |
+| `has_more` | boolean | 是否还有后续步骤 |
+| `terminal_state` | boolean | 是否终态（任务完成） |
+| `completion_claim_allowed` | boolean | 是否允许声明任务完成 |
+| `compact_summary` | string | 紧凑摘要（写 `latest_resume_context.json`） |
+| `remaining_work` | string | 剩余工作描述 |
+| `current_state_markdown` | string | 当前状态 Markdown（freeze 用） |
+| `key_slices_jsonl` | string | 关键切片 JSONL（freeze 用） |
+| `incremental_index_manifest_json` | string | 增量索引清单 JSON |
+| `migration_handover_markdown` | string | 迁移交接 Markdown |
+| `max_steps` / `step_budget` | integer | continuation budget 步数上限 |
+| `dry_run` | boolean | 默认 true，只写预算计划不执行 |
+| `execute` | boolean | 必须为 true 且 `dry_run=false` 才真正执行 |
+| `key` | string | KV 显式键（kv_lookup / rocksdb_lookup / parity_check） |
+| `kind` | string | KV selector：`goal\|latest\|resume_context\|trace\|trace_step\|slice\|budget\|trace_budget` |
+| `prefix` | boolean | 前缀匹配 |
+| `limit` / `offset` | integer | KV 查询分页 |
+| `include_value` | boolean | 是否返回 value（默认 true） |
+| `rocksdb_path` | string | 显式 RocksDB 目录（默认 `task_memory/<goal_id>/rocksdb_native`） |
+| `max_final_steps` | integer | migration_acceptance 最终 continuation budget，默认 8 |
+
+### 4.7 compile_commands.json 发现顺序
 
 1. 显式 `compilation_database_path` → 直接使用
 2. 显式 `compile_db_dir` → 拼接 `compile_commands.json`
 3. `project_root` + 常见构建目录 → 自动搜索 `build/`, `AIbuild/`, `cmake-build-*/`
 4. 均未找到 → 降级为无编译数据库模式（`compile_db_mode=none`，复杂文件可能失败）
 
-### 4.6 CMM 工具清单（codebase-memory-mcp 桥接）
+### 4.8 CMM 工具清单（codebase-memory-mcp 桥接）
 
 CMM（Codebase Memory MCP）工具通过 `codex_lan_agent` 桥接到独立的 `codebase-memory-mcp` 服务，提供基于**预建索引**的项目级代码图查询能力。使用前需先调用 `lan_agent_cmm_index_repository` 建立索引。
 
@@ -354,6 +414,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 | L5 | `lan_agent_build_program_slice` | 获取符号级切片（backward/forward） |
 | L6 | `lan_agent_query_*_artifact` | 从已写入的 artifact 二次查询，无需重跑 Clang |
 | SG | `lan_agent_semantic_grid_*` | 长文本语义网格：解构、归纳、检索、溯源、上下文重构、增量 |
+| TM | `lan_agent_task_memory_*` | 长任务记忆：freeze / append_step / continuation budget / kv snapshot / rocksdb mirror / parity check / structure manifest / migration acceptance |
 
 ### 5.3 模型决策规则
 
@@ -367,6 +428,9 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 6. **超时意识**：DFG/Slice 对复杂文件可能需要 180-300s，模型应设置足够超时。
 7. **语义网格用于非代码文本**：长文本/规则文档/经验框架使用 `semantic_grid_*` 工具链，不走 Clang 工具。
 8. **增量更新用链式 summary**：每轮增量使用上一轮返回的 `artifact_summary_json_path` 作为下一轮输入。
+9. **长任务先 freeze 再 resume**：进入上下文压力或需要换模型时，先 `task_memory_freeze` 落盘当前状态；新模型首读 `task_memory_resume_context` 而不是回放全历史。
+10. **continuation 不在模型侧循环**：当 `has_more=true` 且 `completion_claim_allowed=false` 时，调 `task_memory_execute_continuation_budget(execute=true)` 让 MCP 服务端按预算推进，避免模型上下文无限膨胀。
+11. **RocksDB 镜像不替换源真**：`rocksdb_mirror` 完成后必须 `rocksdb_parity_check` 通过才允许在 read path 上使用，`safe_to_replace_source_of_truth` 必须保持 `false`。
 
 ### 5.4 典型模型对话流程
 
@@ -439,6 +503,38 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 模型输出：
   "已追加 4 个新片段，新增 8 个语义节点（delta）。
    如重复提交相同内容，系统会跳过 4 个重复片段，节点数不变。"
+```
+
+### 5.7 长任务记忆续接流程
+
+```
+场景：本地模型已处理 30 步 RAG 长任务，上下文接近窗口上限，需要换一个新模型续接。
+
+旧模型退出前：
+  1. lan_agent_task_memory_freeze(
+       goal_id="rag-repo-scan-v1",
+       trace_id="trace-20260809-001",
+       current_state_markdown=<当前状态 markdown>,
+       compact_summary="已完成 8/12 个仓库扫描，剩余 4 个待 ingest...",
+       remaining_work="ingest repo #9-#12, build global index, run parity check",
+       next_call_json='{"name":"lan_agent_semantic_grid_incremental_update","arguments":{...}}',
+       terminal_state=false,
+       completion_claim_allowed=false)
+     → 写入 logs/task_memory/rag-repo-scan-v1/latest_resume_context.json
+     → 追加 step_ledger.jsonl / slices.jsonl / index_manifest.json
+
+新模型启动后（无需读全历史）：
+  1. lan_agent_task_memory_resume_context(goal_id="rag-repo-scan-v1")
+     → 返回 compact_summary, next_call_json, remaining_work, terminal_state
+  2. 按 next_call_json 继续调用 MCP 工具
+  3. 每完成一步：lan_agent_task_memory_append_step(goal_id=..., step_kind="tool_call",
+       status="success", summary="...", has_more=true, completion_claim_allowed=false)
+  4. 若需要服务端自动推进 N 步：
+     lan_agent_task_memory_execute_continuation_budget(
+       goal_id="rag-repo-scan-v1", dry_run=false, execute=true, max_steps=5)
+     → MCP 服务端执行 5 步 allowlisted continuation，写 step_ledger，
+       返回 completion_claim_allowed=false + 新的 next_call_json
+  5. 任务完成后：terminal_state=true, completion_claim_allowed=true
 ```
 
 ---
@@ -558,6 +654,141 @@ $content = $response.result.structuredContent
 # path_condition_candidate_count=4
 # control_dependency_candidate_count=4
 # cyclic_function_candidate_count=1
+```
+
+### 案例五：Task Memory 冻结 + 续接 + KV 快照
+
+```powershell
+# 1. 冻结当前长任务状态
+$freezeBody = @{
+    jsonrpc = "2.0"
+    id = "tm-freeze"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_freeze"
+        arguments = @{
+            goal_id = "rag-repo-scan-v1"
+            trace_id = "trace-20260809-001"
+            compact_summary = "已完成 8/12 仓库扫描，剩 4 个待 ingest"
+            remaining_work = "ingest repo #9-#12, build global index"
+            next_call_json = '{"name":"lan_agent_semantic_grid_incremental_update","arguments":{...}}'
+            terminal_state = $false
+            completion_claim_allowed = $false
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$freeze = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $freezeBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# latest_resume_context_path=.../task_memory/rag-repo-scan-v1/latest_resume_context.json
+# step_ledger_path=.../step_ledger.jsonl
+
+# 2. 新模型首读 resume_context
+$resumeBody = @{
+    jsonrpc = "2.0"
+    id = "tm-resume"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_resume_context"
+        arguments = @{ goal_id = "rag-repo-scan-v1" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$resume = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $resumeBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# 返回 compact_summary / next_call_json / remaining_work / terminal_state
+
+# 3. 构建 KV 快照（为 RocksDB 镜像做准备）
+$kvBody = @{
+    jsonrpc = "2.0"
+    id = "tm-kv"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_build_kv_snapshot"
+        arguments = @{ goal_id = "rag-repo-scan-v1" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$kv = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $kvBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# kv_snapshot_index_path=.../kv_snapshot/index.jsonl
+# kv_record_count>0
+
+# 4. 按 selector 查询 KV
+$lookupBody = @{
+    jsonrpc = "2.0"
+    id = "tm-lookup"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_kv_lookup"
+        arguments = @{ goal_id = "rag-repo-scan-v1"; kind = "latest" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$lookup = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $lookupBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, hit=true, value_json contains latest_resume_context
+```
+
+### 案例六：RocksDB 镜像 + 一致性校验
+
+```powershell
+# 1. 镜像 KV 快照到 RocksDB（需 CODEX_LAN_AGENT_WITH_ROCKSDB=ON 编译）
+$mirrorBody = @{
+    jsonrpc = "2.0"
+    id = "tm-mirror"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_rocksdb_mirror"
+        arguments = @{ goal_id = "rag-repo-scan-v1" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$mirror = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $mirrorBody -ContentType "application/json; charset=utf-8" -TimeoutSec 120).result.structuredContent
+# status=success
+# rocksdb_mirror_manifest_path=.../rocksdb_mirror_manifest.json
+# source_of_truth=file_object_store  (始终保持)
+# safe_to_replace_source_of_truth=false
+
+# 2. 一致性校验（同一 selector 比对文件 KV vs RocksDB）
+$parityBody = @{
+    jsonrpc = "2.0"
+    id = "tm-parity"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_rocksdb_parity_check"
+        arguments = @{ goal_id = "rag-repo-scan-v1"; kind = "latest" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$parity = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $parityBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# parity_status=pass
+# safe_to_replace_source_of_truth=false  (校验通过也不允许换源真)
+```
+
+### 案例七：一站式迁移验收（MCP-native）
+
+```powershell
+# 单次调用跑完整迁移验收链：freeze → budget → kv → mirror → parity → manifest
+$accBody = @{
+    jsonrpc = "2.0"
+    id = "tm-accept"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_migration_acceptance"
+        arguments = @{ max_final_steps = 8 }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$acc = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $accBody -ContentType "application/json; charset=utf-8" -TimeoutSec 300).result.structuredContent
+# 预期字段：
+# migration_acceptance_status=ACCEPTED
+# acceptance_status=complete
+# semantic_outcome=TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
+# source_of_truth=file_object_store
+# active_read_backend=rocksdb_native_mirror
+# write_backend=file_object_store
+# safe_to_replace_source_of_truth=false
+# parity_required_for_native_reads=true
 ```
 
 ---
@@ -830,9 +1061,137 @@ output_dir/
 
 ---
 
-## 9. 测试脚本与一键验证
+## 9. Task Memory 工具：长任务记忆与跨模型续接
 
-### 9.1 一键脚本 1：模板回归
+### 9.1 设计动机
+
+本地模型在执行长任务（多轮 RAG、跨仓库扫描、批量代码分析、迭代式重构）时，会快速耗尽上下文窗口。传统做法是把完整历史对话塞进新模型上下文，这带来三个问题：
+
+1. **上下文爆炸**：30+ 步任务的对话历史远超本地模型窗口。
+2. **状态丢失**：换模型/重启会话后，模型对已完成步骤和剩余工作一无所知。
+3. **重复执行**：新模型无法判断哪些步骤已验证完成，容易重跑。
+
+Task Memory 工具链把"任务进度"从模型上下文外移到 MCP 服务端文件对象层，使全新模型只需读取一个紧凑的 `latest_resume_context.json` 即可续接。
+
+### 9.2 文件对象层结构
+
+所有 Task Memory 状态写入 `<data_root>/task_memory/{goal_id}/`，目录布局固定：
+
+```
+<data_root>/task_memory/{goal_id}/
+├── latest_resume_context.json   ← 新模型首读入口（compact_summary + next_call_json）
+├── step_ledger.jsonl            ← 已验证步骤账本（每步一行 JSON）
+├── slices.jsonl                 ← 关键切片（key slices，跨步骤证据）
+├── index_manifest.json          ← 增量索引清单
+├── memory_structure.json        ← 任务记忆结构契约（structure_manifest 写入）
+├── current_state.md             ← 当前状态 Markdown（freeze 写入）
+├── handover.md                  ← 迁移交接 Markdown
+├── rag_thread_migration/        ← RAG 线程迁移资产
+│   └── ...
+├── kv_snapshot/                 ← 文件 KV 快照（build_kv_snapshot 写入）
+│   └── index.jsonl
+├── rocksdb_native/              ← 可选 RocksDB 镜像（rocksdb_mirror 写入）
+│   └── ...
+└── rocksdb_mirror_manifest.json ← RocksDB 镜像清单
+```
+
+### 9.3 新模型 bootstrap 契约
+
+`structure_manifest` 工具固化以下读取顺序（写入 `memory_structure.json`）：
+
+| 顺序 | 读取目标 | 用途 |
+|---|---|---|
+| **首读** | `latest_resume_context.json` | 获取 `compact_summary` / `next_call_json` / `remaining_work` / `terminal_state` |
+| **二读** | `memory_structure.json` | 了解任务记忆整体结构和可查询资产 |
+| **查询读** | `lan_agent_task_memory_rocksdb_lookup`（native mirror ready 时） | 高频读路径走 RocksDB 镜像 |
+| **全历史读** | **`forbidden_by_default`** | 禁止默认回放全历史对话，只在显式审计时按需查询 `step_ledger.jsonl` |
+
+### 9.4 工具调用顺序
+
+迁移验收的**必走顺序**（详见 [TASK_MEMORY_MIGRATION_ACCEPTANCE.md](TASK_MEMORY_MIGRATION_ACCEPTANCE.md)）：
+
+1. `lan_agent_task_memory_freeze` —— 创建文件对象层，写 `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `index_manifest.json` / `rag_thread_migration/*`
+2. `lan_agent_task_memory_resume_context` —— 新模型首读
+3. `lan_agent_task_memory_execute_continuation_budget` —— 执行 allowlisted bounded continuation；非终态预算耗尽必须返回 `terminal_state=false` / `completion_claim_allowed=false` / `final_answer_allowed=false`
+4. `lan_agent_task_memory_build_kv_snapshot` —— 构建文件 KV 快照（源真仍是文件对象层）
+5. `lan_agent_task_memory_rocksdb_mirror` —— 镜像 KV 快照到原生 RocksDB（`CODEX_LAN_AGENT_WITH_ROCKSDB=ON` 时）；RocksDB 角色为 `mirror_read_backend`，**不替换源真**
+6. `lan_agent_task_memory_rocksdb_parity_check` —— 原生读路径必须通过 parity check，`safe_to_replace_source_of_truth` 必须保持 `false`
+7. `lan_agent_task_memory_structure_manifest` —— 写 `memory_structure.json`，固化 bootstrap 契约
+
+### 9.5 不可协商不变量
+
+以下不变量在任何场景下都必须保持，违反即视为迁移失败：
+
+| 不变量 | 值 |
+|---|---|
+| `source_of_truth` | `file_object_store` |
+| `write_backend` | `file_object_store` |
+| `native_backend_role` | `mirror_read_backend` |
+| `safe_to_replace_source_of_truth` | `false` |
+| `parity_required_for_native_reads` | `true` |
+| `required_model_read` | `latest_resume_context.json` |
+
+### 9.6 MCP-native 验收（推荐路径）
+
+启动 MCP 服务后，其他 AI 客户端应优先使用 MCP 原生验收工具：
+
+```json
+{
+  "name": "lan_agent_task_memory_migration_acceptance",
+  "arguments": {
+    "max_final_steps": 8
+  }
+}
+```
+
+预期 MCP 返回字段：
+
+```text
+migration_acceptance_status=ACCEPTED
+acceptance_status=complete
+semantic_outcome=TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
+source_of_truth=file_object_store
+active_read_backend=rocksdb_native_mirror
+write_backend=file_object_store
+safe_to_replace_source_of_truth=false
+parity_required_for_native_reads=true
+```
+
+此路径在 MCP 内部运行完整验收链，无需客户端 PowerShell 脚本，是仅通过 MCP 连接的其他 AI 客户端的正确路径。
+
+### 9.7 外部 Smoke 命令（仅 CI/运维用）
+
+PowerShell 脚本仅作为 HTTP MCP 端点和已部署进程的运维/CI smoke 测试：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\run_task_memory_migration_acceptance.ps1
+```
+
+预期终态行：
+
+```text
+TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
+```
+
+### 9.8 KV 快照键 schema
+
+`build_kv_snapshot` 按以下键 schema 把文件对象索引到 `kv_snapshot/index.jsonl`，与后续 RocksDB 后端一致：
+
+| key 模式 | 含义 |
+|---|---|
+| `goal/{goal_id}` | goal 元信息 |
+| `latest/{goal_id}` | 最新 resume_context 指针 |
+| `trace/{trace_id}/{step_id}` | 单步 trace 记录 |
+| `slice/{slice_id}` | 关键切片记录 |
+| `budget/{budget_run_id}` | continuation budget 运行记录 |
+
+`kv_lookup` / `rocksdb_lookup` 支持显式 `key` 或 `kind` selector（`goal` / `latest` / `resume_context` / `trace` / `trace_step` / `slice` / `budget` / `trace_budget`）。
+
+---
+
+## 10. 测试脚本与一键验证
+
+### 10.1 一键脚本 1：模板回归
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_analysis_templates_1_11.ps1
@@ -840,7 +1199,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 
 覆盖：`tools/list`、AST、CFG、CallGraph、DFG、Slice、artifact query、分页、path-sensitive metadata。
 
-### 9.2 一键脚本 2：复杂项目分析
+### 10.2 一键脚本 2：复杂项目分析
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\analysis_client_examples.ps1 `
@@ -853,7 +1212,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 
 > **注意**：DFG 对复杂文件可能需要 180-300s，脚本默认超时 180s。如超时，手动以 300s 超时重跑。
 
-### 9.3 手动 MCP 调用模板
+### 10.3 手动 MCP 调用模板
 
 ```powershell
 function Invoke-McpTool {
@@ -868,7 +1227,7 @@ function Invoke-McpTool {
 }
 ```
 
-### 9.4 一键脚本 3：语义网格基础 Smoke
+### 10.4 一键脚本 3：语义网格基础 Smoke
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_semantic_grid_smoke.ps1
@@ -876,7 +1235,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 
 覆盖：`tools/list`（6 工具注册）、`ingest_text`（解构）、`build`（L1-L5 金字塔）、`query`（fuzzy 查询）、`trace_source`（原文溯源）、`context_bundle`（上下文重构）。
 
-### 9.5 一键脚本 4：复杂文本 + 多轮增量 Smoke
+### 10.5 一键脚本 4：复杂文本 + 多轮增量 Smoke
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_semantic_grid_complex_incremental_smoke.ps1
@@ -884,11 +1243,21 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 
 覆盖：复杂 markdown 基础构建、增量追加（+4 fragments）、fuzzy 查询、重复增量去重（dedupe）、上下文重构（section_priority）。
 
+### 10.6 一键脚本 5：Task Memory 迁移验收 Smoke
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\run_task_memory_migration_acceptance.ps1
+```
+
+覆盖：MCP-native 迁移验收链（freeze → continuation budget → kv snapshot → rocksdb mirror → parity check → structure manifest），预期终态行 `TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS`。
+
+> 也可直接通过 MCP 调用 `lan_agent_task_memory_migration_acceptance` 工具完成同等验收（推荐其他 AI 客户端使用此路径）。
+
 ---
 
-## 10. 测试结论
+## 11. 测试结论
 
-### 10.1 环境
+### 11.1 环境
 
 | 项 | 值 |
 |---|---|
@@ -897,11 +1266,11 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 | 测试目标文件 | `cximage\FastMatch.cpp`（复杂项目） + `test_simple.cpp`（简单文件） |
 | compile_commands.json | `D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\build\compile_commands.json` |
 
-### 10.2 工具可用性
+### 11.2 工具可用性
 
 | 工具 | 状态 | 结论 |
 |---|---|---|
-| `tools/list` | 可用 | 123 个工具已注册 |
+| `tools/list` | 可用 | 工具总数已注册（含 Clang/语义网格/CMM/Task Memory 等多组） |
 | `lan_agent_run_clang_ast_parser` | 可用 | `status=success`, `compile_db_mode=compile_commands_json` |
 | `lan_agent_build_cfg` | 可用 | `status=success`, 50 函数 / 262 块 / 262 边 |
 | `lan_agent_query_cfg_artifact` | 可用 | `artifact_json_path_resolved_from=artifact_summary_path` |
@@ -911,8 +1280,9 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 | `lan_agent_query_dfg_artifact` | 可用 | `artifact_parser_status=success` |
 | `lan_agent_build_program_slice` | 可用 | `slice_precision=ast_statement_def_use_cfg_callgraph_v1` |
 | `lan_agent_query_program_slice_artifact` | 可用 | artifact + source_lines 二次查询成功 |
+| `lan_agent_task_memory_*` (12 工具) | 可用 | freeze/resume/budget/kv/rocksdb/parity/manifest/acceptance 全链通过 |
 
-### 10.3 核心断言结果（Clang 分析工具）
+### 11.3 核心断言结果（Clang 分析工具）
 
 | 断言 | 结果 |
 |---|---|
@@ -935,7 +1305,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 | artifact query `artifact_json_path_resolved_from=artifact_summary_path` | PASS |
 | artifact query `artifact_parser_status=success` | PASS |
 
-### 10.4 语义网格测试结果
+### 11.4 语义网格测试结果
 
 #### 基础 Smoke (`run_semantic_grid_smoke.ps1`)
 
@@ -975,23 +1345,48 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 | artifact_summary_path 链式传递 | PASS (base→inc1→dup) |
 | artifact 文件全部存在 | PASS |
 
-### 10.5 已知限制
+### 11.5 Task Memory 迁移验收结果
+
+| 断言 | 结果 |
+|---|---|
+| 12 个 task_memory 工具全部注册 | PASS |
+| `freeze` 写入 `latest_resume_context.json` | PASS |
+| `freeze` 追加 `step_ledger.jsonl` | PASS |
+| `resume_context` 返回 compact_summary + next_call_json | PASS |
+| `execute_continuation_budget` (dry_run) 写入预算计划 | PASS |
+| `build_kv_snapshot` 生成 `kv_snapshot/index.jsonl` | PASS |
+| `kv_lookup` 按 `kind=latest` 命中 | PASS |
+| `rocksdb_mirror` 写入 `rocksdb_mirror_manifest.json` | PASS |
+| `rocksdb_lookup` 按 selector 命中 | PASS |
+| `rocksdb_parity_check` 返回 `parity_status=pass` | PASS |
+| `structure_manifest` 写入 `memory_structure.json` | PASS |
+| `migration_acceptance` 返回 `migration_acceptance_status=ACCEPTED` | PASS |
+| `source_of_truth=file_object_store` 全程保持 | PASS |
+| `safe_to_replace_source_of_truth=false` 全程保持 | PASS |
+| `parity_required_for_native_reads=true` 全程保持 | PASS |
+| 外部 Smoke 脚本终态行 `TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS` | PASS |
+
+### 11.6 已知限制
 
 | 限制 | 详情 | 规避 |
 |---|---|---|
 | DFG 复杂文件耗时 | FastMatch.cpp DFG build 需 180-300s | 设置 `TimeoutSec=300` |
 | 端口占用 | 旧进程残留导致新实例启动失败 | 启动前 `Stop-Process` |
 | compile_commands.json 依赖 | 无编译数据库时复杂文件解析失败 | 确保 `project_root` 指向含 `build/compile_commands.json` 的目录 |
+| RocksDB 镜像可选 | 默认构建不含 RocksDB 后端 | 编译时加 `-DCODEX_LAN_AGENT_WITH_ROCKSDB=ON` |
+| Task Memory 文件增长 | 长任务 `step_ledger.jsonl` 持续增长 | 按 `goal_id` 归档，必要时 `freeze` 后清理旧 trace |
 
-### 10.6 最终状态
+### 11.7 最终状态
 
 **[Verified]** — MCP 工具链可用于复杂项目分析，全部核心断言通过。
 
 **[Verified]** — 语义网格工具链支持复杂文本解构、L1-L5 语义金字塔构建、fuzzy/regex 查询、原文溯源、上下文重构、多轮增量追加与 content_hash 去重，全部断言通过。
 
+**[Verified]** — Task Memory 工具链支持长任务状态冻结、跨模型 resume、bounded continuation budget、文件 KV 快照、RocksDB 镜像、parity check 一致性校验、structure manifest 契约固化、一站式 migration acceptance，全部不变量保持，验收终态 `TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS`。
+
 ---
 
-## 11. CMM 工具状态
+## 12. CMM 工具状态
 
 CMM 工具通过 `codex_lan_agent` 桥接 `codebase-memory-mcp` 服务，已在 MCP 工具列表中注册。使用前需确保：
 1. `codebase-memory-mcp` 服务已独立运行。
@@ -1001,9 +1396,9 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 
 ---
 
-## 12. Clang 分析工具 vs CMM 工具功能对比
+## 13. Clang 分析工具 vs CMM 工具功能对比
 
-### 12.1 核心差异
+### 13.1 核心差异
 
 | 维度 | Clang 分析工具 (L0-L6) | CMM 工具 (`lan_agent_cmm_*`) |
 |---|---|---|
@@ -1013,7 +1408,7 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | **底层引擎** | Clang/LLVM AST | codebase-memory-mcp 图数据库 |
 | **典型耗时** | 简单文件 1-5s，复杂文件 180-300s | 毫秒级（索引已建） |
 
-### 12.2 功能对照表
+### 13.2 功能对照表
 
 | 功能需求 | Clang 工具 | CMM 工具 | 说明 |
 |---|---|---|---|
@@ -1033,7 +1428,7 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | **索引管理** | — | `cmm_index_repository` / `cmm_delete_project` | CMM 独有：项目索引生命周期 |
 | **Artifact 二次查询** | `query_*_artifact` (L6) | — | Clang 独有：分页/聚焦查询无需重跑 |
 
-### 12.3 使用场景对比
+### 13.3 使用场景对比
 
 | 场景 | 推荐工具 | 原因 |
 |---|---|---|
@@ -1046,7 +1441,7 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | 对比两个分支的变更影响 | `cmm_detect_changes` | 基于 git diff + 图分析 |
 | 快速查询已分析结果（分页） | `query_*_artifact` (L6) | 毫秒级，无需重跑 Clang |
 
-### 12.4 组合使用建议
+### 13.4 组合使用建议
 
 ```
 复杂分析任务典型工作流：
@@ -1067,9 +1462,9 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 
 ---
 
-## 13. 常见问题排查
+## 14. 常见问题排查
 
-### 13.1 服务启动失败 / 连接拒绝
+### 14.1 服务启动失败 / 连接拒绝
 
 ```
 错误：Could not establish connection
@@ -1084,13 +1479,13 @@ Start-Sleep -Seconds 1
 # 重新启动
 ```
 
-### 13.2 工具不在 tools/list 中
+### 14.2 工具不在 tools/list 中
 
 **原因**：工具 schema 未在 `McpProtocolOperations.h` 的 `BuildMcpToolsListResponse` 中注册。
 
-**解决**：检查 [src/McpProtocolOperations.h](file:///d:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/McpProtocolOperations.h) 中对应工具的 schema 定义是否存在。
+**解决**：检查 [src/McpProtocolOperations.h](src/McpProtocolOperations.h) 中对应工具的 schema 定义是否存在。
 
-### 13.3 复杂文件解析失败
+### 14.3 复杂文件解析失败
 
 **原因**：`compile_commands.json` 未找到或路径不正确。
 
@@ -1099,11 +1494,11 @@ Start-Sleep -Seconds 1
 2. 确认 `<project_root>/build/compile_commands.json` 存在。
 3. 如无，用 CMake 生成：`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`。
 
-### 13.4 DFG/Slice 超时
+### 14.4 DFG/Slice 超时
 
 **解决**：增大超时到 300s，或减小 `max_nodes` / `max_edges` / `max_interprocedural_bindings`。
 
-### 13.5 MinGW 编译
+### 14.5 MinGW 编译
 
 项目默认使用 MSVC。如需 MinGW：
 
@@ -1114,7 +1509,7 @@ cmake --build AIbuild
 
 > 注意：MinGW 模式下 Clang Tooling 的头文件路径需要额外配置，建议优先使用 MSVC。
 
-### 13.6 语义网格增量去重不生效
+### 14.6 语义网格增量去重不生效
 
 **原因**：`dedupe_existing` 参数未设置为 `true`，或上一轮的 `artifact_summary_path` 不正确。
 
@@ -1123,7 +1518,7 @@ cmake --build AIbuild
 2. 确认 `artifact_summary_path` 指向上一轮 `incremental_update` 返回的 `artifact_summary_json_path`。
 3. 检查 `summary.json` 中的 `artifact_semantic_grid_json_path` 指针是否有效。
 
-### 13.7 语义网格 query 返回空结果
+### 14.7 语义网格 query 返回空结果
 
 **原因**：keyword 未匹配到任何节点，或 layer 过滤过严。
 
@@ -1131,3 +1526,32 @@ cmake --build AIbuild
 1. 尝试 `fuzzy_match=true` 启用模糊匹配。
 2. 尝试不传 `layer` 参数，搜索所有层。
 3. 使用 `regex_match=true` 扩展匹配范围。
+
+### 14.8 Task Memory resume_context 找不到文件
+
+**原因**：`goal_id` 不匹配，或尚未对该 goal 调用过 `task_memory_freeze`。
+
+**解决**：
+1. 确认 `goal_id` 与 `freeze` 时使用的一致（仅 `[A-Za-z0-9._-]`，其他字符被替换为 `_`）。
+2. 先调用 `lan_agent_task_memory_freeze(goal_id=...)` 创建文件对象层。
+3. 检查 `<data_root>/task_memory/{goal_id}/latest_resume_context.json` 是否存在。
+
+### 14.9 RocksDB 镜像不可用
+
+**原因**：未以 `-DCODEX_LAN_AGENT_WITH_ROCKSDB=ON` 编译，或 `rocksdb_mirror` 尚未执行。
+
+**解决**：
+1. 重新编译：`cmake -B AIbuild -DCODEX_LAN_AGENT_WITH_ROCKSDB=ON`。
+2. 先调用 `build_kv_snapshot` 再调用 `rocksdb_mirror`。
+3. 检查 `rocksdb_mirror_manifest.json` 是否生成。
+4. 注意：RocksDB 仅为可选读镜像，缺失不影响文件对象层源真和 `kv_lookup` 正常使用。
+
+### 14.10 parity_check 失败
+
+**原因**：文件 KV 快照与 RocksDB 镜像内容不一致，可能是 `rocksdb_mirror` 后又追加了新步骤未重新镜像。
+
+**解决**：
+1. 重新执行 `build_kv_snapshot` 刷新文件 KV。
+2. 重新执行 `rocksdb_mirror` 同步到 RocksDB。
+3. 再次 `rocksdb_parity_check`，应返回 `parity_status=pass`。
+4. **切勿**通过修改源真来"迁就"镜像 —— `safe_to_replace_source_of_truth` 必须保持 `false`。
