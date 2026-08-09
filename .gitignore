@@ -1,53 +1,91 @@
-# Build directories
-build/
-build01/
-builddir_guard/
-build_local_verify/
-build_ninja_verify/
-builddir_guard/
+# ============================================================
+# Whitelist mode: ONLY CMakeLists.txt and src/ are allowed
+# Images / dynamic libraries / executables / third-party
+# vendored sources must NEVER enter the repository.
+# ============================================================
 
-# Binary files
+# Deny everything first
+*
+!*/
+
+# --- Explicit whitelist ---
+!CMakeLists.txt
+!.gitignore
+!README.md
+!LICENSE
+!src/**
+
+# --- Hard deny: executables, binaries, libraries ---
 *.exe
 *.dll
+*.so
+*.so.*
+*.dylib
 *.lib
 *.exp
 *.obj
+*.o
+*.a
 *.pdb
 *.ilk
 
-# Logs
-logs/
-*.log
+# --- Hard deny: images ---
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.ico
+*.tiff
+*.tif
+*.webp
+*.svg
+*.raw
+*.psd
 
-# Temporary files
-temp/
-tmp/
-*.tmp
+# --- Hard deny: archives / packages ---
 *.zip
 *.tar.gz
+*.tar
+*.7z
+*.rar
+*.msi
 
-# IDE files
+# --- Hard deny: third-party vendored (must come from network sources) ---
+third_party/
+vendor/
+vendored/
+deps/
+external/
+
+# --- Build output ---
+build*/
+out/
+dist/
+bin/
+lib/
+
+# --- IDE / OS / caches ---
 .vs/
 .vscode/
 .idea/
 *.user
 *.suo
-
-# OS files
 .DS_Store
 Thumbs.db
-
-# Test output
-test_*_output*
-*.dot
-
-# Configuration files (local)
+*.log
+logs/
+cache/
+__pycache__/
+node_modules/
+uploads/
+output/
 *.cfg
 !codex_lan_agent.cfg
-
-# Data files
 *.jsonl
 !package.json
-
-# Upload files
-uploads/
+*.tmp
+temp/
+tmp/
+*.dot
+test_*_output*

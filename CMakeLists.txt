@@ -27,9 +27,11 @@ add_executable(codex_lan_agent
   src/CmmBridge.cpp
   src/CmmToolResults.cpp
   src/ClangIndexerAdapter.cpp
+  src/SemanticGridOperations.cpp
   src/ClangAstVisitor.cpp
   src/ClangAstParser.cpp
   src/CfGBuilder.cpp
+  src/GraphSerialization.cpp
   src/ProcessRunner.cpp
   src/HttpClient.cpp
   src/main.cpp
@@ -148,6 +150,41 @@ if(CODEX_LAN_AGENT_ENABLE_CLANG_AST)
   message(STATUS "Clang AST parsing enabled (third_party/llvm)")
   message(STATUS "  Include: ${CODEX_LLVM_ROOT}/include")
   message(STATUS "  Lib:    ${CODEX_LLVM_ROOT}/lib")
+
+  add_executable(test_cfg_builder
+    src/test_cfg_builder.cpp
+    src/CfGBuilder.cpp
+    src/ClangIndexerAdapter.cpp
+    src/ClangAstVisitor.cpp
+    src/ClangAstParser.cpp
+    src/GraphSerialization.cpp
+  )
+
+  target_include_directories(test_cfg_builder PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CODEX_LLVM_ROOT}/include"
+  )
+
+  target_compile_definitions(test_cfg_builder PRIVATE
+    CODEX_LAN_AGENT_HAS_CLANG_AST=1
+    _CRT_SECURE_NO_WARNINGS
+  )
+
+  target_link_libraries(test_cfg_builder PRIVATE
+    ${CODEX_LLVM_LIBS}
+  )
+
+  if(WIN32)
+    target_compile_definitions(test_cfg_builder PRIVATE
+      WIN32_LEAN_AND_MEAN
+      NOMINMAX
+    )
+    target_link_libraries(test_cfg_builder PRIVATE
+      ws2_32
+      winhttp
+      version
+    )
+  endif()
 else()
   target_compile_definitions(codex_lan_agent PRIVATE
     CODEX_LAN_AGENT_HAS_CLANG_AST=0

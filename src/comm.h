@@ -626,7 +626,50 @@ struct CommOperations final {
     static std::string ComputeCommandOutcome(const CommandResult & result) {
         const auto task_completion_it = result.fields.find("task_completion");
         if (task_completion_it != result.fields.end() &&
-            task_completion_it->second == "incomplete") {
+            !task_completion_it->second.empty() &&
+            task_completion_it->second != "complete") {
+            return "PARTIAL";
+        }
+
+        const auto has_more_it = result.fields.find("has_more");
+        if (has_more_it != result.fields.end() &&
+            has_more_it->second == "true") {
+            return "PARTIAL";
+        }
+
+        const auto continue_required_it = result.fields.find("continue_required");
+        if (continue_required_it != result.fields.end() &&
+            continue_required_it->second == "true") {
+            return "PARTIAL";
+        }
+
+        const auto terminal_state_it = result.fields.find("terminal_state");
+        if (terminal_state_it != result.fields.end() &&
+            terminal_state_it->second == "false") {
+            return "PARTIAL";
+        }
+
+        const auto task_done_it = result.fields.find("task_done");
+        if (task_done_it != result.fields.end() &&
+            task_done_it->second == "false") {
+            return "PARTIAL";
+        }
+
+        const auto completion_claim_allowed_it = result.fields.find("completion_claim_allowed");
+        if (completion_claim_allowed_it != result.fields.end() &&
+            completion_claim_allowed_it->second == "false") {
+            return "PARTIAL";
+        }
+
+        const auto final_answer_allowed_it = result.fields.find("final_answer_allowed");
+        if (final_answer_allowed_it != result.fields.end() &&
+            final_answer_allowed_it->second == "false") {
+            return "PARTIAL";
+        }
+
+        const auto supervision_status_it = result.fields.find("supervision_status");
+        if (supervision_status_it != result.fields.end() &&
+            supervision_status_it->second == "closed_loop_continue") {
             return "PARTIAL";
         }
 

@@ -166,6 +166,8 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot error_message (default ""))
               (slot status (default ""))
               (slot task_completion (default ""))
+              (slot has_more (default "false"))
+              (slot next_start_line (default ""))
               (slot continue_required (default "false"))
               (slot auto_continue_required (default "false"))
               (slot analysis_allowed (default "true"))
@@ -329,7 +331,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (decision "block")
                       (verification "not_verified")
                       (reason_code "bulk_file_mutation_not_allowed_for_stepwise_edit")
-                      (next_action "use the single-step loop: lan_agent_scan_text_ranges(max_ranges_per_call=1), lan_agent_prepare_edit_windows(max_windows_per_call=1), one atomic delete/replace, verify, then rescan")
+                      (next_action "use lan_agent_delete_text_range_window_atomic(max_lines<=200) for large files, or the single-step scan/prepare/atomic-edit loop for high-risk local edits")
                       (matched_rule "block-broad-file-mutation-for-stepwise-editing-intent")))))",
             R"((defrule block-multi-file-patch-in-phase1
                   (declare (salience 87))
@@ -387,6 +389,8 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                                                           (eq ?tool "lan_agent_prepare_edit_windows")
                                                           (eq ?tool "lan_agent_delete_line_atomic")
                                                           (eq ?tool "lan_agent_delete_content_atomic")
+                                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")
+                                                          (eq ?tool "lan_agent_delete_text_range_window_atomic")
                                                           (eq ?tool "lan_agent_insert_after_anchor_atomic")
                                                           (eq ?tool "lan_agent_replace_line_range_atomic")
                                                           (eq ?tool "lan_agent_write_text_file")
@@ -405,15 +409,34 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (route_target "lan_agent_probe_text_file")
                       (next_action "call lan_agent_probe_text_file first and continue only with the emitted next_call_json/probe_ref chain before any text read, scan, write, or patch step")
                       (matched_rule "route-file-text-operations-to-probe-first")))))",
+            R"((defrule route-read-text-file-to-window-delete-for-comment-cleanup
+                  (declare (salience 84))
+                  (mcp_tool_request (tool_name "lan_agent_read_text_file")
+                                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
+                                                                 (eq ?intent "remove_comments")
+                                                                 (eq ?intent "strip_comments")
+                                                                 (eq ?intent "删除注释")
+                                                                 (eq ?intent "清理注释")
+                                                                 (eq ?intent "去除注释")
+                                                                 (eq ?intent "移除注释")
+                                                                 (eq ?intent "删注释")))
+                                    (probe_ready "true"))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target "lan_agent_read_text_file")
+                      (decision "route")
+                      (verification "verified")
+                      (reason_code "comment_cleanup_prefers_window_delete")
+                      (route_target "lan_agent_delete_text_range_window_atomic")
+                      (next_action "call lan_agent_delete_text_range_window_atomic with max_lines=200; do not use read/scan/prepare for comment cleanup")
+                      (matched_rule "route-read-text-file-to-window-delete-for-comment-cleanup")))))",
             R"((defrule route-read-text-file-to-range-scan-for-editing-intent
                   (declare (salience 83))
                   (mcp_tool_request (tool_name "lan_agent_read_text_file")
-                                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                                 (eq ?intent "text_cleaning")
+                                    (primary_intent ?intent&:(or (eq ?intent "text_cleaning")
                                                                  (eq ?intent "localized_edit")
-                                                                 (eq ?intent "source_edit_planning")
-                                                                 (eq ?intent "remove_comments")
-                                                                 (eq ?intent "strip_comments")))
+                                                                 (eq ?intent "source_edit_planning")))
                                     (probe_ready "true"))
                   =>
                   (assert (clips_decision
@@ -558,6 +581,36 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (reason_code "write_result_missing_audit_ref")
                       (next_action "return patch_id plus result_ref/evidence_ref/log_path before downstream consumers trust this write")
                       (matched_rule "audited-write-result-missing-proof")))))",
+            R"((defrule text-range-delete-result-still-pending-by-has-more
+                  (declare (salience 49))
+                  (mcp_tool_result (tool_name ?tool&:(or (eq ?tool "lan_agent_delete_text_range_window_atomic")
+                                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                                   (has_more "true"))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "text_range_delete_incomplete")
+                      (next_action "tool_call_only: deletion is not complete; call the same delete tool with next_start_line/probe_ref until has_more=false before any final completion claim")
+                      (route_target ?tool)
+                      (matched_rule "text-range-delete-result-still-pending-by-has-more")))))",
+            R"((defrule text-range-delete-result-still-pending-by-continuation
+                  (declare (salience 48))
+                  (mcp_tool_result (tool_name ?tool&:(or (eq ?tool "lan_agent_delete_text_range_window_atomic")
+                                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                                   (continue_required "true"))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "text_range_delete_continue_required")
+                      (next_action "tool_call_only: continue the delete loop; current write was verified but the overall comment deletion task is not complete")
+                      (route_target ?tool)
+                      (matched_rule "text-range-delete-result-still-pending-by-continuation")))))",
             R"((defrule invalid-result-missing-hash
                   (declare (salience 35))
                   (mcp_tool_result (tool_name ?tool) (result_hash ""))
@@ -1251,6 +1304,8 @@ std::string BuildMcpToolRequestFact(
         || tool_name == "lan_agent_prepare_edit_windows"
         || tool_name == "lan_agent_delete_line_atomic"
         || tool_name == "lan_agent_delete_content_atomic"
+        || tool_name == "lan_agent_delete_next_text_range_atomic"
+        || tool_name == "lan_agent_delete_text_range_window_atomic"
         || tool_name == "lan_agent_insert_after_anchor_atomic"
         || tool_name == "lan_agent_replace_line_range_atomic"
         || tool_name == "lan_agent_write_text_file"
@@ -1274,6 +1329,7 @@ std::string BuildMcpToolRequestFact(
         || tool_name == "lan_agent_locate_text_lines"
         || tool_name == "lan_agent_delete_line_atomic"
         || tool_name == "lan_agent_delete_content_atomic"
+        || tool_name == "lan_agent_delete_next_text_range_atomic"
         || tool_name == "lan_agent_insert_after_anchor_atomic"
         || tool_name == "lan_agent_replace_line_range_atomic"
         || tool_name == "lan_agent_write_text_file"
@@ -1289,10 +1345,13 @@ std::string BuildMcpToolRequestFact(
         operation_granularity = "single_edit_window";
     } else if (tool_name == "lan_agent_delete_line_atomic"
                || tool_name == "lan_agent_delete_content_atomic"
+               || tool_name == "lan_agent_delete_next_text_range_atomic"
                || tool_name == "lan_agent_insert_after_anchor_atomic"
                || tool_name == "lan_agent_replace_line_range_atomic") {
         max_items_per_call = "1";
-        operation_granularity = "single_atomic_mutation";
+        operation_granularity = tool_name == "lan_agent_delete_next_text_range_atomic"
+            ? "single_text_range_delete"
+            : "single_atomic_mutation";
     } else if (tool_name == "lan_agent_apply_diff_patch") {
         const int diff_hunk_count = CountUnifiedDiffHunks(params.GetString("diff_text"));
         max_items_per_call = diff_hunk_count > 0
@@ -1453,6 +1512,8 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("error_message", GetFieldOrDefault(result, "error_message", "")) + " "
         + ClipsStringSlot("status", GetFieldOrDefault(result, "status", "")) + " "
         + ClipsStringSlot("task_completion", GetFieldOrDefault(result, "task_completion", "")) + " "
+        + ClipsStringSlot("has_more", GetFieldOrDefault(result, "has_more", "false")) + " "
+        + ClipsStringSlot("next_start_line", GetFieldOrDefault(result, "next_start_line", "")) + " "
         + ClipsStringSlot("continue_required", GetFieldOrDefault(result, "continue_required", "false")) + " "
         + ClipsStringSlot("auto_continue_required", GetFieldOrDefault(result, "auto_continue_required", "false")) + " "
         + ClipsStringSlot("analysis_allowed", GetFieldOrDefault(result, "analysis_allowed", "true")) + " "
@@ -1741,6 +1802,8 @@ CommandResult BuildClipsDecisionResult(
     seed_result.fields["error"] = params.GetString("error");
     seed_result.fields["ai_conclusion_valid"] = params.GetString("ai_conclusion_valid", "true");
     seed_result.fields["task_completion"] = params.GetString("task_completion");
+    seed_result.fields["has_more"] = params.GetString("has_more", "false");
+    seed_result.fields["next_start_line"] = params.GetString("next_start_line");
     seed_result.fields["continue_required"] = params.GetString("continue_required", "false");
     seed_result.fields["auto_continue_required"] = params.GetString("auto_continue_required", "false");
     seed_result.fields["analysis_allowed"] = params.GetString("analysis_allowed", "true");
@@ -1930,6 +1993,33 @@ std::string BuildPreGuardRouteCallJson(
             &first_field,
             "scan_mode",
             params.GetString("scan_mode", "comments"));
+        AppendJsonStringField(&arguments_json, &first_field, "probe_ref", probe_ref);
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "probe_ready",
+            !Trim(probe_ref).empty() || params.GetBool("probe_ready", false),
+            !Trim(probe_ref).empty() || params.GetBool("probe_ready", false));
+    }
+
+    if (route_target == "lan_agent_delete_text_range_window_atomic") {
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "scan_mode",
+            params.GetString("scan_mode", "comments"));
+        const int start_line = std::max(1, params.GetInt("start_line", params.GetInt("next_start_line", 1)));
+        const int max_lines = std::min(200, std::max(1, params.GetInt("max_lines", 200)));
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"start_line\":";
+        arguments_json += std::to_string(start_line);
+        arguments_json += ",\"next_start_line\":";
+        arguments_json += std::to_string(start_line);
+        arguments_json += ",\"max_lines\":";
+        arguments_json += std::to_string(max_lines);
+        first_field = false;
         AppendJsonStringField(&arguments_json, &first_field, "probe_ref", probe_ref);
         AppendJsonBoolField(
             &arguments_json,
@@ -2181,6 +2271,15 @@ void ApplyClipsResultGuard(
     ApplyClipsDecisionFields(decision, "post_result", result);
     result->fields["clips_post_result_chain_fact"] =
         BuildMcpToolChainFact(tool_name, "post_result", nullptr, result);
+    const bool pending_text_range_delete =
+        (tool_name == "lan_agent_delete_text_range_window_atomic"
+            || tool_name == "lan_agent_delete_next_text_range_atomic")
+        && (GetFieldOrDefault(*result, "has_more", "false") == "true"
+            || GetFieldOrDefault(*result, "continue_required", "false") == "true"
+            || GetFieldOrDefault(*result, "status", "") == "needs_continue"
+            || GetFieldOrDefault(*result, "task_completion", "") == "window_applied"
+            || GetFieldOrDefault(*result, "task_completion", "") == "single_item_applied"
+            || GetFieldOrDefault(*result, "task_completion", "") == "boundary_blocked");
     const std::string existing_verification = GetFieldOrDefault(*result, "verification", "");
     const bool invalid_existing_verification =
         existing_verification == "invalid" || existing_verification == "not_verified";
@@ -2195,7 +2294,9 @@ void ApplyClipsResultGuard(
             || GetFieldOrDefault(*result, "decision", "") == "route"
             || GetFieldOrDefault(*result, "decision", "") == "allow");
     const std::string effective_verification =
-        (expected_structured_failure || expected_structured_decision)
+        pending_text_range_delete
+            ? "not_verified"
+        : (expected_structured_failure || expected_structured_decision)
             ? "verified"
             : (invalid_existing_verification
             ? existing_verification
@@ -2218,7 +2319,7 @@ void ApplyClipsResultGuard(
     } else if (expected_structured_failure || expected_structured_decision) {
         result->fields["not_verified_reason"].clear();
     }
-    if (decision.decision == "route") {
+    if (decision.decision == "route" || pending_text_range_delete) {
         const std::string required_tool = FirstNonEmpty(
             decision.route_target,
             GetFieldOrDefault(*result, "next_tool_name", ""),
@@ -2237,14 +2338,39 @@ void ApplyClipsResultGuard(
         if (GetFieldOrDefault(*result, "invalid_conclusion_reason", "").empty()) {
             result->fields["invalid_conclusion_reason"] = FirstNonEmpty(
                 decision.reason_code,
+                pending_text_range_delete ? "text_range_delete_incomplete" : "",
                 "clips_route_required",
                 "clips_route_required");
         }
         result->fields["ai_conclusion_valid"] = "false";
+        result->fields["supervision_status"] = "closed_loop_continue";
+        result->fields["goal_status"] = "not_complete";
+        result->fields["terminal_state"] = "false";
+        result->fields["task_done"] = "false";
+        result->fields["completion_claim_allowed"] = "false";
+        result->fields["must_continue_until"] = "has_more=false";
+        result->fields["completion_guard"] =
+            "NON_TERMINAL_RESULT: do not claim completion; execute required_tool_arguments_json";
+        if (pending_text_range_delete && GetFieldOrDefault(*result, "next_action", "").empty()) {
+            result->fields["next_action"] =
+                "tool_call_only: continue the delete loop until has_more=false before any final completion claim";
+        }
     } else if (GetFieldOrDefault(*result, "semantic_model_clamp", "").empty()) {
         result->fields["semantic_model_clamp"] = "none";
         result->fields["assistant_response_allowed"] = "true";
         result->fields["final_answer_allowed"] = "true";
+        if (GetFieldOrDefault(*result, "terminal_state", "").empty()) {
+            result->fields["terminal_state"] = "true";
+        }
+        if (GetFieldOrDefault(*result, "task_done", "").empty()) {
+            result->fields["task_done"] = "true";
+        }
+        if (GetFieldOrDefault(*result, "completion_claim_allowed", "").empty()) {
+            result->fields["completion_claim_allowed"] = "true";
+        }
+        if (GetFieldOrDefault(*result, "must_continue_until", "").empty()) {
+            result->fields["must_continue_until"] = "";
+        }
     }
     result->fields["status"] = ResolveResultEnvelopeStatus(*result);
     if (GetFieldOrDefault(*result, "error_message", "").empty()) {

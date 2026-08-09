@@ -379,6 +379,62 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "public"
         },
         {
+            "lan_agent_task_memory_freeze",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory freeze returned",
+            "ok,exit_code,status,record_model,goal_id,trace_id,task_memory_root,migration_dir,current_state_path,key_slices_path,incremental_index_manifest_path,migration_handover_path,task_memory_path,step_ledger_path,slices_path,index_manifest_path,resume_context_path,completion_claim_allowed,terminal_state,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_append_step",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory append step returned",
+            "ok,exit_code,status,record_model,goal_id,trace_id,step_index,step_ledger_path,resume_context_path,completion_claim_allowed,terminal_state,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_execute_continuation_budget",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory continuation budget returned",
+            "ok,exit_code,status,record_model,goal_id,trace_id,budget_run_id,budget_status,execution_mode,dry_run,execute_requested,execution_deferred,max_steps,planned_step_count,executed_step_count,budget_exhausted,last_verified_step,last_tool,last_status,last_result_ref,last_summary,resume_context_path,budget_plan_path,step_ledger_path,completion_claim_allowed,terminal_state,task_done,continue_required,auto_continue_required,assistant_response_allowed,final_answer_allowed,must_continue_until,next_call_json,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_build_kv_snapshot",
+            "codex-lan-agent",
+            "task_memory_write",
+            "task memory kv snapshot returned",
+            "ok,exit_code,status,record_model,goal_id,task_memory_root,kv_backend,kv_snapshot_dir,kv_index_path,kv_manifest_path,record_count,step_record_count,slice_record_count,budget_record_count,rocksdb_status,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_kv_lookup",
+            "codex-lan-agent",
+            "task_memory_read",
+            "task memory kv lookup returned",
+            "ok,exit_code,status,record_model,goal_id,lookup_key,prefix_match,kv_backend,kv_index_path,limit,offset,matched_count,returned_count,has_more,next_offset,matches_jsonl,include_value,value_ref,value_text,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_migration_assess",
+            "codex-lan-agent",
+            "task_memory_read",
+            "task memory migration assessment returned",
+            "ok,exit_code,status,record_model,goal_id,task_memory_root,migration_stage,adaptation_decision,active_backend,source_of_truth,backend_order,file_object_ready,migration_bundle_ready,kv_snapshot_ready,kv_contract_ready,rocksdb_native_ready,rocksdb_status,safe_to_enable_rocksdb_adapter,safe_to_replace_source_of_truth,ready_file_count,required_file_count,ready_migration_file_count,required_migration_file_count,missing_file_objects_csv,missing_migration_files_csv,kv_record_count,step_record_count,slice_record_count,budget_record_count,resume_context_path,step_ledger_path,slices_path,index_manifest_path,kv_index_path,kv_manifest_path,terminal_state,completion_claim_allowed,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_task_memory_resume_context",
+            "codex-lan-agent",
+            "task_memory_read",
+            "task memory resume context returned",
+            "ok,exit_code,status,record_model,goal_id,task_memory_root,resume_context_path,resume_context,step_ledger_path,slices_path,index_manifest_path,migration_handover_path,completion_claim_allowed,terminal_state,current_tool,next_call_json,compact_summary,remaining_work,next_allowed_action,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "public"
+        },
+        {
             "lan_agent_probe_text_file",
             "codex-lan-agent",
             "file_probe",
@@ -416,6 +472,22 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "text_range_scan",
             "text range scan returned",
             "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,file_path,normalized_path,scan_mode,total_lines,total_range_count,returned_range_count,range_offset,requested_max_ranges_per_call,max_ranges_per_call,next_range_offset,has_more,has_more_after_current_step,task_completion,step_completion,continue_required,auto_continue_required,analysis_allowed,single_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,probe_ref,probe_ready,content_text,content_payload_format,content_payload_scope,content_payload_boundary_safe,ranges_json,scan_result_ref,scan_contract,step_contract,next_call_json,result_ref,evidence_ref,cache_hit,clips_gate,clips_pre_call_tool_decision,clips_pre_call_tool_reason_code,clips_pre_call_tool_next_action,clips_pre_call_tool_matched_rule,verification_status,verification_ok,supervision_alarm,supervision_alarm_code,supervision_alarm_message,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_delete_next_text_range_atomic",
+            "codex-lan-agent",
+            "file_write",
+            "next text range delete returned",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,next_call_json,file_path,normalized_path,primary_intent,scan_mode,probe_ref,probe_ready,range_index,range_kind,range_start_line,range_end_line,range_start_column,range_end_column,deleted_preview,delete_mode,deleted_text_bytes,old_hash,new_hash,total_lines_before,total_lines_after,total_range_count_before,total_range_count_after,has_more,write_applied,write_verified,disk_write_completed,final_write_tool,verification_status,verification_ok,task_completion,continue_required,auto_continue_required,terminal_state,task_done,completion_claim_allowed,must_continue_until,completion_guard,single_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,server_side_optimized_step,result_ref,evidence_ref,semantic_model_clamp,supervision_status,goal_status,assistant_response_allowed,final_answer_allowed,required_next_action_type,required_tool_name,required_tool_arguments_json,clips_continuation_required,clips_post_result_decision,clips_post_result_verification,clips_post_result_reason_code,clips_post_result_next_action,clips_post_result_matched_rule,trace_id,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_delete_text_range_window_atomic",
+            "codex-lan-agent",
+            "file_write",
+            "bounded text range window delete returned",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,next_call_json,file_path,normalized_path,primary_intent,scan_mode,probe_ref,probe_ready,start_line,window_start_line,window_end_line,requested_max_lines,max_lines,max_lines_per_call,effective_window_policy,small_window_request_upgraded,total_lines_before,total_lines_after,total_range_count_before,total_range_count_after,window_range_count_before,boundary_range_count,boundary_ranges_json,deleted_range_count,deleted_ranges_json,delete_modes_csv,deleted_text_bytes,old_hash,new_hash,has_range_in_current_window_after,has_more,next_start_line,write_applied,write_verified,disk_write_completed,final_write_tool,verification_status,verification_ok,task_completion,continue_required,auto_continue_required,terminal_state,task_done,completion_claim_allowed,must_continue_until,completion_guard,single_step_required,window_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,window_batch_scope,server_side_optimized_step,result_ref,evidence_ref,semantic_model_clamp,supervision_status,goal_status,assistant_response_allowed,final_answer_allowed,required_next_action_type,required_tool_name,required_tool_arguments_json,clips_continuation_required,clips_post_result_decision,clips_post_result_verification,clips_post_result_reason_code,clips_post_result_next_action,clips_post_result_matched_rule,trace_id,provider_id,capability_id",
             "public"
         },
         {

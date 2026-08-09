@@ -125,6 +125,38 @@
     (next_action "return patch_id plus result_ref/evidence_ref/log_path before downstream consumers trust this write")
     (matched_rule "audited-write-result-missing-proof"))))
 
+(defrule text-range-delete-result-still-pending-by-has-more
+  (declare (salience 49))
+  (mcp_tool_result (tool_name ?tool&:(or (eq ?tool "lan_agent_delete_text_range_window_atomic")
+                                         (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                   (has_more "true"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "text_range_delete_incomplete")
+    (next_action "tool_call_only: deletion is not complete; call the same delete tool with next_start_line/probe_ref until has_more=false before any final completion claim")
+    (route_target ?tool)
+    (matched_rule "text-range-delete-result-still-pending-by-has-more"))))
+
+(defrule text-range-delete-result-still-pending-by-continuation
+  (declare (salience 48))
+  (mcp_tool_result (tool_name ?tool&:(or (eq ?tool "lan_agent_delete_text_range_window_atomic")
+                                         (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                   (continue_required "true"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "text_range_delete_continue_required")
+    (next_action "tool_call_only: continue the delete loop; current write was verified but the overall comment deletion task is not complete")
+    (route_target ?tool)
+    (matched_rule "text-range-delete-result-still-pending-by-continuation"))))
+
 (defrule invalid-result-missing-hash
   (declare (salience 35))
   (mcp_tool_result (tool_name ?tool) (result_hash ""))

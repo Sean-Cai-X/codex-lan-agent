@@ -1141,6 +1141,34 @@ std::string BuildEditWindowBundlePath(
         "edit_windows_" + trace_token + ".txt");
 }
 
+std::string BuildTextRangeDeleteRoot(const AgentConfig & config) {
+    return codex_lan_agent::JoinPath(config.log_root, "text_range_deletes");
+}
+
+std::string BuildTextRangeDeletePath(
+    const AgentConfig & config,
+    const std::string & trace_id,
+    const std::string & normalized_file_path) {
+    const std::string trace_token = !trace_id.empty()
+        ? SanitizeDispatchToken(trace_id, "trace")
+        : SanitizeDispatchToken(std::filesystem::path(normalized_file_path).filename().string(), "file");
+    return codex_lan_agent::JoinPath(
+        BuildTextRangeDeleteRoot(config),
+        "text_range_delete_" + trace_token + ".txt");
+}
+
+std::string BuildTextRangeWindowDeletePath(
+    const AgentConfig & config,
+    const std::string & trace_id,
+    const std::string & normalized_file_path) {
+    const std::string trace_token = !trace_id.empty()
+        ? SanitizeDispatchToken(trace_id, "trace")
+        : SanitizeDispatchToken(std::filesystem::path(normalized_file_path).filename().string(), "file");
+    return codex_lan_agent::JoinPath(
+        BuildTextRangeDeleteRoot(config),
+        "text_range_window_delete_" + trace_token + ".txt");
+}
+
 std::string CapPreviewText(const std::string & value, std::size_t max_chars = 160) {
     const std::size_t bounded_max_chars = std::max<std::size_t>(32, max_chars);
     if (value.size() <= bounded_max_chars) {
@@ -1342,6 +1370,209 @@ bool CollectCommentRanges(
         ranges->push_back(range);
     }
 
+    return true;
+}
+
+std::string BuildDeletedRangeSummaryJsonArray(const std::vector<TextRangeDescriptor> & ranges) {
+    std::ostringstream output;
+    output << "[";
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        if (index != 0) {
+            output << ",";
+        }
+        const TextRangeDescriptor & range = ranges[index];
+        output << "{";
+        output << "\"range_index\":" << range.range_index << ",";
+        output << "\"range_kind\":\"" << codex_lan_agent::JsonEscape(range.range_kind) << "\",";
+        output << "\"start_line\":" << range.start_line << ",";
+        output << "\"end_line\":" << range.end_line << ",";
+        output << "\"start_column\":" << range.start_column << ",";
+        output << "\"end_column\":" << range.end_column << ",";
+        output << "\"preview\":\"" << codex_lan_agent::JsonEscape(range.preview) << "\"";
+        output << "}";
+    }
+    output << "]";
+    return output.str();
+}
+
+std::string BuildDeleteNextTextRangeCallJson(
+    const std::string & file_path,
+    const std::string & scan_mode,
+    const std::string & primary_intent,
+    const std::string & trace_id,
+    const std::string & probe_ref) {
+    std::ostringstream output;
+    output << "{\"name\":\"lan_agent_delete_next_text_range_atomic\",\"arguments\":{";
+    output << "\"file_path\":\"" << codex_lan_agent::JsonEscape(file_path) << "\"";
+    output << ",\"scan_mode\":\"" << codex_lan_agent::JsonEscape(scan_mode) << "\"";
+    if (!primary_intent.empty()) {
+        output << ",\"primary_intent\":\"" << codex_lan_agent::JsonEscape(primary_intent) << "\"";
+    }
+    if (!trace_id.empty()) {
+        output << ",\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\"";
+    }
+    if (!probe_ref.empty()) {
+        output << ",\"probe_ref\":\"" << codex_lan_agent::JsonEscape(probe_ref) << "\",\"probe_ready\":true";
+    }
+    output << "}}";
+    return output.str();
+}
+
+std::string BuildDeleteTextRangeWindowCallJson(
+    const std::string & file_path,
+    const std::string & scan_mode,
+    int next_start_line,
+    int max_lines,
+    const std::string & primary_intent,
+    const std::string & trace_id,
+    const std::string & probe_ref) {
+    std::ostringstream output;
+    output << "{\"name\":\"lan_agent_delete_text_range_window_atomic\",\"arguments\":{";
+    output << "\"file_path\":\"" << codex_lan_agent::JsonEscape(file_path) << "\"";
+    output << ",\"scan_mode\":\"" << codex_lan_agent::JsonEscape(scan_mode) << "\"";
+    output << ",\"start_line\":" << std::max(1, next_start_line);
+    output << ",\"next_start_line\":" << std::max(1, next_start_line);
+    output << ",\"max_lines\":" << std::max(1, max_lines);
+    if (!primary_intent.empty()) {
+        output << ",\"primary_intent\":\"" << codex_lan_agent::JsonEscape(primary_intent) << "\"";
+    }
+    if (!trace_id.empty()) {
+        output << ",\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\"";
+    }
+    if (!probe_ref.empty()) {
+        output << ",\"probe_ref\":\"" << codex_lan_agent::JsonEscape(probe_ref) << "\",\"probe_ready\":true";
+    }
+    output << "}}";
+    return output.str();
+}
+
+std::vector<std::size_t> BuildRawLineStartOffsets(const std::string & raw_content) {
+    std::vector<std::size_t> offsets;
+    offsets.push_back(0);
+    for (std::size_t index = 0; index < raw_content.size(); ++index) {
+        if (raw_content[index] == '\n' && index + 1 < raw_content.size()) {
+            offsets.push_back(index + 1);
+        }
+    }
+    return offsets;
+}
+
+std::size_t FindRawLineEndExcludingNewline(
+    const std::string & raw_content,
+    std::size_t line_start) {
+    std::size_t index = line_start;
+    while (index < raw_content.size() && raw_content[index] != '\r' && raw_content[index] != '\n') {
+        ++index;
+    }
+    return index;
+}
+
+std::size_t FindRawLineEndIncludingNewline(
+    const std::string & raw_content,
+    std::size_t line_end) {
+    if (line_end < raw_content.size() && raw_content[line_end] == '\r') {
+        return line_end + 1 < raw_content.size() && raw_content[line_end + 1] == '\n'
+            ? line_end + 2
+            : line_end + 1;
+    }
+    if (line_end < raw_content.size() && raw_content[line_end] == '\n') {
+        return line_end + 1;
+    }
+    return line_end;
+}
+
+bool IsAsciiSpaceOrTab(char ch) {
+    return ch == ' ' || ch == '\t';
+}
+
+bool BuildContentWithDeletedTextRange(
+    const std::string & raw_content,
+    const TextRangeDescriptor & range,
+    std::string * new_content,
+    std::string * deleted_text,
+    std::string * delete_mode,
+    std::string * error_message) {
+    if (new_content == nullptr || deleted_text == nullptr || delete_mode == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = "delete range output is null";
+        }
+        return false;
+    }
+    const std::vector<std::size_t> line_starts = BuildRawLineStartOffsets(raw_content);
+    if (range.start_line < 1 || range.end_line < range.start_line ||
+        static_cast<std::size_t>(range.start_line) > line_starts.size() ||
+        static_cast<std::size_t>(range.end_line) > line_starts.size()) {
+        if (error_message != nullptr) {
+            *error_message = "range line is outside file";
+        }
+        return false;
+    }
+
+    const std::size_t start_line_start = line_starts[static_cast<std::size_t>(range.start_line - 1)];
+    const std::size_t end_line_start = line_starts[static_cast<std::size_t>(range.end_line - 1)];
+    const std::size_t start_line_end = FindRawLineEndExcludingNewline(raw_content, start_line_start);
+    const std::size_t end_line_end = FindRawLineEndExcludingNewline(raw_content, end_line_start);
+    const std::size_t start_column_offset = static_cast<std::size_t>(std::max(1, range.start_column) - 1);
+    std::size_t delete_start = std::min(start_line_start + start_column_offset, start_line_end);
+    std::size_t delete_end = range.end_column > 0
+        ? std::min(end_line_start + static_cast<std::size_t>(range.end_column), end_line_end)
+        : end_line_end;
+    *delete_mode = "range_text";
+
+    if (range.range_kind == "line_comment" && range.start_line == range.end_line) {
+        std::string prefix = raw_content.substr(start_line_start, delete_start - start_line_start);
+        const bool prefix_is_whitespace = Trim(prefix).empty();
+        if (prefix_is_whitespace) {
+            delete_start = start_line_start;
+            delete_end = FindRawLineEndIncludingNewline(raw_content, start_line_end);
+            *delete_mode = "whole_line_comment_line";
+        } else {
+            while (delete_start > start_line_start && IsAsciiSpaceOrTab(raw_content[delete_start - 1])) {
+                --delete_start;
+            }
+            delete_end = start_line_end;
+            *delete_mode = "line_comment_suffix";
+        }
+    } else if (range.range_kind == "block_comment" && range.start_line == range.end_line) {
+        const std::string prefix = raw_content.substr(start_line_start, delete_start - start_line_start);
+        const std::string suffix = raw_content.substr(delete_end, end_line_end - delete_end);
+        if (Trim(prefix).empty() && Trim(suffix).empty()) {
+            delete_start = start_line_start;
+            delete_end = FindRawLineEndIncludingNewline(raw_content, end_line_end);
+            *delete_mode = "whole_line_block_comment";
+        }
+    }
+
+    if (delete_end < delete_start || delete_start > raw_content.size() || delete_end > raw_content.size()) {
+        if (error_message != nullptr) {
+            *error_message = "computed delete range is invalid";
+        }
+        return false;
+    }
+    *deleted_text = raw_content.substr(delete_start, delete_end - delete_start);
+    *new_content = raw_content.substr(0, delete_start) + raw_content.substr(delete_end);
+    return true;
+}
+
+bool WriteWholeFileDirect(
+    const std::filesystem::path & path,
+    const std::string & content,
+    std::string * error_message) {
+    std::ofstream output(path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!output.is_open()) {
+        if (error_message != nullptr) {
+            *error_message = "failed to open file for writing";
+        }
+        return false;
+    }
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
+    output.close();
+    if (!output) {
+        if (error_message != nullptr) {
+            *error_message = "failed to write file content";
+        }
+        return false;
+    }
     return true;
 }
 
@@ -3450,6 +3681,598 @@ CommandResult ScanTextRangesResult(
         "single-step loop: scan one range, prepare one window, apply one atomic edit, verify, then rescan from offset 0";
     result.fields["step_contract"] = result.fields["scan_contract"];
     result.fields["server_side_atomic_read"] = "true";
+    return result;
+}
+
+CommandResult DeleteNextTextRangeAtomicResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & scan_mode = std::string(),
+    const std::string & primary_intent = std::string(),
+    const std::string & trace_id = std::string(),
+    const std::string & probe_ref = std::string()) {
+    CommandResult result;
+    result.fields["file_path"] = file_path;
+    result.fields["primary_intent"] = primary_intent;
+    if (!trace_id.empty()) {
+        result.fields["trace_id"] = trace_id;
+    }
+    if (!probe_ref.empty()) {
+        result.fields["probe_ref"] = probe_ref;
+        result.fields["probe_ready"] = "true";
+    }
+    if (file_path.empty()) {
+        result.ok = false;
+        result.exit_code = 20;
+        result.fields["error"] = "file_path is required";
+        result.fields["error_code"] = "missing_file_path";
+        return result;
+    }
+
+    const std::string normalized_scan_mode = NormalizeTextRangeScanMode(scan_mode);
+    if (normalized_scan_mode.empty()) {
+        result.ok = false;
+        result.exit_code = 75;
+        result.fields["error"] = "unsupported scan_mode; use comments, line_comments, or block_comments";
+        result.fields["error_code"] = "unsupported_scan_mode";
+        result.fields["next_action"] = "retry with scan_mode=comments for comment cleanup";
+        return result;
+    }
+
+    std::filesystem::path normalized;
+    std::string path_error;
+    if (!TryResolveAllowedPath(config, file_path, &normalized, &path_error)) {
+        result.ok = false;
+        result.exit_code = 21;
+        result.fields["error"] = path_error;
+        result.fields["error_code"] = path_error == "path is outside allowed roots"
+            ? "path_outside_allowed_roots"
+            : "path_resolution_failed";
+        return result;
+    }
+
+    std::string raw_content;
+    std::string read_error;
+    if (!ReadWholeFile(normalized, &raw_content, &read_error)) {
+        result.ok = false;
+        result.exit_code = 23;
+        result.fields["error"] = read_error;
+        result.fields["error_code"] = "file_read_failed";
+        return result;
+    }
+
+    std::vector<TextRangeDescriptor> ranges;
+    int total_lines = 0;
+    if (!CollectCommentRanges(raw_content, normalized_scan_mode, &ranges, &total_lines)) {
+        result.ok = false;
+        result.exit_code = 77;
+        result.fields["error"] = "failed to collect text ranges";
+        result.fields["error_code"] = "text_range_scan_failed";
+        return result;
+    }
+
+    result.fields["normalized_path"] = normalized.string();
+    result.fields["scan_mode"] = normalized_scan_mode;
+    result.fields["total_lines_before"] = std::to_string(total_lines);
+    result.fields["total_range_count_before"] = std::to_string(ranges.size());
+    result.fields["operation_granularity"] = "single_text_range_delete";
+    result.fields["single_step_required"] = "true";
+    result.fields["max_items_per_call"] = "1";
+    result.fields["batch_mutation_allowed"] = "false";
+    result.fields["server_side_optimized_step"] = "true";
+
+    if (ranges.empty()) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["status"] = "needs_continue";
+        result.fields["result"] = "no_text_range_remaining";
+        result.fields["summary"] = "no matching text range remains";
+        result.fields["write_applied"] = "false";
+        result.fields["write_verified"] = "true";
+        result.fields["disk_write_completed"] = "false";
+        result.fields["task_completion"] = "complete";
+        result.fields["continue_required"] = "false";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["has_more"] = "false";
+        result.fields["next_action"] = "stop; no matching comment range remains";
+        return result;
+    }
+
+    const TextRangeDescriptor range = ranges.front();
+    std::string new_content;
+    std::string deleted_text;
+    std::string delete_mode;
+    std::string delete_error;
+    if (!BuildContentWithDeletedTextRange(
+            raw_content,
+            range,
+            &new_content,
+            &deleted_text,
+            &delete_mode,
+            &delete_error)) {
+        result.ok = false;
+        result.exit_code = 78;
+        result.fields["error"] = delete_error;
+        result.fields["error_code"] = "delete_range_build_failed";
+        return result;
+    }
+    if (new_content == raw_content) {
+        result.ok = false;
+        result.exit_code = 79;
+        result.fields["error"] = "delete range produced no content change";
+        result.fields["error_code"] = "delete_range_no_effect";
+        return result;
+    }
+
+    const std::string old_hash = StableContentChecksum(raw_content);
+    std::string write_error;
+    if (!WriteWholeFileDirect(normalized, new_content, &write_error)) {
+        result.ok = false;
+        result.exit_code = 80;
+        result.fields["error"] = write_error;
+        result.fields["error_code"] = "file_write_failed";
+        return result;
+    }
+
+    std::string verified_content;
+    if (!ReadWholeFile(normalized, &verified_content, &read_error)) {
+        result.ok = false;
+        result.exit_code = 81;
+        result.fields["error"] = read_error;
+        result.fields["error_code"] = "file_read_after_write_failed";
+        return result;
+    }
+
+    std::vector<TextRangeDescriptor> after_ranges;
+    int total_lines_after = 0;
+    CollectCommentRanges(verified_content, normalized_scan_mode, &after_ranges, &total_lines_after);
+    const std::string new_hash = StableContentChecksum(verified_content);
+    const std::string result_path = BuildTextRangeDeletePath(config, trace_id, normalized.string());
+    std::filesystem::create_directories(BuildTextRangeDeleteRoot(config));
+    std::ofstream audit(result_path, std::ios::out | std::ios::trunc);
+    if (audit.is_open()) {
+        audit << "file_path=" << normalized.string() << "\n";
+        audit << "scan_mode=" << normalized_scan_mode << "\n";
+        audit << "deleted_range_kind=" << range.range_kind << "\n";
+        audit << "deleted_range_lines=" << range.start_line << "-" << range.end_line << "\n";
+        audit << "deleted_range_columns=" << range.start_column << "-" << range.end_column << "\n";
+        audit << "delete_mode=" << delete_mode << "\n";
+        audit << "total_range_count_before=" << ranges.size() << "\n";
+        audit << "total_range_count_after=" << after_ranges.size() << "\n";
+        audit << "old_hash=" << old_hash << "\n";
+        audit << "new_hash=" << new_hash << "\n";
+        audit << "deleted_preview=" << range.preview << "\n";
+    }
+
+    result.ok = true;
+    result.exit_code = 0;
+    const bool single_delete_complete = after_ranges.empty();
+    result.fields["status"] = single_delete_complete ? "success" : "needs_continue";
+    result.fields["result"] = "delete_next_text_range_atomic_applied";
+    result.fields["summary"] = single_delete_complete
+        ? "deleted one text range and verified by readback; no matching text range remains"
+        : "deleted one text range and verified by readback; task is not complete and must continue";
+    result.fields["range_index"] = std::to_string(range.range_index);
+    result.fields["range_kind"] = range.range_kind;
+    result.fields["range_start_line"] = std::to_string(range.start_line);
+    result.fields["range_end_line"] = std::to_string(range.end_line);
+    result.fields["range_start_column"] = std::to_string(range.start_column);
+    result.fields["range_end_column"] = std::to_string(range.end_column);
+    result.fields["deleted_preview"] = range.preview;
+    result.fields["delete_mode"] = delete_mode;
+    result.fields["deleted_text_bytes"] = std::to_string(deleted_text.size());
+    result.fields["old_hash"] = old_hash;
+    result.fields["new_hash"] = new_hash;
+    result.fields["total_lines_after"] = std::to_string(total_lines_after);
+    result.fields["total_range_count_after"] = std::to_string(after_ranges.size());
+    result.fields["has_more"] = single_delete_complete ? "false" : "true";
+    result.fields["write_applied"] = "true";
+    result.fields["write_verified"] = verified_content == new_content ? "true" : "false";
+    result.fields["disk_write_completed"] = "true";
+    result.fields["final_write_tool"] = "mcp_direct_text_range_delete";
+    result.fields["verification_status"] = verified_content == new_content ? "verified" : "not_verified";
+    result.fields["verification_ok"] = verified_content == new_content ? "true" : "false";
+    result.fields["task_completion"] = single_delete_complete ? "complete" : "single_item_applied";
+    result.fields["continue_required"] = single_delete_complete ? "false" : "true";
+    result.fields["auto_continue_required"] = "false";
+    result.fields["terminal_state"] = single_delete_complete ? "true" : "false";
+    result.fields["task_done"] = single_delete_complete ? "true" : "false";
+    result.fields["completion_claim_allowed"] = single_delete_complete ? "true" : "false";
+    result.fields["must_continue_until"] = single_delete_complete ? "" : "has_more=false";
+    result.fields["next_action"] = single_delete_complete
+        ? "stop; no matching comment range remains"
+        : "call lan_agent_delete_next_text_range_atomic again with the same file_path, scan_mode=comments, and probe_ref";
+    result.fields["next_call_json"] = single_delete_complete
+        ? ""
+        : BuildDeleteNextTextRangeCallJson(
+            file_path,
+            normalized_scan_mode,
+            primary_intent,
+            trace_id,
+            probe_ref);
+    result.fields["result_ref"] = result_path;
+    result.fields["evidence_ref"] = result_path;
+    result.fields["content_payload_format"] = "json";
+    result.fields["content_payload_scope"] = "metadata_only";
+    result.fields["content_payload_boundary_safe"] = "true";
+    return result;
+}
+
+CommandResult DeleteTextRangeWindowAtomicResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & scan_mode = std::string(),
+    int start_line = 1,
+    int max_lines = 200,
+    const std::string & primary_intent = std::string(),
+    const std::string & trace_id = std::string(),
+    const std::string & probe_ref = std::string()) {
+    CommandResult result;
+    result.fields["file_path"] = file_path;
+    result.fields["primary_intent"] = primary_intent;
+    if (!trace_id.empty()) {
+        result.fields["trace_id"] = trace_id;
+    }
+    if (!probe_ref.empty()) {
+        result.fields["probe_ref"] = probe_ref;
+        result.fields["probe_ready"] = "true";
+    }
+    if (file_path.empty()) {
+        result.ok = false;
+        result.exit_code = 20;
+        result.fields["error"] = "file_path is required";
+        result.fields["error_code"] = "missing_file_path";
+        return result;
+    }
+
+    const std::string normalized_scan_mode = NormalizeTextRangeScanMode(scan_mode);
+    if (normalized_scan_mode.empty()) {
+        result.ok = false;
+        result.exit_code = 75;
+        result.fields["error"] = "unsupported scan_mode; use comments, line_comments, or block_comments";
+        result.fields["error_code"] = "unsupported_scan_mode";
+        result.fields["next_action"] = "retry with scan_mode=comments for comment cleanup";
+        return result;
+    }
+
+    std::filesystem::path normalized;
+    std::string path_error;
+    if (!TryResolveAllowedPath(config, file_path, &normalized, &path_error)) {
+        result.ok = false;
+        result.exit_code = 21;
+        result.fields["error"] = path_error;
+        result.fields["error_code"] = path_error == "path is outside allowed roots"
+            ? "path_outside_allowed_roots"
+            : "path_resolution_failed";
+        return result;
+    }
+
+    std::string raw_content;
+    std::string read_error;
+    if (!ReadWholeFile(normalized, &raw_content, &read_error)) {
+        result.ok = false;
+        result.exit_code = 23;
+        result.fields["error"] = read_error;
+        result.fields["error_code"] = "file_read_failed";
+        return result;
+    }
+
+    std::vector<TextRangeDescriptor> ranges;
+    int total_lines = 0;
+    if (!CollectCommentRanges(raw_content, normalized_scan_mode, &ranges, &total_lines)) {
+        result.ok = false;
+        result.exit_code = 77;
+        result.fields["error"] = "failed to collect text ranges";
+        result.fields["error_code"] = "text_range_scan_failed";
+        return result;
+    }
+
+    const int bounded_start_line = std::max(1, start_line);
+    const int requested_max_lines = std::max(1, max_lines);
+    const std::string normalized_primary_intent = ToLowerAscii(Trim(primary_intent));
+    const bool comment_cleanup_window =
+        normalized_scan_mode == "comments"
+        || normalized_scan_mode == "line_comments"
+        || normalized_scan_mode == "block_comments"
+        || normalized_primary_intent.empty()
+        || normalized_primary_intent == "comment_cleanup"
+        || normalized_primary_intent == "remove_comments"
+        || normalized_primary_intent == "strip_comments"
+        || normalized_primary_intent == "text_cleaning"
+        || normalized_primary_intent == "删除注释"
+        || normalized_primary_intent == "清理注释"
+        || normalized_primary_intent == "去除注释"
+        || normalized_primary_intent == "移除注释"
+        || normalized_primary_intent == "删注释";
+    const int bounded_max_lines = comment_cleanup_window
+        ? 200
+        : std::min(200, requested_max_lines);
+    const int window_end_line = std::min(total_lines, bounded_start_line + bounded_max_lines - 1);
+    std::vector<TextRangeDescriptor> window_ranges;
+    std::vector<TextRangeDescriptor> boundary_ranges;
+    for (const TextRangeDescriptor & range : ranges) {
+        const bool starts_in_window = range.start_line >= bounded_start_line && range.start_line <= window_end_line;
+        const bool ends_in_window = range.end_line >= bounded_start_line && range.end_line <= window_end_line;
+        if (starts_in_window && ends_in_window && range.range_kind != "block_comment_unterminated") {
+            window_ranges.push_back(range);
+        } else if (starts_in_window || ends_in_window) {
+            boundary_ranges.push_back(range);
+        }
+    }
+
+    result.fields["normalized_path"] = normalized.string();
+    result.fields["scan_mode"] = normalized_scan_mode;
+    result.fields["start_line"] = std::to_string(bounded_start_line);
+    result.fields["window_start_line"] = std::to_string(bounded_start_line);
+    result.fields["window_end_line"] = std::to_string(window_end_line);
+    result.fields["requested_max_lines"] = std::to_string(requested_max_lines);
+    result.fields["max_lines"] = std::to_string(bounded_max_lines);
+    result.fields["effective_window_policy"] = comment_cleanup_window
+        ? "comment_cleanup_fixed_200_line_window"
+        : "caller_bounded_window";
+    result.fields["small_window_request_upgraded"] =
+        comment_cleanup_window && requested_max_lines < 200 ? "true" : "false";
+    result.fields["total_lines_before"] = std::to_string(total_lines);
+    result.fields["total_range_count_before"] = std::to_string(ranges.size());
+    result.fields["window_range_count_before"] = std::to_string(window_ranges.size());
+    result.fields["boundary_range_count"] = std::to_string(boundary_ranges.size());
+    result.fields["operation_granularity"] = "bounded_line_window_text_range_delete";
+    result.fields["single_step_required"] = "false";
+    result.fields["window_step_required"] = "true";
+    result.fields["max_items_per_call"] = std::to_string(bounded_max_lines) + "_lines";
+    result.fields["max_lines_per_call"] = std::to_string(bounded_max_lines);
+    result.fields["batch_mutation_allowed"] = "bounded_window_only";
+    result.fields["server_side_optimized_step"] = "true";
+    result.fields["window_batch_scope"] = "single_file_bounded_line_window";
+
+    if (ranges.empty()) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["status"] = "success";
+        result.fields["result"] = "no_text_range_remaining";
+        result.fields["summary"] = "no matching text range remains";
+        result.fields["write_applied"] = "false";
+        result.fields["write_verified"] = "true";
+        result.fields["disk_write_completed"] = "false";
+        result.fields["task_completion"] = "complete";
+        result.fields["continue_required"] = "false";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["has_more"] = "false";
+        result.fields["terminal_state"] = "true";
+        result.fields["task_done"] = "true";
+        result.fields["completion_claim_allowed"] = "true";
+        result.fields["must_continue_until"] = "";
+        result.fields["next_start_line"] = std::to_string(bounded_start_line);
+        result.fields["next_action"] = "stop; no matching comment range remains";
+        return result;
+    }
+
+    if (!boundary_ranges.empty() && window_ranges.empty()) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["status"] = "success";
+        result.fields["result"] = "window_boundary_range_detected";
+        result.fields["summary"] =
+            "a text range crosses the current window boundary; task is not complete and must continue with the single-range delete tool";
+        result.fields["write_applied"] = "false";
+        result.fields["write_verified"] = "true";
+        result.fields["disk_write_completed"] = "false";
+        result.fields["task_completion"] = "boundary_blocked";
+        result.fields["continue_required"] = "true";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["has_more"] = "true";
+        result.fields["terminal_state"] = "false";
+        result.fields["task_done"] = "false";
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["must_continue_until"] = "has_more=false";
+        result.fields["next_start_line"] = std::to_string(bounded_start_line);
+        result.fields["boundary_ranges_json"] = BuildDeletedRangeSummaryJsonArray(boundary_ranges);
+        result.fields["next_action"] =
+            "use lan_agent_delete_next_text_range_atomic for the boundary-spanning range, then retry this window";
+        result.fields["next_call_json"] = BuildDeleteNextTextRangeCallJson(
+            file_path,
+            normalized_scan_mode,
+            primary_intent,
+            trace_id,
+            probe_ref);
+        return result;
+    }
+
+    if (window_ranges.empty()) {
+        const int next_start_line = bounded_start_line + bounded_max_lines;
+        const bool has_more_windows = next_start_line <= total_lines;
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["status"] = has_more_windows ? "needs_continue" : "success";
+        result.fields["result"] = "no_text_range_in_window";
+        result.fields["summary"] = has_more_windows
+            ? "no matching text range in the current bounded window; task is not complete and must continue"
+            : "no matching text range in the current bounded window; reached the end of the file window scan";
+        result.fields["write_applied"] = "false";
+        result.fields["write_verified"] = "true";
+        result.fields["disk_write_completed"] = "false";
+        result.fields["task_completion"] = has_more_windows ? "window_complete" : "complete";
+        result.fields["continue_required"] = has_more_windows ? "true" : "false";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["has_more"] = has_more_windows ? "true" : "false";
+        result.fields["terminal_state"] = has_more_windows ? "false" : "true";
+        result.fields["task_done"] = has_more_windows ? "false" : "true";
+        result.fields["completion_claim_allowed"] = has_more_windows ? "false" : "true";
+        result.fields["must_continue_until"] = has_more_windows ? "has_more=false" : "";
+        result.fields["next_start_line"] = std::to_string(next_start_line);
+        result.fields["next_action"] = has_more_windows
+            ? "call lan_agent_delete_text_range_window_atomic again with next_start_line"
+            : "stop; reached the end of the file window scan";
+        result.fields["next_call_json"] = has_more_windows
+            ? BuildDeleteTextRangeWindowCallJson(
+                file_path,
+                normalized_scan_mode,
+                next_start_line,
+                bounded_max_lines,
+                primary_intent,
+                trace_id,
+                probe_ref)
+            : "";
+        return result;
+    }
+
+    std::string working_content = raw_content;
+    std::vector<TextRangeDescriptor> applied_ranges = window_ranges;
+    std::sort(applied_ranges.begin(), applied_ranges.end(), [](const TextRangeDescriptor & lhs, const TextRangeDescriptor & rhs) {
+        if (lhs.start_line != rhs.start_line) {
+            return lhs.start_line > rhs.start_line;
+        }
+        return lhs.start_column > rhs.start_column;
+    });
+
+    std::size_t deleted_text_bytes = 0;
+    std::vector<std::string> delete_modes;
+    for (const TextRangeDescriptor & range : applied_ranges) {
+        std::string next_content;
+        std::string deleted_text;
+        std::string delete_mode;
+        std::string delete_error;
+        if (!BuildContentWithDeletedTextRange(
+                working_content,
+                range,
+                &next_content,
+                &deleted_text,
+                &delete_mode,
+                &delete_error)) {
+            result.ok = false;
+            result.exit_code = 78;
+            result.fields["error"] = delete_error;
+            result.fields["error_code"] = "delete_range_build_failed";
+            result.fields["failed_range_start_line"] = std::to_string(range.start_line);
+            return result;
+        }
+        if (next_content == working_content) {
+            result.ok = false;
+            result.exit_code = 79;
+            result.fields["error"] = "delete range produced no content change";
+            result.fields["error_code"] = "delete_range_no_effect";
+            result.fields["failed_range_start_line"] = std::to_string(range.start_line);
+            return result;
+        }
+        deleted_text_bytes += deleted_text.size();
+        delete_modes.push_back(delete_mode);
+        working_content.swap(next_content);
+    }
+
+    const std::string old_hash = StableContentChecksum(raw_content);
+    std::string write_error;
+    if (!WriteWholeFileDirect(normalized, working_content, &write_error)) {
+        result.ok = false;
+        result.exit_code = 80;
+        result.fields["error"] = write_error;
+        result.fields["error_code"] = "file_write_failed";
+        return result;
+    }
+
+    std::string verified_content;
+    if (!ReadWholeFile(normalized, &verified_content, &read_error)) {
+        result.ok = false;
+        result.exit_code = 81;
+        result.fields["error"] = read_error;
+        result.fields["error_code"] = "file_read_after_write_failed";
+        return result;
+    }
+
+    std::vector<TextRangeDescriptor> after_ranges;
+    int total_lines_after = 0;
+    CollectCommentRanges(verified_content, normalized_scan_mode, &after_ranges, &total_lines_after);
+    const std::string new_hash = StableContentChecksum(verified_content);
+    const int after_window_end_line = std::min(total_lines_after, bounded_start_line + bounded_max_lines - 1);
+    bool has_range_in_current_window_after = false;
+    int earliest_remaining_start_line = 0;
+    for (const TextRangeDescriptor & range : after_ranges) {
+        if (earliest_remaining_start_line == 0 || range.start_line < earliest_remaining_start_line) {
+            earliest_remaining_start_line = range.start_line;
+        }
+        if (range.start_line >= bounded_start_line && range.start_line <= after_window_end_line) {
+            has_range_in_current_window_after = true;
+        }
+    }
+    int next_start_line = bounded_start_line + bounded_max_lines;
+    if (has_range_in_current_window_after) {
+        next_start_line = bounded_start_line;
+    } else if (earliest_remaining_start_line > 0 && earliest_remaining_start_line < next_start_line) {
+        next_start_line = earliest_remaining_start_line;
+    }
+    const bool has_more = !after_ranges.empty();
+
+    const std::string result_path = BuildTextRangeWindowDeletePath(config, trace_id, normalized.string());
+    std::filesystem::create_directories(BuildTextRangeDeleteRoot(config));
+    std::ofstream audit(result_path, std::ios::out | std::ios::trunc);
+    if (audit.is_open()) {
+        audit << "file_path=" << normalized.string() << "\n";
+        audit << "scan_mode=" << normalized_scan_mode << "\n";
+        audit << "window_lines=" << bounded_start_line << "-" << window_end_line << "\n";
+        audit << "deleted_range_count=" << window_ranges.size() << "\n";
+        audit << "total_range_count_before=" << ranges.size() << "\n";
+        audit << "total_range_count_after=" << after_ranges.size() << "\n";
+        audit << "old_hash=" << old_hash << "\n";
+        audit << "new_hash=" << new_hash << "\n";
+        audit << "deleted_ranges_json=" << BuildDeletedRangeSummaryJsonArray(window_ranges) << "\n";
+    }
+
+    std::ostringstream modes;
+    for (std::size_t index = 0; index < delete_modes.size(); ++index) {
+        if (index != 0) {
+            modes << ",";
+        }
+        modes << delete_modes[index];
+    }
+
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["status"] = has_more ? "needs_continue" : "success";
+    result.fields["result"] = "delete_text_range_window_atomic_applied";
+    result.fields["summary"] = has_more
+        ? "deleted text ranges in one bounded line window and verified by readback; task is not complete and must continue"
+        : "deleted text ranges in one bounded line window and verified by readback; no matching text range remains";
+    result.fields["deleted_range_count"] = std::to_string(window_ranges.size());
+    result.fields["deleted_ranges_json"] = BuildDeletedRangeSummaryJsonArray(window_ranges);
+    result.fields["delete_modes_csv"] = modes.str();
+    result.fields["deleted_text_bytes"] = std::to_string(deleted_text_bytes);
+    result.fields["old_hash"] = old_hash;
+    result.fields["new_hash"] = new_hash;
+    result.fields["total_lines_after"] = std::to_string(total_lines_after);
+    result.fields["total_range_count_after"] = std::to_string(after_ranges.size());
+    result.fields["has_range_in_current_window_after"] = has_range_in_current_window_after ? "true" : "false";
+    result.fields["has_more"] = has_more ? "true" : "false";
+    result.fields["next_start_line"] = std::to_string(next_start_line);
+    result.fields["write_applied"] = "true";
+    result.fields["write_verified"] = verified_content == working_content ? "true" : "false";
+    result.fields["disk_write_completed"] = "true";
+    result.fields["final_write_tool"] = "mcp_direct_text_range_window_delete";
+    result.fields["verification_status"] = verified_content == working_content ? "verified" : "not_verified";
+    result.fields["verification_ok"] = verified_content == working_content ? "true" : "false";
+    result.fields["task_completion"] = has_more ? "window_applied" : "complete";
+    result.fields["continue_required"] = has_more ? "true" : "false";
+    result.fields["auto_continue_required"] = "false";
+    result.fields["terminal_state"] = has_more ? "false" : "true";
+    result.fields["task_done"] = has_more ? "false" : "true";
+    result.fields["completion_claim_allowed"] = has_more ? "false" : "true";
+    result.fields["must_continue_until"] = has_more ? "has_more=false" : "";
+    result.fields["next_action"] = has_more
+        ? "call lan_agent_delete_text_range_window_atomic again with next_start_line"
+        : "stop; no matching comment range remains";
+    result.fields["next_call_json"] = has_more
+        ? BuildDeleteTextRangeWindowCallJson(
+            file_path,
+            normalized_scan_mode,
+            next_start_line,
+            bounded_max_lines,
+            primary_intent,
+            trace_id,
+            probe_ref)
+        : "";
+    result.fields["result_ref"] = result_path;
+    result.fields["evidence_ref"] = result_path;
+    result.fields["content_payload_format"] = "json";
+    result.fields["content_payload_scope"] = "metadata_only";
+    result.fields["content_payload_boundary_safe"] = "true";
     return result;
 }
 

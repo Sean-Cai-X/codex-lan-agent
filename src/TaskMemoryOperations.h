@@ -1,0 +1,1273 @@
+#pragma once
+
+#include "comm.h"
+#include "JsonRequestView.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace codex_lan_agent {
+
+inline std::string SanitizeTaskMemoryToken(const std::string & value) {
+    std::string output;
+    for (unsigned char ch : value) {
+        const bool safe =
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '_' || ch == '.';
+        output.push_back(safe ? static_cast<char>(ch) : '_');
+    }
+    return output.empty() ? "default_goal" : output;
+}
+
+inline std::string TaskMemoryStableChecksum(const std::string & content) {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (unsigned char ch : content) {
+        hash ^= static_cast<std::uint64_t>(ch);
+        hash *= 1099511628211ull;
+    }
+    std::ostringstream output;
+    output << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return output.str();
+}
+
+inline std::filesystem::path BuildTaskMemoryRoot(
+    const AgentConfig & config,
+    const std::string & goal_id) {
+    return std::filesystem::path(config.data_root) /
+        "task_memory" /
+        SanitizeTaskMemoryToken(goal_id);
+}
+
+inline bool WriteTaskMemoryTextFile(
+    const std::filesystem::path & path,
+    const std::string & content,
+    std::string * error_message) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        if (error_message != nullptr) {
+            *error_message = "failed to create parent directory: " + ec.message();
+        }
+        return false;
+    }
+    std::ofstream output(path, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!output.is_open()) {
+        if (error_message != nullptr) {
+            *error_message = "failed to open file for write: " + path.string();
+        }
+        return false;
+    }
+    output << content;
+    return true;
+}
+
+inline bool AppendTaskMemoryTextFile(
+    const std::filesystem::path & path,
+    const std::string & content,
+    std::string * error_message) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        if (error_message != nullptr) {
+            *error_message = "failed to create parent directory: " + ec.message();
+        }
+        return false;
+    }
+    std::ofstream output(path, std::ios::out | std::ios::app | std::ios::binary);
+    if (!output.is_open()) {
+        if (error_message != nullptr) {
+            *error_message = "failed to open file for append: " + path.string();
+        }
+        return false;
+    }
+    output << content;
+    return true;
+}
+
+inline std::string ReadTaskMemoryTextFile(const std::filesystem::path & path) {
+    std::ifstream input(path, std::ios::in | std::ios::binary);
+    if (!input.is_open()) {
+        return std::string();
+    }
+    std::ostringstream content;
+    content << input.rdbuf();
+    return content.str();
+}
+
+inline std::string JsonStringField(
+    const std::string & key,
+    const std::string & value,
+    bool comma = true) {
+    std::ostringstream output;
+    output << "\"" << JsonEscape(key) << "\":\"" << JsonEscape(value) << "\"";
+    if (comma) {
+        output << ",";
+    }
+    return output.str();
+}
+
+inline std::string TaskMemoryFirstNonEmpty(
+    const std::string & first,
+    const std::string & second,
+    const std::string & third = std::string()) {
+    if (!Trim(first).empty()) {
+        return first;
+    }
+    if (!Trim(second).empty()) {
+        return second;
+    }
+    return third;
+}
+
+inline std::string TaskMemoryParamStringOrRaw(
+    const JsonRequestView & params,
+    const std::string & key,
+    const std::string & fallback = std::string()) {
+    const std::string string_value = params.GetString(key);
+    if (!Trim(string_value).empty()) {
+        return string_value;
+    }
+    const std::string raw_value = params.GetRawJson(key);
+    if (!Trim(raw_value).empty()) {
+        return raw_value;
+    }
+    return fallback;
+}
+
+inline std::string TaskMemoryNormalizeNextCallJson(std::string value) {
+    value = Trim(value);
+    const std::string lowered = ToLowerAscii(value);
+    if (value == "\"\"" || value == "''" || lowered == "null") {
+        return std::string();
+    }
+    return value;
+}
+
+inline std::string BuildDefaultRagMigrationManifest(
+    const std::string & goal_id,
+    const std::string & trace_id) {
+    std::ostringstream output;
+    output
+        << "{\n"
+        << "  \"record_model\":\"rag_thread_incremental_index_manifest_v1\",\n"
+        << "  \"goal_id\":\"" << JsonEscape(goal_id) << "\",\n"
+        << "  \"trace_id\":\"" << JsonEscape(trace_id) << "\",\n"
+        << "  \"module_group\":\"rocksdb_incremental_index\",\n"
+        << "  \"migration_order\":[\"file_object_store\",\"kv_snapshot\",\"rocksdb_native\"],\n"
+        << "  \"source_files\":[\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/rag_storage.h\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/rag_storage.cpp\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/rag_server_runtime.h\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/rag_server_runtime.cpp\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/rag_integration_bridge.h\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/rag_integration_bridge.cpp\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/repo_scanner.h\",\n"
+        << "    \"D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/tools/server/RAG/src/repo_scanner.cpp\"\n"
+        << "  ],\n"
+        << "  \"entry_functions\":[\"ingest_slice\",\"append_step\",\"query_by_trace\",\"query_by_slice\",\"resume_context\"],\n"
+        << "  \"dependencies\":[\"filesystem\",\"json parser\",\"hash/checksum\",\"rocksdb optional\"],\n"
+        << "  \"storage_schema\":{\n"
+        << "    \"slice_key\":\"slice/{slice_id}\",\n"
+        << "    \"trace_key\":\"trace/{trace_id}/{step_id}\",\n"
+        << "    \"goal_key\":\"goal/{goal_id}\",\n"
+        << "    \"latest_key\":\"latest/{goal_id}\"\n"
+        << "  },\n"
+        << "  \"mcp_landing\":{\n"
+        << "    \"file_object_layer\":\"task_memory/{goal_id}\",\n"
+        << "    \"step_ledger\":\"step_ledger.jsonl\",\n"
+        << "    \"resume_context\":\"latest_resume_context.json\",\n"
+        << "    \"rocksdb_status\":\"deferred_optional_backend\"\n"
+        << "  }\n"
+        << "}\n";
+    return output.str();
+}
+
+inline std::string BuildGeneratedCurrentStateMarkdown(
+    const JsonRequestView & params,
+    const std::string & goal_id,
+    const std::string & trace_id) {
+    std::ostringstream output;
+    output
+        << "# RAG Thread Migration Current State\n\n"
+        << "- goal_id: " << goal_id << "\n"
+        << "- trace_id: " << trace_id << "\n"
+        << "- current_goal: " << params.GetString("current_goal") << "\n"
+        << "- current_scope: " << params.GetString("current_scope") << "\n"
+        << "- current_file: " << params.GetString("current_file") << "\n"
+        << "- last_status: " << params.GetString("last_status") << "\n"
+        << "- last_has_more: " << params.GetString("last_has_more", "unknown") << "\n"
+        << "- terminal_state: " << (params.GetBool("terminal_state", false) ? "true" : "false") << "\n"
+        << "- completion_claim_allowed: " << (params.GetBool("completion_claim_allowed", false) ? "true" : "false") << "\n"
+        << "- completed_step_count: " << params.GetInt("completed_step_count", 0) << "\n"
+        << "- remaining_work: " << params.GetString("remaining_work") << "\n\n"
+        << "## last next_call_json\n\n"
+        << "```json\n"
+        << TaskMemoryParamStringOrRaw(params, "next_call_json") << "\n"
+        << "```\n";
+    return output.str();
+}
+
+inline std::string BuildDefaultKeySlicesJsonl(
+    const JsonRequestView & params,
+    const std::string & goal_id,
+    const std::string & trace_id) {
+    const std::string summary = TaskMemoryFirstNonEmpty(
+        params.GetString("compact_summary"),
+        params.GetString("current_goal"),
+        "RAG thread migration state captured for MCP resume.");
+    const std::string seed = goal_id + "|" + trace_id + "|" + summary;
+    std::ostringstream output;
+    output
+        << "{"
+        << JsonStringField("slice_id", "rag-main-" + TaskMemoryStableChecksum(seed))
+        << JsonStringField("slice_type", "task_state")
+        << JsonStringField("summary", summary)
+        << JsonStringField("source_ref", params.GetString("source_ref"))
+        << JsonStringField("result_ref", params.GetString("result_ref"))
+        << JsonStringField("evidence_ref", params.GetString("evidence_ref"))
+        << JsonStringField("trace_id", trace_id)
+        << JsonStringField("dedup_hash", TaskMemoryStableChecksum(summary))
+        << JsonStringField("importance", "high", false)
+        << "}\n";
+    return output.str();
+}
+
+inline std::string BuildResumeContextJson(
+    const JsonRequestView & params,
+    const std::string & goal_id,
+    const std::string & trace_id,
+    int last_verified_step) {
+    const bool terminal_state = params.GetBool("terminal_state", false);
+    const bool completion_claim_allowed = params.GetBool("completion_claim_allowed", false) && terminal_state;
+    const std::string next_call_json = TaskMemoryNormalizeNextCallJson(
+        TaskMemoryParamStringOrRaw(params, "next_call_json"));
+    std::ostringstream output;
+    output
+        << "{\n"
+        << "  \"record_model\":\"mcp_resume_context_v1\",\n"
+        << "  \"updated_at\":\"" << JsonEscape(IsoTimestampNow()) << "\",\n"
+        << "  \"goal_id\":\"" << JsonEscape(goal_id) << "\",\n"
+        << "  \"trace_id\":\"" << JsonEscape(trace_id) << "\",\n"
+        << "  \"terminal_state\":" << (terminal_state ? "true" : "false") << ",\n"
+        << "  \"completion_claim_allowed\":" << (completion_claim_allowed ? "true" : "false") << ",\n"
+        << "  \"current_tool\":\"" << JsonEscape(params.GetString("current_tool")) << "\",\n"
+        << "  \"next_call_json\":\"" << JsonEscape(next_call_json) << "\",\n"
+        << "  \"compact_summary\":\"" << JsonEscape(params.GetString("compact_summary")) << "\",\n"
+        << "  \"last_verified_step\":" << last_verified_step << ",\n"
+        << "  \"remaining_work\":\"" << JsonEscape(params.GetString("remaining_work")) << "\",\n"
+        << "  \"next_allowed_action\":\"" << JsonEscape(params.GetString("next_allowed_action", "call next_call_json or append the next verified step")) << "\"\n"
+        << "}\n";
+    return output.str();
+}
+
+inline std::string BuildTaskMemoryJson(
+    const std::string & goal_id,
+    const std::string & trace_id,
+    const std::filesystem::path & root,
+    const std::filesystem::path & migration_dir) {
+    std::ostringstream output;
+    output
+        << "{\n"
+        << "  \"record_model\":\"mcp_task_memory_v1\",\n"
+        << "  \"goal_id\":\"" << JsonEscape(goal_id) << "\",\n"
+        << "  \"trace_id\":\"" << JsonEscape(trace_id) << "\",\n"
+        << "  \"created_at\":\"" << JsonEscape(IsoTimestampNow()) << "\",\n"
+        << "  \"storage_order\":[\"file_object_store\",\"kv_snapshot\",\"rocksdb_native\"],\n"
+        << "  \"root_path\":\"" << JsonEscape(root.string()) << "\",\n"
+        << "  \"migration_dir\":\"" << JsonEscape(migration_dir.string()) << "\",\n"
+        << "  \"artifacts\":{\n"
+        << "    \"current_state\":\"" << JsonEscape((migration_dir / "1_current_state.md").string()) << "\",\n"
+        << "    \"key_slices\":\"" << JsonEscape((migration_dir / "2_key_slices.jsonl").string()) << "\",\n"
+        << "    \"incremental_index_manifest\":\"" << JsonEscape((migration_dir / "3_incremental_index_manifest.json").string()) << "\",\n"
+        << "    \"migration_handover\":\"" << JsonEscape((migration_dir / "4_migration_handover.md").string()) << "\",\n"
+        << "    \"step_ledger\":\"" << JsonEscape((root / "step_ledger.jsonl").string()) << "\",\n"
+        << "    \"slices\":\"" << JsonEscape((root / "slices.jsonl").string()) << "\",\n"
+        << "    \"index_manifest\":\"" << JsonEscape((root / "index_manifest.json").string()) << "\",\n"
+        << "    \"latest_resume_context\":\"" << JsonEscape((root / "latest_resume_context.json").string()) << "\"\n"
+        << "  }\n"
+        << "}\n";
+    return output.str();
+}
+
+inline std::string BuildMigrationHandoverMarkdown(
+    const std::string & goal_id,
+    const std::string & trace_id) {
+    std::ostringstream output;
+    output
+        << "# RAG Thread Migration Handover\n\n"
+        << "Goal: make the next model continue from MCP assets instead of full chat history.\n\n"
+        << "- goal_id: " << goal_id << "\n"
+        << "- trace_id: " << trace_id << "\n"
+        << "- read first: latest_resume_context.json\n"
+        << "- then inspect: step_ledger.jsonl, slices.jsonl, index_manifest.json\n\n"
+        << "Rules:\n"
+        << "- Do not claim completion when completion_claim_allowed=false.\n"
+        << "- Continue only through next_call_json or a bounded verified step.\n"
+        << "- Append every verified step to step_ledger.jsonl.\n"
+        << "- Keep RocksDB as a later optional backend; file object storage is the current source of truth.\n";
+    return output.str();
+}
+
+inline int TaskMemoryExtractIntField(
+    const std::string & json,
+    const std::string & key,
+    int fallback = 0) {
+    const std::string raw = ExtractJsonRawValue(json, key);
+    if (Trim(raw).empty()) {
+        return fallback;
+    }
+    try {
+        return std::stoi(raw);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+inline bool TaskMemoryExtractBoolField(
+    const std::string & json,
+    const std::string & key,
+    bool fallback = false) {
+    const std::string raw = ExtractJsonRawValue(json, key);
+    if (raw == "true") {
+        return true;
+    }
+    if (raw == "false") {
+        return false;
+    }
+    return fallback;
+}
+
+inline bool TaskMemoryFileExistsNonEmpty(const std::filesystem::path & path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec)
+        && !ec
+        && std::filesystem::is_regular_file(path, ec)
+        && !ec
+        && std::filesystem::file_size(path, ec) > 0
+        && !ec;
+}
+
+inline std::string TaskMemoryJoinCsv(const std::vector<std::string> & items) {
+    std::ostringstream output;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) {
+            output << ",";
+        }
+        output << items[i];
+    }
+    return output.str();
+}
+
+inline std::string TaskMemoryJsonPreview(const std::string & value, std::size_t max_chars = 240) {
+    std::string compact;
+    compact.reserve(std::min(value.size(), max_chars));
+    bool previous_space = false;
+    for (char ch : value) {
+        const bool is_space = ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ';
+        if (is_space) {
+            if (!previous_space && !compact.empty()) {
+                compact.push_back(' ');
+            }
+            previous_space = true;
+        } else {
+            compact.push_back(ch);
+            previous_space = false;
+        }
+        if (compact.size() >= max_chars) {
+            compact.resize(max_chars);
+            break;
+        }
+    }
+    return compact;
+}
+
+inline void AppendTaskMemoryKvRecord(
+    std::ostringstream & output,
+    const std::string & key,
+    const std::string & kind,
+    const std::string & goal_id,
+    const std::string & trace_id,
+    const std::string & source_path,
+    const std::string & value,
+    const std::string & step_id = std::string(),
+    const std::string & slice_id = std::string(),
+    const std::string & budget_run_id = std::string()) {
+    output
+        << "{"
+        << JsonStringField("record_model", "mcp_task_memory_kv_record_v1")
+        << JsonStringField("key", key)
+        << JsonStringField("kind", kind)
+        << JsonStringField("goal_id", goal_id)
+        << JsonStringField("trace_id", trace_id)
+        << JsonStringField("step_id", step_id)
+        << JsonStringField("slice_id", slice_id)
+        << JsonStringField("budget_run_id", budget_run_id)
+        << JsonStringField("source_path", source_path)
+        << JsonStringField("value_ref", source_path)
+        << JsonStringField("value_hash", TaskMemoryStableChecksum(value))
+        << JsonStringField("preview", TaskMemoryJsonPreview(value), false)
+        << "}\n";
+}
+
+inline std::string TaskMemoryBuildLookupKey(
+    const std::string & goal_id,
+    const JsonRequestView & params,
+    bool * prefix_match) {
+    if (prefix_match != nullptr) {
+        *prefix_match = false;
+    }
+    const std::string explicit_key = params.GetString("key");
+    if (!Trim(explicit_key).empty()) {
+        if (params.GetBool("prefix", false) && prefix_match != nullptr) {
+            *prefix_match = true;
+        }
+        return explicit_key;
+    }
+
+    const std::string kind = params.GetString("kind");
+    if (kind == "goal") {
+        return "goal/" + goal_id;
+    }
+    if (kind == "latest" || kind == "resume_context") {
+        return "latest/" + goal_id;
+    }
+    if (kind == "slice") {
+        return "slice/" + params.GetString("slice_id");
+    }
+    if (kind == "budget") {
+        return "budget/" + params.GetString("budget_run_id");
+    }
+    if (kind == "trace_step") {
+        return "trace/" + params.GetString("trace_id") + "/step/" + params.GetString("step_id");
+    }
+    if (kind == "trace_budget") {
+        return "trace/" + params.GetString("trace_id") + "/budget/" + params.GetString("budget_run_id");
+    }
+    if (kind == "trace" || !Trim(params.GetString("trace_id")).empty()) {
+        if (Trim(params.GetString("trace_id")).empty()) {
+            return std::string();
+        }
+        if (prefix_match != nullptr) {
+            *prefix_match = true;
+        }
+        return "trace/" + params.GetString("trace_id") + "/";
+    }
+    return std::string();
+}
+
+inline CommandResult BuildTaskMemoryFreezeResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        result.fields["next_action"] = "provide goal_id before freezing task memory";
+        return result;
+    }
+
+    const std::string trace_id = params.GetString("trace_id", "TRACE-" + TaskMemoryStableChecksum(goal_id));
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    const std::filesystem::path migration_dir = root / "rag_thread_migration";
+    const std::filesystem::path evidence_dir = root / "evidence_refs";
+
+    const std::string current_state = TaskMemoryFirstNonEmpty(
+        params.GetString("current_state_markdown"),
+        BuildGeneratedCurrentStateMarkdown(params, goal_id, trace_id));
+    const std::string slices_jsonl = TaskMemoryFirstNonEmpty(
+        params.GetString("key_slices_jsonl"),
+        BuildDefaultKeySlicesJsonl(params, goal_id, trace_id));
+    const std::string manifest = TaskMemoryFirstNonEmpty(
+        TaskMemoryParamStringOrRaw(params, "incremental_index_manifest_json"),
+        BuildDefaultRagMigrationManifest(goal_id, trace_id));
+    const std::string handover = TaskMemoryFirstNonEmpty(
+        params.GetString("migration_handover_markdown"),
+        BuildMigrationHandoverMarkdown(goal_id, trace_id));
+    const std::string resume_context = BuildResumeContextJson(
+        params,
+        goal_id,
+        trace_id,
+        std::max(0, params.GetInt("completed_step_count", 0)));
+
+    std::error_code ec;
+    std::filesystem::create_directories(evidence_dir, ec);
+    if (ec) {
+        result.ok = false;
+        result.exit_code = 501;
+        result.fields["error"] = "failed to create evidence_refs directory: " + ec.message();
+        return result;
+    }
+
+    std::string error;
+    const std::vector<std::pair<std::filesystem::path, std::string>> writes = {
+        {migration_dir / "1_current_state.md", current_state},
+        {migration_dir / "2_key_slices.jsonl", slices_jsonl},
+        {migration_dir / "3_incremental_index_manifest.json", manifest},
+        {migration_dir / "4_migration_handover.md", handover},
+        {root / "task_memory.json", BuildTaskMemoryJson(goal_id, trace_id, root, migration_dir)},
+        {root / "slices.jsonl", slices_jsonl},
+        {root / "index_manifest.json", manifest},
+        {root / "latest_resume_context.json", resume_context}
+    };
+    for (const auto & item : writes) {
+        if (!WriteTaskMemoryTextFile(item.first, item.second, &error)) {
+            result.ok = false;
+            result.exit_code = 502;
+            result.fields["error"] = error;
+            result.fields["failed_path"] = item.first.string();
+            return result;
+        }
+    }
+
+    std::ostringstream ledger_record;
+    ledger_record
+        << "{"
+        << JsonStringField("record_model", "mcp_step_ledger_entry_v1")
+        << JsonStringField("timestamp", IsoTimestampNow())
+        << JsonStringField("goal_id", goal_id)
+        << JsonStringField("trace_id", trace_id)
+        << JsonStringField("step_kind", "freeze")
+        << JsonStringField("status", params.GetString("last_status", "frozen"))
+        << JsonStringField("summary", params.GetString("compact_summary"))
+        << "\"step_index\":" << std::max(0, params.GetInt("completed_step_count", 0)) << ","
+        << "\"terminal_state\":" << (params.GetBool("terminal_state", false) ? "true" : "false") << ","
+        << "\"completion_claim_allowed\":" << (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false) ? "true" : "false")
+        << "}\n";
+    if (!AppendTaskMemoryTextFile(root / "step_ledger.jsonl", ledger_record.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 503;
+        result.fields["error"] = error;
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_freeze_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["trace_id"] = trace_id;
+    result.fields["task_memory_root"] = root.string();
+    result.fields["migration_dir"] = migration_dir.string();
+    result.fields["current_state_path"] = (migration_dir / "1_current_state.md").string();
+    result.fields["key_slices_path"] = (migration_dir / "2_key_slices.jsonl").string();
+    result.fields["incremental_index_manifest_path"] = (migration_dir / "3_incremental_index_manifest.json").string();
+    result.fields["migration_handover_path"] = (migration_dir / "4_migration_handover.md").string();
+    result.fields["task_memory_path"] = (root / "task_memory.json").string();
+    result.fields["step_ledger_path"] = (root / "step_ledger.jsonl").string();
+    result.fields["slices_path"] = (root / "slices.jsonl").string();
+    result.fields["index_manifest_path"] = (root / "index_manifest.json").string();
+    result.fields["resume_context_path"] = (root / "latest_resume_context.json").string();
+    result.fields["completion_claim_allowed"] =
+        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+    result.fields["terminal_state"] = params.GetBool("terminal_state", false) ? "true" : "false";
+    result.fields["task_done"] = params.GetBool("terminal_state", false) ? "true" : "false";
+    result.fields["final_answer_allowed"] =
+        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+    result.fields["assistant_response_allowed"] =
+        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+    result.fields["must_continue_until"] = params.GetBool("terminal_state", false) ? "" : "terminal_state=true";
+    result.fields["semantic_outcome"] = "task_memory_frozen";
+    result.fields["next_action"] = "read lan_agent_task_memory_resume_context before continuing this goal";
+    result.fields["result_ref"] = (root / "latest_resume_context.json").string();
+    result.fields["evidence_ref"] = (migration_dir / "4_migration_handover.md").string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryAppendStepResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+    const std::string trace_id = params.GetString("trace_id", "TRACE-" + TaskMemoryStableChecksum(goal_id));
+    const int step_index = std::max(0, params.GetInt("step_index", 0));
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    const std::filesystem::path ledger_path = root / "step_ledger.jsonl";
+
+    std::ostringstream record;
+    record
+        << "{"
+        << JsonStringField("record_model", "mcp_step_ledger_entry_v1")
+        << JsonStringField("timestamp", IsoTimestampNow())
+        << JsonStringField("goal_id", goal_id)
+        << JsonStringField("trace_id", trace_id)
+        << JsonStringField("step_id", params.GetString("step_id", "step-" + std::to_string(step_index)))
+        << JsonStringField("step_kind", params.GetString("step_kind", "verified_step"))
+        << JsonStringField("current_tool", params.GetString("current_tool"))
+        << JsonStringField("status", params.GetString("status", "observed"))
+        << JsonStringField("summary", params.GetString("summary"))
+        << JsonStringField("result_ref", params.GetString("result_ref"))
+        << JsonStringField("evidence_ref", params.GetString("evidence_ref"))
+        << JsonStringField("next_call_json", TaskMemoryParamStringOrRaw(params, "next_call_json"))
+        << "\"step_index\":" << step_index << ","
+        << "\"has_more\":" << (params.GetBool("has_more", false) ? "true" : "false") << ","
+        << "\"terminal_state\":" << (params.GetBool("terminal_state", false) ? "true" : "false") << ","
+        << "\"completion_claim_allowed\":" << (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false) ? "true" : "false")
+        << "}\n";
+
+    std::string error;
+    if (!AppendTaskMemoryTextFile(ledger_path, record.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 502;
+        result.fields["error"] = error;
+        return result;
+    }
+
+    const std::string resume_context = BuildResumeContextJson(params, goal_id, trace_id, step_index);
+    if (!WriteTaskMemoryTextFile(root / "latest_resume_context.json", resume_context, &error)) {
+        result.ok = false;
+        result.exit_code = 503;
+        result.fields["error"] = error;
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_append_step_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["trace_id"] = trace_id;
+    result.fields["step_index"] = std::to_string(step_index);
+    result.fields["step_ledger_path"] = ledger_path.string();
+    result.fields["resume_context_path"] = (root / "latest_resume_context.json").string();
+    result.fields["completion_claim_allowed"] =
+        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+    result.fields["terminal_state"] = params.GetBool("terminal_state", false) ? "true" : "false";
+    result.fields["task_done"] = params.GetBool("terminal_state", false) ? "true" : "false";
+    result.fields["final_answer_allowed"] =
+        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+    result.fields["assistant_response_allowed"] =
+        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+    result.fields["must_continue_until"] = params.GetBool("terminal_state", false) ? "" : "terminal_state=true";
+    result.fields["semantic_outcome"] = "task_memory_step_appended";
+    result.fields["next_action"] = "continue with next_call_json while completion_claim_allowed=false";
+    result.fields["result_ref"] = (root / "latest_resume_context.json").string();
+    result.fields["evidence_ref"] = ledger_path.string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryExecuteContinuationBudgetResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+
+    const int max_steps = std::min(64, std::max(1, params.GetInt("max_steps", params.GetInt("step_budget", 1))));
+    const bool dry_run = params.GetBool("dry_run", true);
+    const bool execute = params.GetBool("execute", false);
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    const std::filesystem::path resume_path = root / "latest_resume_context.json";
+    const std::string resume_context = ReadTaskMemoryTextFile(resume_path);
+    if (resume_context.empty()) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "resume context not found";
+        result.fields["resume_context_path"] = resume_path.string();
+        result.fields["next_action"] = "call lan_agent_task_memory_freeze first";
+        return result;
+    }
+
+    const std::string trace_id = TaskMemoryFirstNonEmpty(
+        params.GetString("trace_id"),
+        ExtractJsonString(resume_context, "trace_id"),
+        "TRACE-" + TaskMemoryStableChecksum(goal_id));
+    const int last_verified_step = TaskMemoryExtractIntField(resume_context, "last_verified_step", 0);
+    const bool terminal_state = TaskMemoryExtractBoolField(resume_context, "terminal_state", false);
+    const bool completion_claim_allowed =
+        TaskMemoryExtractBoolField(resume_context, "completion_claim_allowed", false) && terminal_state;
+    const std::string next_call_json = ExtractJsonString(resume_context, "next_call_json");
+    const bool has_next_call = !Trim(next_call_json).empty();
+    const bool can_plan_next = !terminal_state && has_next_call;
+    const int planned_step_count = can_plan_next ? 1 : 0;
+    const std::string now = IsoTimestampNow();
+    const std::string budget_run_id = "budget-" + TaskMemoryStableChecksum(
+        goal_id + "|" + trace_id + "|" + std::to_string(last_verified_step) + "|" + now);
+    const std::filesystem::path budget_dir = root / "budget_runs";
+    const std::filesystem::path budget_path = budget_dir / (budget_run_id + ".json");
+    const std::string execution_mode = (execute && !dry_run)
+        ? "execute_requested_but_deferred_to_explicit_tool_call"
+        : "plan_only";
+    const std::string budget_status = terminal_state
+        ? "terminal_no_work"
+        : (has_next_call ? "next_call_planned" : "blocked_missing_next_call_json");
+
+    std::ostringstream plan;
+    plan
+        << "{\n"
+        << "  \"record_model\":\"mcp_continuation_budget_plan_v1\",\n"
+        << "  \"budget_run_id\":\"" << JsonEscape(budget_run_id) << "\",\n"
+        << "  \"goal_id\":\"" << JsonEscape(goal_id) << "\",\n"
+        << "  \"trace_id\":\"" << JsonEscape(trace_id) << "\",\n"
+        << "  \"created_at\":\"" << JsonEscape(now) << "\",\n"
+        << "  \"execution_mode\":\"" << JsonEscape(execution_mode) << "\",\n"
+        << "  \"budget_status\":\"" << JsonEscape(budget_status) << "\",\n"
+        << "  \"max_steps\":" << max_steps << ",\n"
+        << "  \"planned_step_count\":" << planned_step_count << ",\n"
+        << "  \"last_verified_step\":" << last_verified_step << ",\n"
+        << "  \"terminal_state\":" << (terminal_state ? "true" : "false") << ",\n"
+        << "  \"completion_claim_allowed\":" << (completion_claim_allowed ? "true" : "false") << ",\n"
+        << "  \"next_call_json\":\"" << JsonEscape(next_call_json) << "\",\n"
+        << "  \"required_followup\":\""
+        << JsonEscape(can_plan_next ? "call next_call_json explicitly, then append verified result" : "inspect resume_context and repair continuation state")
+        << "\"\n"
+        << "}\n";
+
+    std::string error;
+    if (!WriteTaskMemoryTextFile(budget_path, plan.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 502;
+        result.fields["error"] = error;
+        result.fields["failed_path"] = budget_path.string();
+        return result;
+    }
+
+    std::ostringstream ledger_record;
+    ledger_record
+        << "{"
+        << JsonStringField("record_model", "mcp_step_ledger_entry_v1")
+        << JsonStringField("timestamp", now)
+        << JsonStringField("goal_id", goal_id)
+        << JsonStringField("trace_id", trace_id)
+        << JsonStringField("step_id", budget_run_id)
+        << JsonStringField("step_kind", "continuation_budget_plan")
+        << JsonStringField("status", budget_status)
+        << JsonStringField("summary", "continuation budget evaluated from resume_context")
+        << JsonStringField("result_ref", resume_path.string())
+        << JsonStringField("evidence_ref", budget_path.string())
+        << JsonStringField("next_call_json", next_call_json)
+        << "\"step_index\":" << last_verified_step << ","
+        << "\"planned_step_count\":" << planned_step_count << ","
+        << "\"max_steps\":" << max_steps << ","
+        << "\"terminal_state\":" << (terminal_state ? "true" : "false") << ","
+        << "\"completion_claim_allowed\":" << (completion_claim_allowed ? "true" : "false")
+        << "}\n";
+    if (!AppendTaskMemoryTextFile(root / "step_ledger.jsonl", ledger_record.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 503;
+        result.fields["error"] = error;
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_execute_continuation_budget_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["trace_id"] = trace_id;
+    result.fields["budget_run_id"] = budget_run_id;
+    result.fields["budget_status"] = budget_status;
+    result.fields["execution_mode"] = execution_mode;
+    result.fields["dry_run"] = dry_run ? "true" : "false";
+    result.fields["execute_requested"] = execute ? "true" : "false";
+    result.fields["execution_deferred"] = "true";
+    result.fields["max_steps"] = std::to_string(max_steps);
+    result.fields["planned_step_count"] = std::to_string(planned_step_count);
+    result.fields["last_verified_step"] = std::to_string(last_verified_step);
+    result.fields["resume_context_path"] = resume_path.string();
+    result.fields["budget_plan_path"] = budget_path.string();
+    result.fields["step_ledger_path"] = (root / "step_ledger.jsonl").string();
+    result.fields["terminal_state"] = terminal_state ? "true" : "false";
+    result.fields["completion_claim_allowed"] = completion_claim_allowed ? "true" : "false";
+    result.fields["task_done"] = terminal_state ? "true" : "false";
+    result.fields["continue_required"] = can_plan_next ? "true" : "false";
+    result.fields["auto_continue_required"] = can_plan_next ? "true" : "false";
+    result.fields["assistant_response_allowed"] = completion_claim_allowed ? "true" : "false";
+    result.fields["final_answer_allowed"] = completion_claim_allowed ? "true" : "false";
+    result.fields["must_continue_until"] = terminal_state ? "" : "terminal_state=true";
+    result.fields["next_call_json"] = next_call_json;
+    result.fields["semantic_outcome"] = "continuation_budget_planned";
+    result.fields["next_action"] = can_plan_next
+        ? "call next_call_json explicitly, then lan_agent_task_memory_append_step with verified evidence"
+        : "repair or refresh latest_resume_context before continuing";
+    result.fields["result_ref"] = resume_path.string();
+    result.fields["evidence_ref"] = budget_path.string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryBuildKvSnapshotResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    if (!std::filesystem::exists(root)) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "task memory root not found";
+        result.fields["task_memory_root"] = root.string();
+        result.fields["next_action"] = "call lan_agent_task_memory_freeze first";
+        return result;
+    }
+
+    const std::filesystem::path snapshot_dir = root / "kv_snapshot";
+    const std::filesystem::path index_path = snapshot_dir / "index.jsonl";
+    const std::filesystem::path manifest_path = snapshot_dir / "manifest.json";
+    std::ostringstream index;
+    int record_count = 0;
+    int step_record_count = 0;
+    int slice_record_count = 0;
+    int budget_record_count = 0;
+
+    const auto add_file_record = [&](const std::filesystem::path & path, const std::string & key, const std::string & kind) {
+        const std::string value = ReadTaskMemoryTextFile(path);
+        if (value.empty()) {
+            return;
+        }
+        AppendTaskMemoryKvRecord(
+            index,
+            key,
+            kind,
+            goal_id,
+            ExtractJsonString(value, "trace_id"),
+            path.string(),
+            value);
+        ++record_count;
+    };
+
+    add_file_record(root / "task_memory.json", "goal/" + goal_id, "goal");
+    add_file_record(root / "latest_resume_context.json", "latest/" + goal_id, "latest");
+
+    const std::filesystem::path ledger_path = root / "step_ledger.jsonl";
+    {
+        std::istringstream lines(ReadTaskMemoryTextFile(ledger_path));
+        std::string line;
+        int fallback_index = 0;
+        while (std::getline(lines, line)) {
+            line = Trim(line);
+            if (line.empty()) {
+                continue;
+            }
+            const std::string trace_id = ExtractJsonString(line, "trace_id");
+            std::string step_id = ExtractJsonString(line, "step_id");
+            if (step_id.empty()) {
+                const std::string step_index = ExtractJsonRawValue(line, "step_index");
+                step_id = step_index.empty() ? std::to_string(fallback_index) : step_index;
+            }
+            AppendTaskMemoryKvRecord(
+                index,
+                "trace/" + trace_id + "/step/" + step_id,
+                "trace_step",
+                goal_id,
+                trace_id,
+                ledger_path.string(),
+                line,
+                step_id);
+            ++record_count;
+            ++step_record_count;
+            ++fallback_index;
+        }
+    }
+
+    const std::filesystem::path slices_path = root / "slices.jsonl";
+    {
+        std::istringstream lines(ReadTaskMemoryTextFile(slices_path));
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = Trim(line);
+            if (line.empty()) {
+                continue;
+            }
+            const std::string slice_id = ExtractJsonString(line, "slice_id");
+            const std::string trace_id = ExtractJsonString(line, "trace_id");
+            if (!slice_id.empty()) {
+                AppendTaskMemoryKvRecord(
+                    index,
+                    "slice/" + slice_id,
+                    "slice",
+                    goal_id,
+                    trace_id,
+                    slices_path.string(),
+                    line,
+                    std::string(),
+                    slice_id);
+                ++record_count;
+                ++slice_record_count;
+            }
+        }
+    }
+
+    const std::filesystem::path budget_dir = root / "budget_runs";
+    if (std::filesystem::exists(budget_dir)) {
+        for (const auto & entry : std::filesystem::directory_iterator(budget_dir)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+                continue;
+            }
+            const std::string value = ReadTaskMemoryTextFile(entry.path());
+            if (value.empty()) {
+                continue;
+            }
+            const std::string budget_run_id = TaskMemoryFirstNonEmpty(
+                ExtractJsonString(value, "budget_run_id"),
+                entry.path().stem().string());
+            const std::string trace_id = ExtractJsonString(value, "trace_id");
+            AppendTaskMemoryKvRecord(
+                index,
+                "budget/" + budget_run_id,
+                "budget",
+                goal_id,
+                trace_id,
+                entry.path().string(),
+                value,
+                std::string(),
+                std::string(),
+                budget_run_id);
+            ++record_count;
+            ++budget_record_count;
+            if (!trace_id.empty()) {
+                AppendTaskMemoryKvRecord(
+                    index,
+                    "trace/" + trace_id + "/budget/" + budget_run_id,
+                    "trace_budget",
+                    goal_id,
+                    trace_id,
+                    entry.path().string(),
+                    value,
+                    std::string(),
+                    std::string(),
+                    budget_run_id);
+                ++record_count;
+            }
+        }
+    }
+
+    std::string error;
+    if (!WriteTaskMemoryTextFile(index_path, index.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 502;
+        result.fields["error"] = error;
+        result.fields["failed_path"] = index_path.string();
+        return result;
+    }
+
+    std::ostringstream manifest;
+    manifest
+        << "{\n"
+        << "  \"record_model\":\"mcp_task_memory_kv_snapshot_manifest_v1\",\n"
+        << "  \"goal_id\":\"" << JsonEscape(goal_id) << "\",\n"
+        << "  \"created_at\":\"" << JsonEscape(IsoTimestampNow()) << "\",\n"
+        << "  \"backend\":\"file_jsonl_snapshot\",\n"
+        << "  \"index_path\":\"" << JsonEscape(index_path.string()) << "\",\n"
+        << "  \"record_count\":" << record_count << ",\n"
+        << "  \"step_record_count\":" << step_record_count << ",\n"
+        << "  \"slice_record_count\":" << slice_record_count << ",\n"
+        << "  \"budget_record_count\":" << budget_record_count << ",\n"
+        << "  \"rocksdb_status\":\"deferred_optional_backend\"\n"
+        << "}\n";
+    if (!WriteTaskMemoryTextFile(manifest_path, manifest.str(), &error)) {
+        result.ok = false;
+        result.exit_code = 503;
+        result.fields["error"] = error;
+        result.fields["failed_path"] = manifest_path.string();
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_kv_snapshot_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["task_memory_root"] = root.string();
+    result.fields["kv_backend"] = "file_jsonl_snapshot";
+    result.fields["kv_snapshot_dir"] = snapshot_dir.string();
+    result.fields["kv_index_path"] = index_path.string();
+    result.fields["kv_manifest_path"] = manifest_path.string();
+    result.fields["record_count"] = std::to_string(record_count);
+    result.fields["step_record_count"] = std::to_string(step_record_count);
+    result.fields["slice_record_count"] = std::to_string(slice_record_count);
+    result.fields["budget_record_count"] = std::to_string(budget_record_count);
+    result.fields["rocksdb_status"] = "deferred_optional_backend";
+    result.fields["semantic_outcome"] = "task_memory_kv_snapshot_built";
+    result.fields["next_action"] = "call lan_agent_task_memory_kv_lookup with key or kind filters";
+    result.fields["result_ref"] = index_path.string();
+    result.fields["evidence_ref"] = manifest_path.string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryKvLookupResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+
+    bool prefix_match = false;
+    const std::string lookup_key = TaskMemoryBuildLookupKey(goal_id, params, &prefix_match);
+    if (Trim(lookup_key).empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "key or lookup selector is required";
+        result.fields["next_action"] = "provide key, kind=latest, kind=goal, kind=trace with trace_id, kind=slice with slice_id, or kind=budget with budget_run_id";
+        return result;
+    }
+
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    const std::filesystem::path index_path = root / "kv_snapshot" / "index.jsonl";
+    const std::string index_text = ReadTaskMemoryTextFile(index_path);
+    if (index_text.empty()) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "kv snapshot index not found";
+        result.fields["kv_index_path"] = index_path.string();
+        result.fields["next_action"] = "call lan_agent_task_memory_build_kv_snapshot first";
+        return result;
+    }
+
+    const int limit = std::max(1, params.GetInt("limit", 16));
+    const int offset = std::max(0, params.GetInt("offset", 0));
+    const bool include_value = params.GetBool("include_value", false);
+    std::istringstream lines(index_text);
+    std::string line;
+    std::ostringstream matches;
+    int total_matches = 0;
+    int emitted = 0;
+    std::string first_value;
+    std::string first_value_ref;
+    while (std::getline(lines, line)) {
+        line = Trim(line);
+        if (line.empty()) {
+            continue;
+        }
+        const std::string key = ExtractJsonString(line, "key");
+        const bool matched = prefix_match
+            ? key.rfind(lookup_key, 0) == 0
+            : key == lookup_key;
+        if (!matched) {
+            continue;
+        }
+        if (total_matches >= offset && emitted < limit) {
+            matches << line << "\n";
+            ++emitted;
+            if (include_value && first_value.empty()) {
+                first_value_ref = ExtractJsonString(line, "value_ref");
+                first_value = ReadTaskMemoryTextFile(std::filesystem::path(first_value_ref));
+            }
+        }
+        ++total_matches;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_kv_lookup_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["lookup_key"] = lookup_key;
+    result.fields["prefix_match"] = prefix_match ? "true" : "false";
+    result.fields["kv_backend"] = "file_jsonl_snapshot";
+    result.fields["kv_index_path"] = index_path.string();
+    result.fields["limit"] = std::to_string(limit);
+    result.fields["offset"] = std::to_string(offset);
+    result.fields["matched_count"] = std::to_string(total_matches);
+    result.fields["returned_count"] = std::to_string(emitted);
+    result.fields["has_more"] = (offset + emitted < total_matches) ? "true" : "false";
+    result.fields["next_offset"] = std::to_string(offset + emitted);
+    result.fields["matches_jsonl"] = matches.str();
+    result.fields["include_value"] = include_value ? "true" : "false";
+    result.fields["value_ref"] = first_value_ref;
+    result.fields["value_text"] = first_value;
+    result.fields["semantic_outcome"] = total_matches > 0 ? "task_memory_kv_lookup_hit" : "task_memory_kv_lookup_miss";
+    result.fields["next_action"] = (offset + emitted < total_matches)
+        ? "repeat lan_agent_task_memory_kv_lookup with next_offset"
+        : "use matches_jsonl value_ref to inspect source evidence";
+    result.fields["result_ref"] = index_path.string();
+    result.fields["evidence_ref"] = index_path.string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryMigrationAssessResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    const std::filesystem::path migration_dir = root / "rag_thread_migration";
+    const std::filesystem::path resume_path = root / "latest_resume_context.json";
+    const std::filesystem::path ledger_path = root / "step_ledger.jsonl";
+    const std::filesystem::path slices_path = root / "slices.jsonl";
+    const std::filesystem::path task_memory_path = root / "task_memory.json";
+    const std::filesystem::path index_manifest_path = root / "index_manifest.json";
+    const std::filesystem::path kv_index_path = root / "kv_snapshot" / "index.jsonl";
+    const std::filesystem::path kv_manifest_path = root / "kv_snapshot" / "manifest.json";
+
+    const std::vector<std::pair<std::string, std::filesystem::path>> file_object_files = {
+        {"task_memory", task_memory_path},
+        {"step_ledger", ledger_path},
+        {"slices", slices_path},
+        {"index_manifest", index_manifest_path},
+        {"latest_resume_context", resume_path}
+    };
+    const std::vector<std::pair<std::string, std::filesystem::path>> migration_files = {
+        {"current_state", migration_dir / "1_current_state.md"},
+        {"key_slices", migration_dir / "2_key_slices.jsonl"},
+        {"incremental_index_manifest", migration_dir / "3_incremental_index_manifest.json"},
+        {"migration_handover", migration_dir / "4_migration_handover.md"}
+    };
+
+    int ready_file_count = 0;
+    std::vector<std::string> missing_file_objects;
+    for (const auto & item : file_object_files) {
+        if (TaskMemoryFileExistsNonEmpty(item.second)) {
+            ++ready_file_count;
+        } else {
+            missing_file_objects.push_back(item.first);
+        }
+    }
+
+    int ready_migration_count = 0;
+    std::vector<std::string> missing_migration_files;
+    for (const auto & item : migration_files) {
+        if (TaskMemoryFileExistsNonEmpty(item.second)) {
+            ++ready_migration_count;
+        } else {
+            missing_migration_files.push_back(item.first);
+        }
+    }
+
+    const bool file_object_ready = missing_file_objects.empty();
+    const bool migration_bundle_ready = missing_migration_files.empty();
+    const bool kv_snapshot_ready =
+        TaskMemoryFileExistsNonEmpty(kv_index_path) &&
+        TaskMemoryFileExistsNonEmpty(kv_manifest_path);
+    const std::string kv_manifest = ReadTaskMemoryTextFile(kv_manifest_path);
+    const int kv_record_count = TaskMemoryExtractIntField(kv_manifest, "record_count", 0);
+    const int step_record_count = TaskMemoryExtractIntField(kv_manifest, "step_record_count", 0);
+    const int slice_record_count = TaskMemoryExtractIntField(kv_manifest, "slice_record_count", 0);
+    const int budget_record_count = TaskMemoryExtractIntField(kv_manifest, "budget_record_count", 0);
+    const bool kv_contract_ready = kv_snapshot_ready && kv_record_count > 0;
+    const bool rocksdb_native_ready = false;
+    const bool safe_to_enable_rocksdb_adapter = file_object_ready && migration_bundle_ready && kv_contract_ready;
+    const bool safe_to_replace_source_of_truth = false;
+
+    std::string adaptation_decision;
+    std::string next_action;
+    if (!std::filesystem::exists(root)) {
+        adaptation_decision = "BLOCKED_TASK_MEMORY_ROOT_MISSING";
+        next_action = "call lan_agent_task_memory_freeze first";
+    } else if (!file_object_ready || !migration_bundle_ready) {
+        adaptation_decision = "BLOCKED_FILE_OBJECT_LAYER_INCOMPLETE";
+        next_action = "repair missing task_memory files or rerun lan_agent_task_memory_freeze";
+    } else if (!kv_contract_ready) {
+        adaptation_decision = "BLOCKED_KV_SNAPSHOT_MISSING_OR_EMPTY";
+        next_action = "call lan_agent_task_memory_build_kv_snapshot";
+    } else {
+        adaptation_decision = "READY_FOR_ROCKSDB_ADAPTER_IMPLEMENTATION";
+        next_action = "implement RocksDB adapter as optional dual-write/read-parity backend; keep file object store as source of truth until parity passes";
+    }
+
+    const std::string active_backend = kv_contract_ready ? "file_jsonl_snapshot" : "file_object_store";
+    const std::string resume_context = ReadTaskMemoryTextFile(resume_path);
+    result.fields["record_model"] = "mcp_task_memory_migration_assessment_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["task_memory_root"] = root.string();
+    result.fields["migration_stage"] = "stage4_pre_rocksdb_adapter_assessment";
+    result.fields["adaptation_decision"] = adaptation_decision;
+    result.fields["active_backend"] = active_backend;
+    result.fields["source_of_truth"] = "file_object_store";
+    result.fields["backend_order"] = "[\"file_object_store\",\"kv_snapshot\",\"rocksdb_native\"]";
+    result.fields["file_object_ready"] = file_object_ready ? "true" : "false";
+    result.fields["migration_bundle_ready"] = migration_bundle_ready ? "true" : "false";
+    result.fields["kv_snapshot_ready"] = kv_snapshot_ready ? "true" : "false";
+    result.fields["kv_contract_ready"] = kv_contract_ready ? "true" : "false";
+    result.fields["rocksdb_native_ready"] = rocksdb_native_ready ? "true" : "false";
+    result.fields["rocksdb_status"] = "deferred_optional_backend";
+    result.fields["safe_to_enable_rocksdb_adapter"] = safe_to_enable_rocksdb_adapter ? "true" : "false";
+    result.fields["safe_to_replace_source_of_truth"] = safe_to_replace_source_of_truth ? "true" : "false";
+    result.fields["ready_file_count"] = std::to_string(ready_file_count);
+    result.fields["required_file_count"] = std::to_string(static_cast<int>(file_object_files.size()));
+    result.fields["ready_migration_file_count"] = std::to_string(ready_migration_count);
+    result.fields["required_migration_file_count"] = std::to_string(static_cast<int>(migration_files.size()));
+    result.fields["missing_file_objects_csv"] = TaskMemoryJoinCsv(missing_file_objects);
+    result.fields["missing_migration_files_csv"] = TaskMemoryJoinCsv(missing_migration_files);
+    result.fields["kv_record_count"] = std::to_string(kv_record_count);
+    result.fields["step_record_count"] = std::to_string(step_record_count);
+    result.fields["slice_record_count"] = std::to_string(slice_record_count);
+    result.fields["budget_record_count"] = std::to_string(budget_record_count);
+    result.fields["resume_context_path"] = resume_path.string();
+    result.fields["step_ledger_path"] = ledger_path.string();
+    result.fields["slices_path"] = slices_path.string();
+    result.fields["index_manifest_path"] = index_manifest_path.string();
+    result.fields["kv_index_path"] = kv_index_path.string();
+    result.fields["kv_manifest_path"] = kv_manifest_path.string();
+    result.fields["terminal_state"] = ExtractJsonRawValue(resume_context, "terminal_state");
+    result.fields["completion_claim_allowed"] = ExtractJsonRawValue(resume_context, "completion_claim_allowed");
+    result.fields["semantic_outcome"] = safe_to_enable_rocksdb_adapter
+        ? "task_memory_ready_for_rocksdb_adapter"
+        : "task_memory_migration_assessment_blocked";
+    result.fields["next_action"] = next_action;
+    result.fields["result_ref"] = kv_manifest_path.string();
+    result.fields["evidence_ref"] = root.string();
+    return result;
+}
+
+inline CommandResult BuildTaskMemoryResumeContextResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string goal_id = params.GetString("goal_id");
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "goal_id is required";
+        return result;
+    }
+    const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
+    const std::filesystem::path resume_path = root / "latest_resume_context.json";
+    const std::string resume_context = ReadTaskMemoryTextFile(resume_path);
+    if (resume_context.empty()) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "resume context not found";
+        result.fields["resume_context_path"] = resume_path.string();
+        result.fields["next_action"] = "call lan_agent_task_memory_freeze first";
+        return result;
+    }
+
+    result.fields["record_model"] = "mcp_task_memory_resume_context_response_v1";
+    result.fields["goal_id"] = goal_id;
+    result.fields["task_memory_root"] = root.string();
+    result.fields["resume_context_path"] = resume_path.string();
+    result.fields["resume_context"] = resume_context;
+    result.fields["step_ledger_path"] = (root / "step_ledger.jsonl").string();
+    result.fields["slices_path"] = (root / "slices.jsonl").string();
+    result.fields["index_manifest_path"] = (root / "index_manifest.json").string();
+    result.fields["migration_handover_path"] = (root / "rag_thread_migration" / "4_migration_handover.md").string();
+    result.fields["terminal_state"] = ExtractJsonRawValue(resume_context, "terminal_state");
+    result.fields["completion_claim_allowed"] = ExtractJsonRawValue(resume_context, "completion_claim_allowed");
+    result.fields["current_tool"] = ExtractJsonString(resume_context, "current_tool");
+    result.fields["next_call_json"] = ExtractJsonString(resume_context, "next_call_json");
+    result.fields["compact_summary"] = ExtractJsonString(resume_context, "compact_summary");
+    result.fields["remaining_work"] = ExtractJsonString(resume_context, "remaining_work");
+    result.fields["next_allowed_action"] = ExtractJsonString(resume_context, "next_allowed_action");
+    result.fields["semantic_outcome"] = "task_memory_resume_context_ready";
+    result.fields["next_action"] = "use resume_context only; do not reload full historical chat unless evidence is missing";
+    result.fields["result_ref"] = resume_path.string();
+    result.fields["evidence_ref"] = (root / "step_ledger.jsonl").string();
+    return result;
+}
+
+}  // namespace codex_lan_agent

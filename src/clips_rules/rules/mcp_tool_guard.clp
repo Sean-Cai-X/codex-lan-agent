@@ -124,6 +124,8 @@
                                           (eq ?tool "lan_agent_prepare_edit_windows")
                                           (eq ?tool "lan_agent_delete_line_atomic")
                                           (eq ?tool "lan_agent_delete_content_atomic")
+                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")
+                                          (eq ?tool "lan_agent_delete_text_range_window_atomic")
                                           (eq ?tool "lan_agent_insert_after_anchor_atomic")
                                           (eq ?tool "lan_agent_replace_line_range_atomic")
                                           (eq ?tool "lan_agent_write_text_file")
@@ -143,15 +145,35 @@
     (next_action "call lan_agent_probe_text_file first and continue only with the emitted next_call_json/probe_ref chain before any text read, scan, write, or patch step")
     (matched_rule "route-file-text-operations-to-probe-first"))))
 
+(defrule route-read-text-file-to-window-delete-for-comment-cleanup
+  (declare (salience 84))
+  (mcp_tool_request (tool_name "lan_agent_read_text_file")
+                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
+                                                 (eq ?intent "remove_comments")
+                                                 (eq ?intent "strip_comments")
+                                                 (eq ?intent "删除注释")
+                                                 (eq ?intent "清理注释")
+                                                 (eq ?intent "去除注释")
+                                                 (eq ?intent "移除注释")
+                                                 (eq ?intent "删注释")))
+                    (probe_ready "true"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target "lan_agent_read_text_file")
+    (decision "route")
+    (verification "verified")
+    (reason_code "comment_cleanup_prefers_window_delete")
+    (route_target "lan_agent_delete_text_range_window_atomic")
+    (next_action "call lan_agent_delete_text_range_window_atomic with max_lines=200; do not use read/scan/prepare for comment cleanup")
+    (matched_rule "route-read-text-file-to-window-delete-for-comment-cleanup"))))
+
 (defrule route-read-text-file-to-range-scan-for-editing-intent
   (declare (salience 83))
   (mcp_tool_request (tool_name "lan_agent_read_text_file")
-                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                 (eq ?intent "text_cleaning")
+                    (primary_intent ?intent&:(or (eq ?intent "text_cleaning")
                                                  (eq ?intent "localized_edit")
-                                                 (eq ?intent "source_edit_planning")
-                                                 (eq ?intent "remove_comments")
-                                                 (eq ?intent "strip_comments")))
+                                                 (eq ?intent "source_edit_planning")))
                     (probe_ready "true"))
   =>
   (assert (clips_decision

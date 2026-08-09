@@ -58,6 +58,8 @@
   (slot error_message (default ""))
   (slot status (default ""))
   (slot task_completion (default ""))
+  (slot has_more (default "false"))
+  (slot next_start_line (default ""))
   (slot continue_required (default "false"))
   (slot auto_continue_required (default "false"))
   (slot analysis_allowed (default "true"))

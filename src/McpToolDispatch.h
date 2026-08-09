@@ -149,6 +149,22 @@ CommandResult ScanTextRangesResult(
     int range_offset,
     const std::string & trace_id,
     const std::string & probe_ref);
+CommandResult DeleteNextTextRangeAtomicResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & scan_mode,
+    const std::string & primary_intent,
+    const std::string & trace_id,
+    const std::string & probe_ref);
+CommandResult DeleteTextRangeWindowAtomicResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & scan_mode,
+    int start_line,
+    int max_lines,
+    const std::string & primary_intent,
+    const std::string & trace_id,
+    const std::string & probe_ref);
 CommandResult PrepareEditWindowsResult(
     const AgentConfig & config,
     const std::string & file_path,
@@ -488,6 +504,27 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 std::max(0, params.GetInt("offset", 0)),
                 std::max(1000, params.GetInt("timeout_ms", 15000)));
         }},
+        {"lan_agent_task_memory_freeze", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryFreezeResult(config, params);
+        }},
+        {"lan_agent_task_memory_append_step", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryAppendStepResult(config, params);
+        }},
+        {"lan_agent_task_memory_execute_continuation_budget", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildTaskMemoryExecuteContinuationBudgetRunnerResult(config, params);
+        }},
+        {"lan_agent_task_memory_build_kv_snapshot", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryBuildKvSnapshotResult(config, params);
+        }},
+        {"lan_agent_task_memory_kv_lookup", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryKvLookupResult(config, params);
+        }},
+        {"lan_agent_task_memory_migration_assess", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryMigrationAssessResult(config, params);
+        }},
+        {"lan_agent_task_memory_resume_context", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ::codex_lan_agent::BuildTaskMemoryResumeContextResult(config, params);
+        }},
         {"lan_agent_remote_session_semantic_catalog", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildRemoteSessionSemanticCatalogResult(config);
         }},
@@ -741,6 +778,26 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("scan_mode", "comments"),
                 std::max(1, params.GetInt("max_ranges_per_call", 1)),
                 std::max(0, params.GetInt("range_offset", 0)),
+                params.GetString("trace_id"),
+                params.GetString("probe_ref"));
+        }},
+        {"lan_agent_delete_next_text_range_atomic", [](const AgentConfig & config, const JsonRequestView & params) {
+            return DeleteNextTextRangeAtomicResult(
+                config,
+                params.GetString("file_path"),
+                params.GetString("scan_mode", "comments"),
+                params.GetString("primary_intent", "comment_cleanup"),
+                params.GetString("trace_id"),
+                params.GetString("probe_ref"));
+        }},
+        {"lan_agent_delete_text_range_window_atomic", [](const AgentConfig & config, const JsonRequestView & params) {
+            return DeleteTextRangeWindowAtomicResult(
+                config,
+                params.GetString("file_path"),
+                params.GetString("scan_mode", "comments"),
+                std::max(1, params.GetInt("start_line", params.GetInt("next_start_line", 1))),
+                std::min(200, std::max(1, params.GetInt("max_lines", 200))),
+                params.GetString("primary_intent", "comment_cleanup"),
                 params.GetString("trace_id"),
                 params.GetString("probe_ref"));
         }},
@@ -1113,6 +1170,13 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_rag_storage_lookup", "rag_bridge_storage_lookup", "rag_storage_lookup", "low", "rag,bridge,storage,lookup,read_only"},
         {"lan_agent_rag_review_observe", "rag_bridge_review_observe", "rag_review_observe", "medium", "rag,bridge,review,observe,write,store_refs"},
         {"lan_agent_rag_storage_page", "rag_bridge_storage_page", "rag_storage_page", "low", "rag,bridge,storage,page,read_only"},
+        {"lan_agent_task_memory_freeze", "task_memory_write", "task_memory_freeze", "medium", "task-memory,resume-context,write,audited"},
+        {"lan_agent_task_memory_append_step", "task_memory_write", "task_memory_append_step", "medium", "task-memory,step-ledger,write,audited"},
+        {"lan_agent_task_memory_execute_continuation_budget", "task_memory_write", "task_memory_execute_continuation_budget", "medium", "task-memory,continuation-budget,step-ledger,write,audited"},
+        {"lan_agent_task_memory_build_kv_snapshot", "task_memory_write", "task_memory_build_kv_snapshot", "medium", "task-memory,kv-snapshot,index,write,audited"},
+        {"lan_agent_task_memory_kv_lookup", "task_memory_read", "task_memory_kv_lookup", "low", "task-memory,kv-snapshot,index,lookup,read_only"},
+        {"lan_agent_task_memory_migration_assess", "task_memory_read", "task_memory_migration_assess", "low", "task-memory,migration,backend-readiness,read_only"},
+        {"lan_agent_task_memory_resume_context", "task_memory_read", "task_memory_resume_context", "low", "task-memory,resume-context,read_only"},
         {"lan_agent_remote_session_semantic_catalog", "remote_session_semantic_catalog", "remote_session_semantic_catalog", "low", "remote-session,semantic-catalog,read_only"},
         {"lan_agent_semantic_grid_ingest_text", "semantic_grid_ingest", "semantic_grid_ingest_text", "low", "semantic-grid,ingest,text,read_only"},
         {"lan_agent_semantic_grid_build", "semantic_grid_build", "semantic_grid_build", "medium", "semantic-grid,build,artifact"},
@@ -1179,6 +1243,8 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_find_content_matches", "read_observe", "find_content_matches", "low", "file,locate,metadata_only"},
         {"lan_agent_delete_line_atomic", "file_mutation", "delete_line_atomic", "high", "file,write,line,atomic,audited"},
         {"lan_agent_delete_content_atomic", "file_mutation", "delete_content_atomic", "high", "file,write,content,atomic,audited"},
+        {"lan_agent_delete_next_text_range_atomic", "file_mutation", "delete_next_text_range_atomic", "high", "file,write,text-range,atomic,audited,single-step"},
+        {"lan_agent_delete_text_range_window_atomic", "file_mutation", "delete_text_range_window_atomic", "high", "file,write,text-range,atomic,audited,bounded-window"},
         {"lan_agent_locate_text_lines", "read_observe", "locate_text_lines", "low", "file,locate,metadata_only"},
         {"lan_agent_insert_after_anchor_atomic", "file_mutation", "insert_after_anchor_atomic", "high", "file,write,anchor,atomic,audited"},
         {"lan_agent_replace_line_range_atomic", "file_mutation", "replace_line_range_atomic", "high", "file,write,line-range,atomic,audited"},

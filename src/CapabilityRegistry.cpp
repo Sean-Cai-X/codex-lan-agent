@@ -234,6 +234,90 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "none"
         },
         {
+            "task_memory_freeze",
+            "Freeze a long RAG/main-thread state into MCP-owned migration files, slices, manifest, ledger, and latest resume_context.",
+            "lan_agent_task_memory_freeze",
+            "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"current_goal\":\"optional string\",\"current_scope\":\"optional string\",\"current_file\":\"optional string\",\"last_status\":\"optional string\",\"last_has_more\":\"optional string\",\"terminal_state\":\"optional bool\",\"completion_claim_allowed\":\"optional bool\",\"completed_step_count\":\"optional integer\",\"current_tool\":\"optional string\",\"next_call_json\":\"optional string\",\"compact_summary\":\"optional string\",\"remaining_work\":\"optional string\",\"key_slices_jsonl\":\"optional JSONL string\",\"incremental_index_manifest_json\":\"optional JSON string\"}",
+            "{\"record_model\":\"mcp_task_memory_freeze_response_v1\",\"resume_context_path\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"verify resume context after freeze\"}",
+            "[\"goal_id\",\"trace_id\",\"task_memory_root\",\"migration_dir\",\"current_state_path\",\"key_slices_path\",\"incremental_index_manifest_path\",\"migration_handover_path\",\"step_ledger_path\",\"resume_context_path\",\"completion_claim_allowed\",\"terminal_state\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_write"
+        },
+        {
+            "task_memory_append_step",
+            "Append one verified continuation step to MCP step_ledger and refresh latest resume_context.",
+            "lan_agent_task_memory_append_step",
+            "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"step_id\":\"optional string\",\"step_index\":\"optional integer\",\"step_kind\":\"optional string\",\"current_tool\":\"optional string\",\"status\":\"optional string\",\"summary\":\"optional string\",\"result_ref\":\"optional string\",\"evidence_ref\":\"optional string\",\"next_call_json\":\"optional string\",\"has_more\":\"optional bool\",\"terminal_state\":\"optional bool\",\"completion_claim_allowed\":\"optional bool\",\"compact_summary\":\"optional string\",\"remaining_work\":\"optional string\"}",
+            "{\"record_model\":\"mcp_task_memory_append_step_response_v1\",\"resume_context_path\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"read compact continuation state\"}",
+            "[\"goal_id\",\"trace_id\",\"step_index\",\"step_ledger_path\",\"resume_context_path\",\"completion_claim_allowed\",\"terminal_state\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_append"
+        },
+        {
+            "task_memory_execute_continuation_budget",
+            "Execute or dry-run a bounded continuation budget from latest resume_context, append each verified step to the MCP ledger, and refresh resume_context without loading full chat history.",
+            "lan_agent_task_memory_execute_continuation_budget",
+            "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"max_steps\":\"optional integer capped at 64\",\"step_budget\":\"optional integer alias\",\"dry_run\":\"optional bool default true\",\"execute\":\"optional bool; execute=true and dry_run=false runs allowlisted continuation tools\"}",
+            "{\"record_model\":\"mcp_task_memory_execute_continuation_budget_response_v1\",\"budget_plan_path\":\"non_empty\",\"executed_step_count\":\"integer\",\"next_call_json\":\"optional string\"}",
+            "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"inspect current compact continuation state\"}",
+            "[\"goal_id\",\"trace_id\",\"budget_run_id\",\"budget_status\",\"execution_mode\",\"execution_deferred\",\"max_steps\",\"planned_step_count\",\"executed_step_count\",\"budget_exhausted\",\"last_verified_step\",\"last_tool\",\"last_status\",\"resume_context_path\",\"budget_plan_path\",\"step_ledger_path\",\"completion_claim_allowed\",\"terminal_state\",\"continue_required\",\"next_call_json\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_append"
+        },
+        {
+            "task_memory_build_kv_snapshot",
+            "Build a file-backed KV snapshot for one task_memory goal using the RocksDB-compatible key schema.",
+            "lan_agent_task_memory_build_kv_snapshot",
+            "{\"goal_id\":\"required string\"}",
+            "{\"record_model\":\"mcp_task_memory_kv_snapshot_response_v1\",\"kv_index_path\":\"non_empty\",\"record_count\":\"integer\"}",
+            "{\"tool\":\"lan_agent_task_memory_kv_lookup\",\"reason\":\"query the snapshot by key or selector\"}",
+            "[\"goal_id\",\"task_memory_root\",\"kv_backend\",\"kv_snapshot_dir\",\"kv_index_path\",\"kv_manifest_path\",\"record_count\",\"step_record_count\",\"slice_record_count\",\"budget_record_count\",\"rocksdb_status\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_write"
+        },
+        {
+            "task_memory_kv_lookup",
+            "Lookup a task_memory KV snapshot by exact key or prefix selectors such as trace_id, slice_id, or budget_run_id.",
+            "lan_agent_task_memory_kv_lookup",
+            "{\"goal_id\":\"required string\",\"key\":\"optional string\",\"kind\":\"optional string: goal|latest|trace|trace_step|slice|budget|trace_budget\",\"trace_id\":\"optional string\",\"step_id\":\"optional string\",\"slice_id\":\"optional string\",\"budget_run_id\":\"optional string\",\"prefix\":\"optional bool\",\"limit\":\"optional integer\",\"offset\":\"optional integer\",\"include_value\":\"optional bool\"}",
+            "{\"record_model\":\"mcp_task_memory_kv_lookup_response_v1\",\"matches_jsonl\":\"JSONL string\",\"has_more\":\"true|false\"}",
+            "{\"tool\":\"lan_agent_task_memory_build_kv_snapshot\",\"reason\":\"snapshot missing or stale\"}",
+            "[\"goal_id\",\"lookup_key\",\"prefix_match\",\"kv_backend\",\"kv_index_path\",\"limit\",\"offset\",\"matched_count\",\"returned_count\",\"has_more\",\"next_offset\",\"matches_jsonl\",\"include_value\",\"value_ref\",\"value_text\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "task_memory_migration_assess",
+            "Assess whether one task_memory goal is ready to move from file object storage and KV snapshot toward an optional RocksDB backend.",
+            "lan_agent_task_memory_migration_assess",
+            "{\"goal_id\":\"required string\"}",
+            "{\"record_model\":\"mcp_task_memory_migration_assessment_v1\",\"adaptation_decision\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_task_memory_build_kv_snapshot\",\"reason\":\"KV contract is missing or stale\"}",
+            "[\"goal_id\",\"migration_stage\",\"adaptation_decision\",\"active_backend\",\"source_of_truth\",\"backend_order\",\"file_object_ready\",\"migration_bundle_ready\",\"kv_snapshot_ready\",\"kv_contract_ready\",\"rocksdb_native_ready\",\"safe_to_enable_rocksdb_adapter\",\"safe_to_replace_source_of_truth\",\"kv_record_count\",\"missing_file_objects_csv\",\"missing_migration_files_csv\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "task_memory_resume_context",
+            "Read the compact resume_context for a long task so a fresh model can continue without full chat history.",
+            "lan_agent_task_memory_resume_context",
+            "{\"goal_id\":\"required string\"}",
+            "{\"record_model\":\"mcp_task_memory_resume_context_response_v1\",\"resume_context\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_task_memory_freeze\",\"reason\":\"resume context is missing\"}",
+            "[\"goal_id\",\"task_memory_root\",\"resume_context_path\",\"resume_context\",\"step_ledger_path\",\"slices_path\",\"index_manifest_path\",\"completion_claim_allowed\",\"terminal_state\",\"current_tool\",\"next_call_json\",\"compact_summary\",\"remaining_work\",\"next_allowed_action\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
             "run_rag_flow",
             "Run one remote RAG flow query through the current retrieval and generation bridge.",
             "lan_agent_run_rag_flow",
@@ -352,6 +436,30 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "low",
             "true",
             "none"
+        },
+        {
+            "delete_next_text_range_atomic",
+            "Delete exactly one next scanned text range and verify by readback. Use this optimized loop for comment cleanup after a single probe instead of scan->prepare->replace roundtrips.",
+            "lan_agent_delete_next_text_range_atomic",
+            "{\"file_path\":\"required string\",\"scan_mode\":\"optional string: comments|line_comments|block_comments; use comments for comment cleanup\",\"primary_intent\":\"optional string\",\"probe_ref\":\"recommended after lan_agent_probe_text_file\",\"probe_ready\":\"optional boolean\",\"trace_id\":\"optional string\"}",
+            "{\"result\":\"delete_next_text_range_atomic_applied|no_text_range_remaining\",\"write_verified\":\"true\",\"has_more\":\"true|false\",\"terminal_state\":\"true only when has_more=false\",\"completion_claim_allowed\":\"false while has_more=true\"}",
+            "{\"tool\":\"lan_agent_probe_text_file\",\"reason\":\"probe once, then repeat delete_next_text_range_atomic until has_more=false; never claim completion while completion_claim_allowed=false\"}",
+            "[\"file_path\",\"range_kind\",\"range_start_line\",\"range_end_line\",\"deleted_preview\",\"delete_mode\",\"total_range_count_before\",\"total_range_count_after\",\"has_more\",\"terminal_state\",\"task_done\",\"completion_claim_allowed\",\"must_continue_until\",\"write_verified\",\"result_ref\",\"evidence_ref\"]",
+            "high",
+            "false",
+            "write_file"
+        },
+        {
+            "delete_text_range_window_atomic",
+            "Delete comments in one bounded line window of at most 200 lines and verify by readback. For comment cleanup, small max_lines requests are upgraded to the fixed 200-line server-side window. Use for large text files after a single probe; repeat with next_start_line until has_more=false.",
+            "lan_agent_delete_text_range_window_atomic",
+            "{\"file_path\":\"required string\",\"scan_mode\":\"optional string: comments|line_comments|block_comments\",\"start_line\":\"optional integer, default 1\",\"max_lines\":\"optional integer, max 200, default 200\",\"primary_intent\":\"optional string\",\"probe_ref\":\"recommended after lan_agent_probe_text_file\",\"probe_ready\":\"optional boolean\",\"trace_id\":\"optional string\"}",
+            "{\"result\":\"delete_text_range_window_atomic_applied|no_text_range_in_window|no_text_range_remaining|window_boundary_range_detected\",\"write_verified\":\"true\",\"has_more\":\"true|false\",\"next_start_line\":\"integer\",\"terminal_state\":\"true only when has_more=false\",\"completion_claim_allowed\":\"false while has_more=true\"}",
+            "{\"tool\":\"lan_agent_probe_text_file\",\"reason\":\"probe once, then repeat delete_text_range_window_atomic with next_start_line until has_more=false; never claim completion while completion_claim_allowed=false\"}",
+            "[\"file_path\",\"window_start_line\",\"window_end_line\",\"deleted_range_count\",\"total_range_count_before\",\"total_range_count_after\",\"has_more\",\"next_start_line\",\"terminal_state\",\"task_done\",\"completion_claim_allowed\",\"must_continue_until\",\"write_verified\",\"result_ref\",\"evidence_ref\"]",
+            "high",
+            "false",
+            "write_file"
         },
         {
             "find_line_metadata",
@@ -822,6 +930,83 @@ const std::vector<McpCapabilitySpec> & GetMcpCapabilitySpecs() {
             "structured JSON",
             "storage_page_bridge",
             "Direct bridge for paged storage-backed fact reads with continuation fields."
+        },
+        {
+            "task_memory_freeze",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,trace_id?,current_goal?,current_scope?,current_file?,last_status?,last_has_more?,terminal_state?,completion_claim_allowed?,completed_step_count?,current_tool?,next_call_json?,compact_summary?,remaining_work?,key_slices_jsonl?,incremental_index_manifest_json?",
+            "task_memory_root,migration_dir,current_state_path,key_slices_path,incremental_index_manifest_path,migration_handover_path,step_ledger_path,resume_context_path,completion_claim_allowed,terminal_state,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id} file object store",
+            "structured JSON + file refs",
+            "long_task_state_freeze",
+            "First-stage MCP memory landing for RAG main-thread migration. Keeps RocksDB optional and makes resume_context the only required read for fresh models."
+        },
+        {
+            "task_memory_append_step",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,trace_id?,step_id?,step_index?,step_kind?,current_tool?,status?,summary?,result_ref?,evidence_ref?,next_call_json?,has_more?,terminal_state?,completion_claim_allowed?,compact_summary?,remaining_work?",
+            "step_ledger_path,resume_context_path,completion_claim_allowed,terminal_state,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/step_ledger.jsonl",
+            "structured JSON + file refs",
+            "long_task_step_ledger",
+            "Append-only continuation ledger. Every verified loop step refreshes latest_resume_context.json."
+        },
+        {
+            "task_memory_execute_continuation_budget",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,trace_id?,max_steps?,step_budget?,dry_run?,execute?",
+            "budget_run_id,budget_status,execution_mode,execution_deferred,planned_step_count,executed_step_count,budget_exhausted,last_verified_step,last_tool,budget_plan_path,step_ledger_path,next_call_json,completion_claim_allowed,terminal_state,continue_required,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/budget_runs/{budget_run_id}.json + step_ledger.jsonl",
+            "structured JSON + file refs",
+            "bounded_continuation_budget",
+            "Second-stage bridge from passive resume_context to bounded continuation execution. Phase 2 executes only allowlisted single-file text-range cleanup tools."
+        },
+        {
+            "task_memory_build_kv_snapshot",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id",
+            "kv_backend,kv_index_path,kv_manifest_path,record_count,step_record_count,slice_record_count,budget_record_count,rocksdb_status,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/kv_snapshot/index.jsonl",
+            "structured JSONL + manifest",
+            "rocksdb_compatible_kv_snapshot",
+            "Third-stage bridge from file object memory to queryable KV schema. This is the compatibility contract before swapping the backend to native RocksDB."
+        },
+        {
+            "task_memory_kv_lookup",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,key?,kind?,trace_id?,step_id?,slice_id?,budget_run_id?,prefix?,limit?,offset?,include_value?",
+            "lookup_key,prefix_match,matched_count,returned_count,has_more,next_offset,matches_jsonl,value_ref,value_text,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/kv_snapshot/index.jsonl",
+            "structured JSONL",
+            "task_memory_kv_query",
+            "Read-side contract for goal/latest/trace/slice/budget memory keys; native RocksDB should preserve this observable behavior."
+        },
+        {
+            "task_memory_migration_assess",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id",
+            "migration_stage,adaptation_decision,active_backend,source_of_truth,file_object_ready,migration_bundle_ready,kv_contract_ready,rocksdb_native_ready,safe_to_enable_rocksdb_adapter,safe_to_replace_source_of_truth,next_action",
+            "data_root/task_memory/{goal_id}",
+            "structured JSON",
+            "pre_rocksdb_adapter_gate",
+            "Stage 4 adaptation judgment. It keeps file object storage as source of truth and only marks RocksDB adapter implementation safe after file objects and KV snapshot are ready."
+        },
+        {
+            "task_memory_resume_context",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id",
+            "resume_context,completion_claim_allowed,terminal_state,current_tool,next_call_json,compact_summary,remaining_work,next_allowed_action,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/latest_resume_context.json",
+            "structured JSON",
+            "short_context_resume",
+            "Read-only compact state. Fresh models should read this instead of full historical chat."
         },
         // -----------------------------------------------------------------
         // Memory Slice
