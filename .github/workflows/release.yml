@@ -1,4 +1,4 @@
-name: release-windows-x64
+﻿name: release-windows-x64
 
 # ================================================================
 # Fully-online release pipeline (NO local uploads, NO vendored libs).
@@ -40,7 +40,7 @@ env:
   LLVM_VERSION: 18.1.8
   # Cache key encodes: LLVM version + compile flags + toolchain.
   # Bump the -vN suffix ONLY when changing LLVM compile flags or upgrading.
-  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-v1
+  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-v2
   ARCH: x64
 
 jobs:
@@ -116,21 +116,39 @@ jobs:
           :: Assemble flat LLVM_ROOT: <ROOT>/include + <ROOT>/lib
           mkdir %LLVM_ROOT_FLAT%\include
           mkdir %LLVM_ROOT_FLAT%\lib
-          :: Clang public headers (source)
+          :: (1) Clang public headers (source tree)
           xcopy /y /e /i %LLVM_SRC%\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
           if exist %LLVM_SRC%\clang\include\clang-c xcopy /y /e /i %LLVM_SRC%\clang\include\clang-c %LLVM_ROOT_FLAT%\include\clang-c >nul
-          :: LLVM public headers (source)
+          :: (2) LLVM public headers (source tree)
           xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
           if exist %LLVM_SRC%\llvm\include\llvm-c xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm-c %LLVM_ROOT_FLAT%\include\llvm-c >nul
-          :: Generated config headers (llvm/Config/llvm-config.h, config.h, abi-breaking.h)
+          :: (3) LLVM generated config (llvm/Config/llvm-config.h, config.h, abi-breaking.h, ...)
           xcopy /y /e /i %LLVM_BUILD%\include\llvm\Config %LLVM_ROOT_FLAT%\include\llvm\Config >nul
-          :: Clang generated config if present
-          if exist %LLVM_BUILD%\tools\clang\include\clang\Config xcopy /y /e /i %LLVM_BUILD%\tools\clang\include\clang\Config %LLVM_ROOT_FLAT%\include\clang\Config >nul
-          :: All static .lib produced by the build
+          :: (4) Clang TableGen generated files (*.inc) + clang/Config/Version.inc etc.
+          ::     Covers all known CMake layout variants:
+          ::     - ENABLE_PROJECTS=clang -> build/tools/clang/include/clang
+          ::     - llvm/projects/clang legacy -> build/projects/clang/include/clang
+          ::     - NATIVE/{tools,projects} cross wrappers
+          if exist %LLVM_BUILD%\tools\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\tools\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          if exist %LLVM_BUILD%\projects\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\projects\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          if exist %LLVM_BUILD%\NATIVE\tools\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\NATIVE\tools\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          if exist %LLVM_BUILD%\NATIVE\projects\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\NATIVE\projects\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          :: (5) All static .lib produced by the build
           copy /y %LLVM_BUILD%\lib\*.lib %LLVM_ROOT_FLAT%\lib\ >nul
-          :: Sanity verification
+          :: Sanity verification (source + TableGen .inc + .lib)
           if not exist %LLVM_ROOT_FLAT%\include\clang\AST\ASTConsumer.h (
-            echo ERROR: clang AST header missing & exit /b 1
+            echo ERROR: clang AST source header missing & exit /b 1
+          )
+          if not exist %LLVM_ROOT_FLAT%\include\clang\Basic\DiagnosticCommonKinds.inc (
+            echo ERROR: TableGen DiagnosticCommonKinds.inc missing - assembly incomplete & exit /b 1
           )
           if not exist %LLVM_ROOT_FLAT%\lib\clangTooling.lib (
             echo ERROR: clangTooling.lib missing & exit /b 1
@@ -143,12 +161,15 @@ jobs:
         shell: pwsh
         run: |
           $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
-          $h = Join-Path $Root "include\clang\AST\ASTConsumer.h"
-          $l = Join-Path $Root "lib\clangTooling.lib"
-          if (-not (Test-Path $h)) { Write-Error "Missing $h"; exit 1 }
-          if (-not (Test-Path $l)) { Write-Error "Missing $l"; exit 1 }
+          $h    = Join-Path $Root "include\clang\AST\ASTConsumer.h"
+          $inc  = Join-Path $Root "include\clang\Basic\DiagnosticCommonKinds.inc"
+          $l    = Join-Path $Root "lib\clangTooling.lib"
+          if (-not (Test-Path $h))   { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $inc)) { Write-Error "Missing TableGen header $inc (clang .inc assembly incomplete)"; exit 1 }
+          if (-not (Test-Path $l))   { Write-Error "Missing $l"; exit 1 }
           $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
-          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount)"
+          $incCount = (Get-ChildItem (Join-Path $Root "include\clang") -Recurse -Filter "*.inc").Count
+          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, .inc count: $incCount)"
 
       - name: Export LLVM_ROOT path for downstream job
         id: llvm-root-output
@@ -194,12 +215,15 @@ jobs:
         shell: pwsh
         run: |
           $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
-          $h = Join-Path $Root "include\clang\AST\ASTConsumer.h"
-          $l = Join-Path $Root "lib\clangTooling.lib"
-          if (-not (Test-Path $h)) { Write-Error "Missing $h"; exit 1 }
-          if (-not (Test-Path $l)) { Write-Error "Missing $l"; exit 1 }
+          $h    = Join-Path $Root "include\clang\AST\ASTConsumer.h"
+          $inc  = Join-Path $Root "include\clang\Basic\DiagnosticCommonKinds.inc"
+          $l    = Join-Path $Root "lib\clangTooling.lib"
+          if (-not (Test-Path $h))   { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $inc)) { Write-Error "Missing TableGen header $inc (clang .inc assembly incomplete)"; exit 1 }
+          if (-not (Test-Path $l))   { Write-Error "Missing $l"; exit 1 }
           $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
-          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount)  [Layer 1 cache-hit: ${{ needs.llvm-toolchain.outputs.cache_hit }}]"
+          $incCount = (Get-ChildItem (Join-Path $Root "include\clang") -Recurse -Filter "*.inc").Count
+          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, .inc count: $incCount)  [Layer 1 cache-hit: ${{ needs.llvm-toolchain.outputs.cache_hit }}]"
 
       - name: Configure codex_lan_agent (Ninja + vcvars64, with Clang AST)
         shell: cmd
@@ -338,3 +362,4 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
           }
           Write-Host "=== Release completed for tag $Tag ==="
+
