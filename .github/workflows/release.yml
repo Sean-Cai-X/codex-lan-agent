@@ -1,9 +1,19 @@
-﻿name: release-windows-x64
+name: release-windows-x64
 
 # ================================================================
 # Fully-online release pipeline (NO local uploads, NO vendored libs).
-# LLVM/Clang 18.1.8 is built from official source on the runner.
-# Static libs cached for subsequent runs (keyed by version + toolchain).
+#
+# Two-layer architecture (LLVM toolchain decoupled from business build):
+#   Layer 1 - llvm-toolchain job:
+#       Builds LLVM/Clang 18.1.8 static libs from official source ONCE,
+#       assembles flat LLVM_ROOT {include,lib}, caches it.
+#       Rebuilds ONLY when LLVM version / source / compile flags change
+#       (cache key encodes version + flags). Business build failures
+#       NEVER invalidate this cache.
+#   Layer 2 - codex-build-release job:
+#       Restores cached flat LLVM_ROOT, does incremental compile of
+#       codex_lan_agent only (LLVM .lib are prebuilt external deps,
+#       business source changes do NOT trigger LLVM recompile).
 # ================================================================
 
 on:
@@ -17,29 +27,37 @@ on:
         required: false
         default: ""
         type: string
+      force_rebuild_llvm:
+        description: "Force rebuild LLVM toolchain (ignore cache)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
 env:
   LLVM_VERSION: 18.1.8
+  # Cache key encodes: LLVM version + compile flags + toolchain.
+  # Bump the -vN suffix ONLY when changing LLVM compile flags or upgrading.
+  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-v1
   ARCH: x64
 
 jobs:
-  build-and-release:
-    name: Build + Release (Windows x64 · LLVM/Clang 18.1.8 from source)
+  # ============================================================
+  # Layer 1: LLVM/Clang toolchain (independent, cache-persistent)
+  # ============================================================
+  llvm-toolchain:
+    name: "Layer 1 · LLVM/Clang 18.1.8 toolchain (cached)"
     runs-on: windows-latest
+    outputs:
+      llvm_root: ${{ steps.llvm-root-output.outputs.llvm_root }}
+      cache_hit: ${{ steps.cache-llvm.outputs.cache-hit }}
 
     steps:
-      - name: Checkout codex-lan-agent sources (CMakeLists.txt + src/ only)
-        uses: actions/checkout@v4
-
-      - name: Probe host toolchain (vcvars64 path)
+      - name: Probe MSVC (vcvars64 path)
         shell: pwsh
         run: |
-          cmake --version
-          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
-          Write-Host "ninja: $ninja"
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           Write-Host "VS install: $VS_INSTALL"
@@ -48,15 +66,20 @@ jobs:
           Write-Host "vcvars: $vcvars"
           "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Cache flat LLVM/Clang 18.1.8 static libs (built from source)
+      - name: Cache flat LLVM/Clang 18.1.8 static libs
         id: cache-llvm
         uses: actions/cache@v4
         with:
           path: ${{ runner.workspace }}/llvm_root
-          key: llvm-18.1.8-static-flat-msvc-ninja-v1
+          key: ${{ env.LLVM_CACHE_KEY }}
+          # Save even if later steps in THIS job fail (build errors etc.).
+          # Layer 2 depends on this cache being saved when build succeeds.
+          save-always: true
 
       - name: Build LLVM/Clang 18.1.8 static libs from source & assemble flat LLVM_ROOT
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        if: |
+          steps.cache-llvm.outputs.cache-hit != 'true' ||
+          github.event.inputs.force_rebuild_llvm == 'true'
         shell: cmd
         run: |
           call "%VCVARS_PATH%"
@@ -67,11 +90,11 @@ jobs:
           if exist %LLVM_SRC% rmdir /s /q %LLVM_SRC%
           if exist %LLVM_BUILD% rmdir /s /q %LLVM_BUILD%
           if exist %LLVM_ROOT_FLAT% rmdir /s /q %LLVM_ROOT_FLAT%
-          :: Shallow clone the official LLVM monorepo at the exact release tag.
+          :: Shallow clone official LLVM monorepo at the exact release tag.
           git clone --depth 1 --branch llvmorg-%LLVM_VERSION% https://github.com/llvm/llvm-project.git %LLVM_SRC%
           if errorlevel 1 exit /b 1
-          :: Configure with Ninja + MSVC. Static libs only (no shared), X86 target only,
-          :: tests/examples/benchmarks/docs disabled to minimize build time.
+          :: Configure: Ninja + MSVC, static libs only, X86 target only,
+          :: tests/examples/benchmarks/docs/tools disabled to minimize build time.
           cmake -G Ninja -S %LLVM_SRC%\llvm -B %LLVM_BUILD% ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DLLVM_ENABLE_PROJECTS=clang ^
@@ -87,7 +110,7 @@ jobs:
             -DCLANG_BUILD_TOOLS=OFF ^
             -DLLVM_ENABLE_DIA_SDK=OFF
           if errorlevel 1 exit /b 1
-          :: Build all default targets (lib/*.lib, no tools since LLVM_BUILD_TOOLS=OFF).
+          :: Build all static libs (no tools since LLVM_BUILD_TOOLS=OFF).
           cmake --build %LLVM_BUILD% --config Release --parallel %NUMBER_OF_PROCESSORS%
           if errorlevel 1 exit /b 1
           :: Assemble flat LLVM_ROOT: <ROOT>/include + <ROOT>/lib
@@ -101,7 +124,7 @@ jobs:
           if exist %LLVM_SRC%\llvm\include\llvm-c xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm-c %LLVM_ROOT_FLAT%\include\llvm-c >nul
           :: Generated config headers (llvm/Config/llvm-config.h, config.h, abi-breaking.h)
           xcopy /y /e /i %LLVM_BUILD%\include\llvm\Config %LLVM_ROOT_FLAT%\include\llvm\Config >nul
-          :: Clang generated config (clang/Config/...) if present
+          :: Clang generated config if present
           if exist %LLVM_BUILD%\tools\clang\include\clang\Config xcopy /y /e /i %LLVM_BUILD%\tools\clang\include\clang\Config %LLVM_ROOT_FLAT%\include\clang\Config >nul
           :: All static .lib produced by the build
           copy /y %LLVM_BUILD%\lib\*.lib %LLVM_ROOT_FLAT%\lib\ >nul
@@ -116,7 +139,7 @@ jobs:
           set /p LIBCOUNT=<%TEMP%\libcount.txt
           echo LLVM flat root assembled at %LLVM_ROOT_FLAT% (%LIBCOUNT% .lib files)
 
-      - name: Verify cached LLVM_ROOT integrity
+      - name: Verify LLVM_ROOT integrity (cache hit or fresh build)
         shell: pwsh
         run: |
           $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
@@ -127,6 +150,57 @@ jobs:
           $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
           Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount)"
 
+      - name: Export LLVM_ROOT path for downstream job
+        id: llvm-root-output
+        shell: pwsh
+        run: |
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
+          "llvm_root=$Root" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+  # ============================================================
+  # Layer 2: Business build (incremental, uses cached LLVM_ROOT)
+  # ============================================================
+  codex-build-release:
+    name: "Layer 2 · codex_lan_agent build + Release"
+    runs-on: windows-latest
+    needs: llvm-toolchain
+
+    steps:
+      - name: Checkout codex-lan-agent sources (CMakeLists.txt + src/ only)
+        uses: actions/checkout@v4
+
+      - name: Probe MSVC (vcvars64 path)
+        shell: pwsh
+        run: |
+          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          Write-Host "ninja: $ninja"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "VS install: $VS_INSTALL"
+          $vcvars = Join-Path $VS_INSTALL "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          Write-Host "vcvars: $vcvars"
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore cached flat LLVM_ROOT (Layer 1 output)
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/llvm_root
+          key: ${{ env.LLVM_CACHE_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Verify LLVM_ROOT integrity
+        shell: pwsh
+        run: |
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
+          $h = Join-Path $Root "include\clang\AST\ASTConsumer.h"
+          $l = Join-Path $Root "lib\clangTooling.lib"
+          if (-not (Test-Path $h)) { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $l)) { Write-Error "Missing $l"; exit 1 }
+          $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
+          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount)  [Layer 1 cache-hit: ${{ needs.llvm-toolchain.outputs.cache_hit }}]"
+
       - name: Configure codex_lan_agent (Ninja + vcvars64, with Clang AST)
         shell: cmd
         run: |
@@ -134,8 +208,9 @@ jobs:
           set REPO=%CD%
           set INSTALLDIR=%RUNNER_WORKSPACE%\llvm_root
           set BUILD=%REPO%\build_release_x64
-          :: Ninja is single-config; pass -DCMAKE_BUILD_TYPE=Release directly.
-          :: MSVC arch is selected by vcvars64.bat (x64 host+target).
+          :: Ninja single-config; CMAKE_BUILD_TYPE=Release passed directly.
+          :: LLVM_ROOT is a prebuilt external dependency (Layer 1 cache) —
+          :: business source changes NEVER trigger LLVM recompile.
           cmake -S %REPO% -B %BUILD% ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
@@ -146,7 +221,7 @@ jobs:
             -DCODEX_LLVM_ROOT="%INSTALLDIR%"
           if errorlevel 1 exit /b 1
 
-      - name: Build codex_lan_agent (Release)
+      - name: Build codex_lan_agent (Release · incremental)
         shell: cmd
         run: |
           call "%VCVARS_PATH%"
@@ -200,14 +275,18 @@ jobs:
             Write-Host "No tag context, fallback: $Tag"
           }
           $Sha = (git rev-parse HEAD).Substring(0,7)
+          $Layer1Hit = '${{ needs.llvm-toolchain.outputs.cache_hit }}'
           $Body = @"
           ## codex_lan_agent $Tag (Windows x64)
 
-          ### Fully-online build (GitHub-hosted runner)
-          - Runner: windows-latest
-          - Toolchain: MSVC (vcvars64) + Ninja
-          - LLVM/Clang 18.1.8: built from source on the runner (tag llvmorg-18.1.8)
-          - Static linkage: all LLVM/Clang .lib statically linked into the exe
+          ### Two-layer build (GitHub-hosted runner)
+          - **Layer 1 - LLVM toolchain**: LLVM/Clang 18.1.8 built from source (tag llvmorg-18.1.8)
+            - Status: $(if ($Layer1Hit -eq 'true') {'cache HIT (reused prebuilt static libs, ~seconds)'} else {'cache MISS (rebuilt from source, ~2h)'})
+            - Cache key: ```${{ env.LLVM_CACHE_KEY }}```
+            - Rebuild trigger: LLVM version/source/compile-flags change ONLY
+          - **Layer 2 - Business build**: codex_lan_agent incremental compile on cached LLVM_ROOT
+            - Toolchain: MSVC (vcvars64) + Ninja
+            - Static linkage: all LLVM/Clang .lib statically linked into the exe
           - Commit sha: $Sha
 
           ### Third-party dependencies (ALL from network sources, NOTHING vendored in repo)
@@ -215,27 +294,32 @@ jobs:
             - Source: https://github.com/llvm/llvm-project/tree/llvmorg-18.1.8
             - Configure: -DBUILD_SHARED_LIBS=OFF -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_PROJECTS=clang
             - License: Apache-2.0 WITH LLVM-exception  https://llvm.org/LICENSE.txt
-          - Static .lib cached on GitHub Actions cache (key: llvm-18.1.8-static-flat-msvc-ninja-v1)
+          - Static .lib cached on GitHub Actions cache (decoupled from business build).
           - Release ZIP contains NO .lib/.dll. Repo NEVER ships third-party binaries.
+
+          ### Dependency isolation
+          LLVM .lib are prebuilt external artifacts (flat LLVM_ROOT restored from cache).
+          Business source changes compile ONLY codex_lan_agent — never retrigger LLVM build.
 
           ### Reproduce locally
           ```powershell
           git clone https://github.com/${{ github.repository }}.git
           cd codex-lan-agent
-          # Build LLVM 18.1.8 from source (network):
+          # Layer 1 (one-time): build LLVM 18.1.8 from source (network)
           #   git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project.git
-          #   cmake -G Ninja -S llvm-project\llvm -B llvm-build ^
-          #     -DLLVM_ENABLE_PROJECTS=clang -DBUILD_SHARED_LIBS=OFF -DLLVM_TARGETS_TO_BUILD=X86 ^
+          #   cmake -G Ninja -S llvm-project\llvm -B llvm-build `
+          #     -DLLVM_ENABLE_PROJECTS=clang -DBUILD_SHARED_LIBS=OFF -DLLVM_TARGETS_TO_BUILD=X86 `
           #     -DCMAKE_BUILD_TYPE=Release
           #   cmake --build llvm-build --parallel
-          # Then assemble third_party\llvm\{include,lib} from build output + source headers.
+          #   # assemble third_party\llvm\{include,lib} from build output + source headers
+          # Layer 2 (incremental):
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
           cmake --build build --parallel
           ```
 
           ### Repo contents policy (.gitignore whitelist · enforced)
-          - Allowed: `CMakeLists.txt` · `src/**` · `.github/workflows/**`
-          - DENIED: `*.exe *.dll *.lib *.obj *.o *.a` · images · archives · `third_party/` · `vendor/`
+          - Allowed: ``CMakeLists.txt`` · ``src/**`` · ``.github/workflows/**``
+          - DENIED: ``*.exe *.dll *.lib *.obj *.o *.a`` · images · archives · ``third_party/`` · ``vendor/``
           "@
           $NotesFile = Join-Path $env:RUNNER_TEMP "release_notes_$Tag.md"
           $Body | Out-File -FilePath $NotesFile -Encoding utf8
@@ -243,7 +327,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Creating release $Tag..."
             gh release create $Tag --repo '${{ github.repository }}' `
-              --title "codex_lan_agent $Tag · Windows x64 (LLVM 18.1.8 from source, online build)" `
+              --title "codex_lan_agent $Tag · Windows x64 (LLVM 18.1.8 · two-layer online build)" `
               --notes-file $NotesFile `
               --target '${{ github.sha }}' `
               $Zip
