@@ -34,13 +34,29 @@ jobs:
       - name: Checkout sources (CMakeLists.txt + src/ only, per repo policy)
         uses: actions/checkout@v4
 
-      - name: Setup Visual Studio Build Tools (via MSBuild setup action)
-        uses: microsoft/setup-msbuild@v2
-        with:
-          vs-version: "[17.0,18.0)"
-
-      - name: Setup CMake
-        uses: lukka/get-cmake@latest
+      - name: Verify host toolchain (VS2022 + CMake already on windows-latest image)
+        shell: pwsh
+        run: |
+          cmake --version
+          # Look for installed Visual Studio
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          } else { Write-Host "vswhere missing" }
+          # Probe vcvars
+          $paths = @(
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+          )
+          $found = $false
+          foreach ($p in $paths) {
+            if (Test-Path $p) { Write-Host "FOUND vcvars: $p"; $found=$true; break }
+          }
+          if (-not $found) { Write-Host "vcvars NOT found; but cmake VS generator may still locate MSBuild via registry/COM" }
 
       - name: Cache LLVM/Clang download
         id: cache-llvm
@@ -55,7 +71,6 @@ jobs:
         run: |
           $Version = "$env:LLVM_VERSION"
           $BaseUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$Version"
-          # Official GitHub release artifact: self-extracting 7z exe
           $Exe = "LLVM-$Version-win64.exe"
           $Url = "$BaseUrl/$Exe"
           $Dest = Join-Path $env:RUNNER_TEMP $Exe
@@ -66,6 +81,8 @@ jobs:
           for ($i=1; $i -le $maxRetries; $i++) {
             try {
               Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+              $sz = [math]::Round((Get-Item $Dest).Length/1MB,2)
+              Write-Host "Download OK: ${sz} MB"
               break
             } catch {
               Write-Host "Attempt $i/$maxRetries failed: $_"
@@ -75,23 +92,26 @@ jobs:
           }
           $InstallDir = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
           New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-          Write-Host "Extracting (7z self-extract) to $InstallDir"
-          # Official LLVM .exe is a 7z SFX. Use 7z to extract directly.
+          # Use 7zip4NET via System.IO.Compression.ZipFile is NOT for SFX 7z; prefer 7z
           $SevenZip = "${env:ProgramFiles}\7-Zip\7z.exe"
           if (-not (Test-Path $SevenZip)) { $SevenZip = "${env:ProgramFiles(x86)}\7-Zip\7z.exe" }
           if (Test-Path $SevenZip) {
-            & $SevenZip x -y -o"$InstallDir" $Dest | Select-Object -Last 5
+            Write-Host "Extracting via 7z..."
+            & $SevenZip x -y -o"$InstallDir" $Dest | Select-Object -Last 3
+            if ($LASTEXITCODE -ne 0) { Write-Error "7z extract failed"; exit 1 }
           } else {
-            Write-Host "7z not found; fallback to silent extraction via SFX /S /D=..."
+            Write-Host "7z missing; fall back to SFX silent extraction"
             $proc = Start-Process -FilePath $Dest -ArgumentList "/S /D=$InstallDir" -PassThru -Wait
             Write-Host "SFX exit $($proc.ExitCode)"
             Start-Sleep -Seconds 5
           }
           if (-not (Test-Path (Join-Path $InstallDir "include\clang\AST\ASTConsumer.h")) -or
               -not (Test-Path (Join-Path $InstallDir "lib\clangTooling.lib"))) {
-            Write-Error "LLVM headers/libs not found after extraction"
-            Write-Host "Listing $InstallDir top..."
-            Get-ChildItem $InstallDir -ErrorAction SilentlyContinue | Select-Object -First 15 Name
+            Write-Error "LLVM headers/libs not found after extraction at $InstallDir"
+            if (Test-Path $InstallDir) {
+              Write-Host "Top of $InstallDir :"
+              Get-ChildItem $InstallDir | Select-Object -First 20 Name
+            }
             exit 1
           }
           Write-Host "LLVM $Version ready at $InstallDir"
@@ -101,6 +121,9 @@ jobs:
         run: |
           $Repo = Get-Location
           $InstallDir = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
+          if (-not (Test-Path (Join-Path $InstallDir "lib\clangTooling.lib"))) {
+            Write-Error "LLVM libs missing in $InstallDir"; exit 1
+          }
           $Build = Join-Path $Repo "build_release_x64"
           cmake -S $Repo -B $Build `
             -G $env:CMAKE_GENERATOR `
@@ -118,6 +141,9 @@ jobs:
           $Build = Join-Path (Get-Location) "build_release_x64"
           cmake --build $Build --config Release --parallel $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
+          $Exe = Join-Path $Build "Release\codex_lan_agent.exe"
+          if (-not (Test-Path $Exe)) { Write-Error "codex_lan_agent.exe not built"; exit 1 }
+          Write-Host "Build OK: $Exe  $([math]::Round((Get-Item $Exe).Length/1MB,2)) MB"
 
       - name: Stage release package
         shell: pwsh
@@ -126,14 +152,9 @@ jobs:
           $Build = Join-Path $Repo "build_release_x64\Release"
           $Stage = Join-Path $Repo "stage\codex_lan_agent-windows-x64"
           New-Item -ItemType Directory -Force -Path (Join-Path $Stage "bin") | Out-Null
-          if (-not (Test-Path (Join-Path $Build "codex_lan_agent.exe"))) {
-            Write-Error "codex_lan_agent.exe not built" ; exit 1
-          }
           Copy-Item (Join-Path $Build "codex_lan_agent.exe") (Join-Path $Stage "bin\")
           if (Test-Path (Join-Path $Repo "codex_lan_agent.cfg")) {
             Copy-Item (Join-Path $Repo "codex_lan_agent.cfg") $Stage
-          } else {
-            Write-Host "INFO: codex_lan_agent.cfg not in tree (kept out via .gitignore) - skipping"
           }
           if (Test-Path (Join-Path $Repo "README.md")) {
             Copy-Item (Join-Path $Repo "README.md") $Stage
@@ -146,7 +167,6 @@ jobs:
           Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip
           $zipItem = Get-Item $Zip
           Write-Host "Package: $($zipItem.Name)  $([math]::Round($zipItem.Length/1MB,2)) MB"
-          Get-ChildItem -Recurse $Stage | ForEach-Object { Write-Host "  $($_.FullName.Replace($Stage, ''))" }
 
       - name: Create GitHub Release and upload artifact
         shell: pwsh
@@ -168,32 +188,33 @@ jobs:
           $Body = @"
           ## codex_lan_agent $Tag (Windows x64)
 
-          ### Online build (GitHub-hosted runner)
-          - Runner: windows-latest (Visual Studio 2022 Build Tools 17.x)
+          ### Online build (GitHub-hosted runner, fully online)
+          - Runner: windows-latest (Visual Studio 2022 already pre-installed)
           - Generator: Visual Studio 17 2022 · x64
-          - C++17 / C99
-          - Build with Clang AST: ON
+          - Standard: C++17 / C99
+          - Clang AST parsing: enabled (-DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON)
           - Commit sha: $Sha
 
           ### Third-party dependencies (ALL from network sources, nothing vendored in repo)
-          - **LLVM/Clang 18.1.8** (official prebuilt Windows x64)
-            - Download URL: https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8
+          - **LLVM/Clang 18.1.8** (official prebuilt Windows x64, network download)
+            - URL: https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8
             - Artifact: LLVM-18.1.8-win64.exe
             - License: Apache-2.0 WITH LLVM-exception  https://llvm.org/LICENSE.txt
-          - Static linkage: all LLVM/Clang code linked into exe. Release zip contains NO .lib/.dll.
+          - Static linkage: every LLVM/Clang .lib is statically linked into the exe.
+            Release ZIP contains NO .lib/.dll. Repo NEVER ships third-party binaries.
 
           ### Reproduce locally
           ```powershell
           git clone https://github.com/${{ github.repository }}.git
           cd codex-lan-agent
-          # Download & extract LLVM 18.1.8 (network) -> third_party\llvm\
+          # Download + extract LLVM 18.1.8 (network source) -> third_party\llvm\
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
           cmake --build build --config Release --parallel
           ```
 
-          ### Repo contents policy (.gitignore whitelist)
-          - Only `CMakeLists.txt` + `src/**` + `.github/workflows/**` are allowed in git.
-          - Executables / DLLs / LIBs / images / archives / third_party vendored dirs are DENIED.
+          ### Repo contents policy (.gitignore whitelist · enforced)
+          - Allowed: `CMakeLists.txt` · `src/**` · `.github/workflows/**`
+          - DENIED: `*.exe *.dll *.lib *.obj *.o *.a` · images · archives · `third_party/` · `vendor/`
           "@
           $NotesFile = Join-Path $env:RUNNER_TEMP "release_notes_$Tag.md"
           $Body | Out-File -FilePath $NotesFile -Encoding utf8
