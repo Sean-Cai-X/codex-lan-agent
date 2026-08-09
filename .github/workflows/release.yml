@@ -1,0 +1,197 @@
+﻿name: release-windows-x64
+
+# ================================================================
+# Fully-online release pipeline (NO local uploads, NO vendored libs).
+# Third-party LLVM/Clang is downloaded from official GitHub releases.
+# ================================================================
+
+on:
+  push:
+    tags:
+      - "v*-x64"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to create release for (e.g. v2026.08.09-x64)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  LLVM_VERSION: 18.1.8
+  CMAKE_GENERATOR: "Visual Studio 17 2022"
+  ARCH: x64
+
+jobs:
+  build-and-release:
+    name: Build + Release (Windows x64 · LLVM/Clang 18.1.8)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout sources (CMakeLists.txt + src/ only, per repo policy)
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC developer command line (VS2022 x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: "14.39"
+
+      - name: Setup CMake / Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Cache LLVM/Clang download
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/llvm-18.1.8-win64
+          key: llvm-18.1.8-win64-vs2022
+
+      - name: Download LLVM/Clang 18.1.8 (official network source)
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $Version = "$env:LLVM_VERSION"
+          $BaseUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$Version"
+          # Official GitHub release artifact: self-extracting 7z exe
+          $Exe = "LLVM-$Version-win64.exe"
+          $Url = "$BaseUrl/$Exe"
+          $Dest = Join-Path $env:RUNNER_TEMP $Exe
+          Write-Host "Downloading $Url -> $Dest"
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+          $InstallDir = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
+          New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+          Write-Host "Extracting to $InstallDir"
+          # The official .exe is a 7z self-extract archive; invoke with /S /D=<dir>
+          & $Dest /S /D=$InstallDir
+          # Wait for extraction to settle
+          Start-Sleep -Seconds 3
+          if (-not (Test-Path (Join-Path $InstallDir "include\clang\AST\ASTConsumer.h"))) {
+            Write-Error "LLVM headers not found after extraction"
+            exit 1
+          }
+          if (-not (Test-Path (Join-Path $InstallDir "lib\clangTooling.lib"))) {
+            Write-Error "LLVM libs not found after extraction"
+            exit 1
+          }
+          Write-Host "LLVM $Version ready at $InstallDir"
+
+      - name: Configure CMake (with Clang AST enabled, network LLVM)
+        shell: pwsh
+        run: |
+          $Repo = Get-Location
+          $InstallDir = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
+          $Build = Join-Path $Repo "build_release_x64"
+          cmake -S $Repo -B $Build `
+            -G $env:CMAKE_GENERATOR `
+            -A $env:ARCH `
+            -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON `
+            -DCODEX_LAN_AGENT_BUILD_CLANG_INDEXER=OFF `
+            -DCODEX_LAN_AGENT_COPY_TO_ROOT=OFF `
+            -DCODEX_LAN_AGENT_BUNDLE_CMM=OFF `
+            -DCODEX_LLVM_ROOT="$InstallDir"
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          $Build = Join-Path (Get-Location) "build_release_x64"
+          cmake --build $Build --config Release --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Stage release package
+        shell: pwsh
+        run: |
+          $Repo = Get-Location
+          $Build = Join-Path $Repo "build_release_x64\Release"
+          $Stage = Join-Path $Repo "stage\codex_lan_agent-windows-x64"
+          New-Item -ItemType Directory -Force -Path (Join-Path $Stage "bin") | Out-Null
+          Copy-Item (Join-Path $Build "codex_lan_agent.exe") (Join-Path $Stage "bin\")
+          if (Test-Path (Join-Path $Repo "codex_lan_agent.cfg")) {
+            Copy-Item (Join-Path $Repo "codex_lan_agent.cfg") $Stage
+          } else {
+            Write-Host "INFO: codex_lan_agent.cfg not in repo (kept out via .gitignore) - skipping"
+          }
+          if (Test-Path (Join-Path $Repo "README.md")) {
+            Copy-Item (Join-Path $Repo "README.md") $Stage
+          }
+          if (Test-Path (Join-Path $Repo "LICENSE")) {
+            Copy-Item (Join-Path $Repo "LICENSE") $Stage
+          }
+          $Zip = Join-Path $Repo "codex_lan_agent-windows-x64.zip"
+          if (Test-Path $Zip) { Remove-Item $Zip }
+          Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip
+          $zipItem = Get-Item $Zip
+          Write-Host "Package: $($zipItem.Name)  $([math]::Round($zipItem.Length/1MB,2)) MB"
+          Get-ChildItem -Recurse $Stage | ForEach-Object { Write-Host "  $($_.FullName.Replace($Stage, ''))" }
+
+      - name: Create GitHub Release and upload artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $Repo = Get-Location
+          $Zip = Join-Path $Repo "codex_lan_agent-windows-x64.zip"
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ github.event.inputs.tag }}' -ne '') {
+            $Tag = '${{ github.event.inputs.tag }}'
+          } elseif ('${{ github.ref_type }}' -eq 'tag') {
+            $Tag = '${{ github.ref_name }}'
+          } else {
+            $Tag = 'v' + (Get-Date -Format 'yyyy.MM.dd') + '-x64'
+            Write-Host "No tag context, fallback: $Tag"
+          }
+          $Sha = (git rev-parse HEAD).Substring(0,7)
+          $Body = @"
+          ## codex_lan_agent $Tag (Windows x64)
+
+          ### Online build (GitHub-hosted runner)
+          - Runner: windows-latest (VS2022 x64)
+          - Compiler: MSVC 19.39 (VS 2022 Build Tools)
+          - C++17 / C99
+          - Build with Clang AST: ON
+          - Commit sha: $Sha
+
+          ### Third-party dependencies (ALL from network sources, nothing vendored in repo)
+          - **LLVM/Clang 18.1.8** (official prebuilt Windows x64)
+            - Download URL: https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8
+            - Artifact: LLVM-18.1.8-win64.exe
+            - License: Apache-2.0 WITH LLVM-exception  https://llvm.org/LICENSE.txt
+          - Static linkage: all LLVM/Clang code linked into exe. Release zip contains NO .lib/.dll.
+
+          ### Reproduce locally
+          ```powershell
+          git clone https://github.com/${{ github.repository }}.git
+          cd codex-lan-agent
+          # Download & extract LLVM 18.1.8 (network) -> third_party\llvm\
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
+          cmake --build build --config Release --parallel
+          ```
+
+          ### Repo contents policy (.gitignore whitelist)
+          - Only `CMakeLists.txt` + `src/**` are allowed in git.
+          - Executables / DLLs / LIBs / images / archives / third_party vendored dirs are DENIED.
+
+          ### Package contents
+          - bin/codex_lan_agent.exe   (statically linked with LLVM/Clang 18.1.8)
+          - codex_lan_agent.cfg       (example config, if present)
+          - README.md / LICENSE
+          "@
+          $NotesFile = Join-Path $env:RUNNER_TEMP "release_notes_$Tag.md"
+          $Body | Out-File -FilePath $NotesFile -Encoding utf8
+          $existing = gh release view $Tag --repo '${{ github.repository }}' 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Creating release $Tag..."
+            gh release create $Tag --repo '${{ github.repository }}' `
+              --title "codex_lan_agent $Tag · Windows x64 (LLVM 18.1.8, online build)" `
+              --notes-file $NotesFile `
+              --target '${{ github.sha }}' `
+              $Zip
+          } else {
+            Write-Host "Release $Tag exists; uploading asset..."
+            gh release upload $Tag --repo '${{ github.repository }}' --clobber $Zip
+          }
+          Write-Host "=== Release completed for tag $Tag ==="

@@ -9,6 +9,7 @@
 !*/
 
 # --- Explicit whitelist ---
+!.github/
 !CMakeLists.txt
 !.gitignore
 !README.md
@@ -89,3 +90,4 @@ temp/
 tmp/
 *.dot
 test_*_output*
+
