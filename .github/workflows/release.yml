@@ -34,13 +34,12 @@ jobs:
       - name: Checkout sources (CMakeLists.txt + src/ only, per repo policy)
         uses: actions/checkout@v4
 
-      - name: Setup MSVC developer command line (VS2022 x64)
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup Visual Studio Build Tools (via MSBuild setup action)
+        uses: microsoft/setup-msbuild@v2
         with:
-          arch: x64
-          toolset: "14.39"
+          vs-version: "[17.0,18.0)"
 
-      - name: Setup CMake / Ninja
+      - name: Setup CMake
         uses: lukka/get-cmake@latest
 
       - name: Cache LLVM/Clang download
@@ -63,20 +62,36 @@ jobs:
           Write-Host "Downloading $Url -> $Dest"
           $ProgressPreference = 'SilentlyContinue'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+          $maxRetries = 5
+          for ($i=1; $i -le $maxRetries; $i++) {
+            try {
+              Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+              break
+            } catch {
+              Write-Host "Attempt $i/$maxRetries failed: $_"
+              if ($i -eq $maxRetries) { throw }
+              Start-Sleep -Seconds (5 * $i)
+            }
+          }
           $InstallDir = Join-Path "${{ runner.workspace }}" "llvm-18.1.8-win64"
           New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-          Write-Host "Extracting to $InstallDir"
-          # The official .exe is a 7z self-extract archive; invoke with /S /D=<dir>
-          & $Dest /S /D=$InstallDir
-          # Wait for extraction to settle
-          Start-Sleep -Seconds 3
-          if (-not (Test-Path (Join-Path $InstallDir "include\clang\AST\ASTConsumer.h"))) {
-            Write-Error "LLVM headers not found after extraction"
-            exit 1
+          Write-Host "Extracting (7z self-extract) to $InstallDir"
+          # Official LLVM .exe is a 7z SFX. Use 7z to extract directly.
+          $SevenZip = "${env:ProgramFiles}\7-Zip\7z.exe"
+          if (-not (Test-Path $SevenZip)) { $SevenZip = "${env:ProgramFiles(x86)}\7-Zip\7z.exe" }
+          if (Test-Path $SevenZip) {
+            & $SevenZip x -y -o"$InstallDir" $Dest | Select-Object -Last 5
+          } else {
+            Write-Host "7z not found; fallback to silent extraction via SFX /S /D=..."
+            $proc = Start-Process -FilePath $Dest -ArgumentList "/S /D=$InstallDir" -PassThru -Wait
+            Write-Host "SFX exit $($proc.ExitCode)"
+            Start-Sleep -Seconds 5
           }
-          if (-not (Test-Path (Join-Path $InstallDir "lib\clangTooling.lib"))) {
-            Write-Error "LLVM libs not found after extraction"
+          if (-not (Test-Path (Join-Path $InstallDir "include\clang\AST\ASTConsumer.h")) -or
+              -not (Test-Path (Join-Path $InstallDir "lib\clangTooling.lib"))) {
+            Write-Error "LLVM headers/libs not found after extraction"
+            Write-Host "Listing $InstallDir top..."
+            Get-ChildItem $InstallDir -ErrorAction SilentlyContinue | Select-Object -First 15 Name
             exit 1
           }
           Write-Host "LLVM $Version ready at $InstallDir"
@@ -95,12 +110,14 @@ jobs:
             -DCODEX_LAN_AGENT_COPY_TO_ROOT=OFF `
             -DCODEX_LAN_AGENT_BUNDLE_CMM=OFF `
             -DCODEX_LLVM_ROOT="$InstallDir"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
       - name: Build Release
         shell: pwsh
         run: |
           $Build = Join-Path (Get-Location) "build_release_x64"
           cmake --build $Build --config Release --parallel $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
 
       - name: Stage release package
         shell: pwsh
@@ -109,11 +126,14 @@ jobs:
           $Build = Join-Path $Repo "build_release_x64\Release"
           $Stage = Join-Path $Repo "stage\codex_lan_agent-windows-x64"
           New-Item -ItemType Directory -Force -Path (Join-Path $Stage "bin") | Out-Null
+          if (-not (Test-Path (Join-Path $Build "codex_lan_agent.exe"))) {
+            Write-Error "codex_lan_agent.exe not built" ; exit 1
+          }
           Copy-Item (Join-Path $Build "codex_lan_agent.exe") (Join-Path $Stage "bin\")
           if (Test-Path (Join-Path $Repo "codex_lan_agent.cfg")) {
             Copy-Item (Join-Path $Repo "codex_lan_agent.cfg") $Stage
           } else {
-            Write-Host "INFO: codex_lan_agent.cfg not in repo (kept out via .gitignore) - skipping"
+            Write-Host "INFO: codex_lan_agent.cfg not in tree (kept out via .gitignore) - skipping"
           }
           if (Test-Path (Join-Path $Repo "README.md")) {
             Copy-Item (Join-Path $Repo "README.md") $Stage
@@ -135,6 +155,7 @@ jobs:
         run: |
           $Repo = Get-Location
           $Zip = Join-Path $Repo "codex_lan_agent-windows-x64.zip"
+          if (-not (Test-Path $Zip)) { Write-Error "zip missing" ; exit 1 }
           if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ github.event.inputs.tag }}' -ne '') {
             $Tag = '${{ github.event.inputs.tag }}'
           } elseif ('${{ github.ref_type }}' -eq 'tag') {
@@ -148,8 +169,8 @@ jobs:
           ## codex_lan_agent $Tag (Windows x64)
 
           ### Online build (GitHub-hosted runner)
-          - Runner: windows-latest (VS2022 x64)
-          - Compiler: MSVC 19.39 (VS 2022 Build Tools)
+          - Runner: windows-latest (Visual Studio 2022 Build Tools 17.x)
+          - Generator: Visual Studio 17 2022 · x64
           - C++17 / C99
           - Build with Clang AST: ON
           - Commit sha: $Sha
@@ -166,19 +187,13 @@ jobs:
           git clone https://github.com/${{ github.repository }}.git
           cd codex-lan-agent
           # Download & extract LLVM 18.1.8 (network) -> third_party\llvm\
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-            -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
           cmake --build build --config Release --parallel
           ```
 
           ### Repo contents policy (.gitignore whitelist)
-          - Only `CMakeLists.txt` + `src/**` are allowed in git.
+          - Only `CMakeLists.txt` + `src/**` + `.github/workflows/**` are allowed in git.
           - Executables / DLLs / LIBs / images / archives / third_party vendored dirs are DENIED.
-
-          ### Package contents
-          - bin/codex_lan_agent.exe   (statically linked with LLVM/Clang 18.1.8)
-          - codex_lan_agent.cfg       (example config, if present)
-          - README.md / LICENSE
           "@
           $NotesFile = Join-Path $env:RUNNER_TEMP "release_notes_$Tag.md"
           $Body | Out-File -FilePath $NotesFile -Encoding utf8
@@ -190,8 +205,10 @@ jobs:
               --notes-file $NotesFile `
               --target '${{ github.sha }}' `
               $Zip
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           } else {
             Write-Host "Release $Tag exists; uploading asset..."
             gh release upload $Tag --repo '${{ github.repository }}' --clobber $Zip
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
           }
           Write-Host "=== Release completed for tag $Tag ==="
