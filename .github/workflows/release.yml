@@ -34,14 +34,12 @@ jobs:
       - name: Checkout codex-lan-agent sources (CMakeLists.txt + src/ only)
         uses: actions/checkout@v4
 
-      - name: Probe host toolchain & set CMAKE_GENERATOR
+      - name: Probe host toolchain (vcvars64 path)
         shell: pwsh
         run: |
           cmake --version
-          # Ninja is preinstalled on windows-latest; prefer it for LLVM build speed.
           $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
           Write-Host "ninja: $ninja"
-          # Find vcvars64.bat
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           Write-Host "VS install: $VS_INSTALL"
@@ -90,7 +88,6 @@ jobs:
             -DLLVM_ENABLE_DIA_SDK=OFF
           if errorlevel 1 exit /b 1
           :: Build all default targets (lib/*.lib, no tools since LLVM_BUILD_TOOLS=OFF).
-          :: Using /parallel with ninja picks up %NUMBER_OF_PROCESSORS%.
           cmake --build %LLVM_BUILD% --config Release --parallel %NUMBER_OF_PROCESSORS%
           if errorlevel 1 exit /b 1
           :: Assemble flat LLVM_ROOT: <ROOT>/include + <ROOT>/lib
@@ -130,45 +127,44 @@ jobs:
           $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
           Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount)"
 
-      - name: Configure codex_lan_agent (with Clang AST, network-built LLVM_ROOT)
-        shell: pwsh
+      - name: Configure codex_lan_agent (Ninja + vcvars64, with Clang AST)
+        shell: cmd
         run: |
-          $Repo = Get-Location
-          $InstallDir = Join-Path "${{ runner.workspace }}" "llvm_root"
-          $Build = Join-Path $Repo "build_release_x64"
-          # Use VS generator for codex_lan_agent (matches CMakeLists assumptions).
-          $gens = cmake --help | Select-String 'Visual Studio \d+' | ForEach-Object { $_.Line }
-          $GEN = $null
-          foreach ($g in @("Visual Studio 17 2022", "Visual Studio 18 2022")) {
-            if ($gens -match [regex]::Escape($g)) { $GEN = $g; break }
-          }
-          if (-not $GEN) { throw "No Visual Studio generator available" }
-          Write-Host "Using generator: $GEN"
-          cmake -S $Repo -B $Build `
-            -G $GEN `
-            -A $env:ARCH `
-            -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON `
-            -DCODEX_LAN_AGENT_BUILD_CLANG_INDEXER=OFF `
-            -DCODEX_LAN_AGENT_COPY_TO_ROOT=OFF `
-            -DCODEX_LAN_AGENT_BUNDLE_CMM=OFF `
-            -DCODEX_LLVM_ROOT="$InstallDir"
-          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
+          call "%VCVARS_PATH%"
+          set REPO=%CD%
+          set INSTALLDIR=%RUNNER_WORKSPACE%\llvm_root
+          set BUILD=%REPO%\build_release_x64
+          :: Ninja is single-config; pass -DCMAKE_BUILD_TYPE=Release directly.
+          :: MSVC arch is selected by vcvars64.bat (x64 host+target).
+          cmake -S %REPO% -B %BUILD% ^
+            -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON ^
+            -DCODEX_LAN_AGENT_BUILD_CLANG_INDEXER=OFF ^
+            -DCODEX_LAN_AGENT_COPY_TO_ROOT=OFF ^
+            -DCODEX_LAN_AGENT_BUNDLE_CMM=OFF ^
+            -DCODEX_LLVM_ROOT="%INSTALLDIR%"
+          if errorlevel 1 exit /b 1
 
       - name: Build codex_lan_agent (Release)
-        shell: pwsh
+        shell: cmd
         run: |
-          $Build = Join-Path (Get-Location) "build_release_x64"
-          cmake --build $Build --config Release --parallel $env:NUMBER_OF_PROCESSORS
-          if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
-          $Exe = Join-Path $Build "Release\codex_lan_agent.exe"
-          if (-not (Test-Path $Exe)) { Write-Error "codex_lan_agent.exe not built at $Exe"; exit 1 }
-          Write-Host "Build OK: $Exe  $([math]::Round((Get-Item $Exe).Length/1MB,2)) MB"
+          call "%VCVARS_PATH%"
+          set BUILD=%CD%\build_release_x64
+          cmake --build %BUILD% --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          :: Ninja single-config: exe lands directly in build_release_x64\codex_lan_agent.exe
+          if not exist %BUILD%\codex_lan_agent.exe (
+            echo ERROR: codex_lan_agent.exe not built & exit /b 1
+          )
+          for %%I in (%BUILD%\codex_lan_agent.exe) do echo Build OK: %%I  size=%%~zI bytes
 
       - name: Stage release package
         shell: pwsh
         run: |
           $Repo = Get-Location
-          $Exe = Join-Path $Repo "build_release_x64\Release\codex_lan_agent.exe"
+          $Exe = Join-Path $Repo "build_release_x64\codex_lan_agent.exe"
+          if (-not (Test-Path $Exe)) { Write-Error "exe missing at $Exe"; exit 1 }
           $Stage = Join-Path $Repo "stage\codex_lan_agent-windows-x64"
           New-Item -ItemType Directory -Force -Path (Join-Path $Stage "bin") | Out-Null
           Copy-Item $Exe (Join-Path $Stage "bin\codex_lan_agent.exe")
@@ -208,7 +204,8 @@ jobs:
           ## codex_lan_agent $Tag (Windows x64)
 
           ### Fully-online build (GitHub-hosted runner)
-          - Runner: windows-latest (Visual Studio preinstalled)
+          - Runner: windows-latest
+          - Toolchain: MSVC (vcvars64) + Ninja
           - LLVM/Clang 18.1.8: built from source on the runner (tag llvmorg-18.1.8)
           - Static linkage: all LLVM/Clang .lib statically linked into the exe
           - Commit sha: $Sha
@@ -232,8 +229,8 @@ jobs:
           #     -DCMAKE_BUILD_TYPE=Release
           #   cmake --build llvm-build --parallel
           # Then assemble third_party\llvm\{include,lib} from build output + source headers.
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
-          cmake --build build --config Release --parallel
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
+          cmake --build build --parallel
           ```
 
           ### Repo contents policy (.gitignore whitelist · enforced)
