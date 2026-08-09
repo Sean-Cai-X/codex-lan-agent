@@ -1,5 +1,5 @@
 # ============================================================
-# Whitelist mode: ONLY CMakeLists.txt and src/ are allowed
+# Whitelist mode: ONLY CMakeLists.txt, src/, .github/ workflows
 # Images / dynamic libraries / executables / third-party
 # vendored sources must NEVER enter the repository.
 # ============================================================
@@ -9,7 +9,7 @@
 !*/
 
 # --- Explicit whitelist ---
-!.github/
+!.github/**
 !CMakeLists.txt
 !.gitignore
 !README.md
@@ -90,4 +90,3 @@ temp/
 tmp/
 *.dot
 test_*_output*
-
