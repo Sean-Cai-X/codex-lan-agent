@@ -41,6 +41,8 @@ env:
   # Cache key encodes: LLVM version + compile flags + toolchain.
   # Bump the -vN suffix ONLY when changing LLVM compile flags or upgrading.
   LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-v3
+  ROCKSDB_VERSION: 11.0.4
+  ROCKSDB_CACHE_KEY: rocksdb-11.0.4-static-msvc-md-v1
   ARCH: x64
 
 jobs:
@@ -239,7 +241,75 @@ jobs:
           $llvmIncCount = (Get-ChildItem (Join-Path $Root "include\llvm") -Recurse -Filter "*.inc").Count
           Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, clang .inc: $incCount, llvm .inc: $llvmIncCount)  [Layer 1 cache-hit: ${{ needs.llvm-toolchain.outputs.cache_hit }}]"
 
-      - name: Configure codex_lan_agent (Ninja + vcvars64, with Clang AST)
+      - name: Restore cached RocksDB 11.0.4 (optional mirror backend)
+        id: cache-rocksdb
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/rocksdb_install
+          key: ${{ env.ROCKSDB_CACHE_KEY }}
+
+      - name: Build RocksDB 11.0.4 (static lib, /MD, no optional deps)
+        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          set ROCKSDB_SRC=%RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION%
+          set ROCKSDB_BUILD=%RUNNER_WORKSPACE%\rocksdb_build
+          set ROCKSDB_INSTALL=%RUNNER_WORKSPACE%\rocksdb_install
+          if exist %ROCKSDB_INSTALL% rmdir /s /q %ROCKSDB_INSTALL%
+          :: Download rocksdb 11.0.4 source tarball (official GitHub release)
+          curl -L -o %TEMP%\rocksdb.tar.gz https://github.com/facebook/rocksdb/archive/refs/tags/v%ROCKSDB_VERSION%.tar.gz
+          if errorlevel 1 exit /b 1
+          tar -xzf %TEMP%\rocksdb.tar.gz -C %RUNNER_WORKSPACE%
+          if errorlevel 1 exit /b 1
+          :: Configure: static lib, /MD CRT (matches codex_lan_agent), all optional compression deps OFF
+          cmake -G Ninja -S %ROCKSDB_SRC% -B %ROCKSDB_BUILD% ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DPORTABLE=1 ^
+            -DWITH_TESTS=OFF ^
+            -DWITH_BENCHMARK_TOOLS=OFF ^
+            -DWITH_TOOLS=OFF ^
+            -DWITH_JNI=OFF ^
+            -DWITH_GFLAGS=OFF ^
+            -DWITH_SNAPPY=OFF ^
+            -DWITH_LZ4=OFF ^
+            -DWITH_ZLIB=OFF ^
+            -DWITH_ZSTD=OFF ^
+            -DWITH_BZIP2=OFF ^
+            -DWITH_TBB=OFF ^
+            -DROCKSDB_BUILD_SHARED=OFF ^
+            -DUSE_RTTI=1 ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+          if errorlevel 1 exit /b 1
+          :: Build rocksdb static lib only
+          cmake --build %ROCKSDB_BUILD% --target rocksdb --config Release --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          :: Stage into install dir (flat: include/ + lib/rocksdb.lib)
+          mkdir %ROCKSDB_INSTALL%\include
+          mkdir %ROCKSDB_INSTALL%\lib
+          xcopy /y /e /i %ROCKSDB_SRC%\include\* %ROCKSDB_INSTALL%\include\ >nul
+          copy /y %ROCKSDB_BUILD%\rocksdb.lib %ROCKSDB_INSTALL%\lib\rocksdb.lib >nul
+          :: Sanity check
+          if not exist %ROCKSDB_INSTALL%\include\rocksdb\db.h (
+            echo ERROR: rocksdb/db.h missing & exit /b 1
+          )
+          if not exist %ROCKSDB_INSTALL%\lib\rocksdb.lib (
+            echo ERROR: rocksdb.lib missing & exit /b 1
+          )
+          echo RocksDB %ROCKSDB_VERSION% static lib built at %ROCKSDB_INSTALL%
+
+      - name: Verify RocksDB install
+        shell: pwsh
+        run: |
+          $Install = Join-Path "${{ runner.workspace }}" "rocksdb_install"
+          $h = Join-Path $Install "include\rocksdb\db.h"
+          $l = Join-Path $Install "lib\rocksdb.lib"
+          if (-not (Test-Path $h)) { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $l)) { Write-Error "Missing $l"; exit 1 }
+          $libSize = (Get-Item $l).Length
+          Write-Host "RocksDB install=$Install  (rocksdb.lib: $([math]::Round($libSize/1MB,2)) MB)  [cache-hit: ${{ steps.cache-rocksdb.outputs.cache-hit }}]"
+
+      - name: Configure codex_lan_agent (Ninja + vcvars64, with Clang AST + RocksDB)
         shell: cmd
         run: |
           call "%VCVARS_PATH%"
@@ -256,6 +326,9 @@ jobs:
             -DCODEX_LAN_AGENT_BUILD_CLANG_INDEXER=OFF ^
             -DCODEX_LAN_AGENT_COPY_TO_ROOT=OFF ^
             -DCODEX_LAN_AGENT_BUNDLE_CMM=OFF ^
+            -DCODEX_LAN_AGENT_WITH_ROCKSDB=ON ^
+            -DCODEX_LAN_AGENT_ROCKSDB_INCLUDE_DIR="%RUNNER_WORKSPACE%\rocksdb_install\include" ^
+            -DCODEX_LAN_AGENT_ROCKSDB_LIBRARY="%RUNNER_WORKSPACE%\rocksdb_install\lib\rocksdb.lib" ^
             -DCODEX_LLVM_ROOT="%INSTALLDIR%"
           if errorlevel 1 exit /b 1
 
@@ -332,6 +405,11 @@ jobs:
             - Source: https://github.com/llvm/llvm-project/tree/llvmorg-18.1.8
             - Configure: -DBUILD_SHARED_LIBS=OFF -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_PROJECTS=clang
             - License: Apache-2.0 WITH LLVM-exception  https://llvm.org/LICENSE.txt
+          - **RocksDB 11.0.4** built from official source (optional mirror read backend):
+            - Source: https://github.com/facebook/rocksdb/tree/v11.0.4
+            - Configure: -DROCKSDB_BUILD_SHARED=OFF -DPORTABLE=1 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL (static lib, /MD CRT)
+            - License: GPLv2/GPLv3/Apache-2.0  https://github.com/facebook/rocksdb/blob/main/LICENSE
+            - Statically linked into exe; enables lan_agent_task_memory_rocksdb_mirror/lookup/parity_check tools.
           - Static .lib cached on GitHub Actions cache (decoupled from business build).
           - Release ZIP contains NO .lib/.dll. Repo NEVER ships third-party binaries.
 
