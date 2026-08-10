@@ -43,6 +43,27 @@ std::string EscapeForClipsString(const std::string & value) {
     return escaped;
 }
 
+std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent) {
+    const std::string lowered = ToLowerAscii(Trim(primary_intent));
+    if (lowered == "delete comments"
+        || lowered == "remove comments"
+        || lowered == "strip comments"
+        || lowered == "comment cleanup"
+        || lowered == "cleanup comments"
+        || lowered == "comment_cleanup"
+        || lowered == "delete_comments"
+        || lowered == "remove_comments"
+        || lowered == "strip_comments"
+        || lowered == "删除注释"
+        || lowered == "清理注释"
+        || lowered == "去除注释"
+        || lowered == "移除注释"
+        || lowered == "删注释") {
+        return "comment_cleanup";
+    }
+    return primary_intent;
+}
+
 std::string ClipsStringSlot(const char * name, const std::string & value) {
     return "(" + std::string(name) + " \"" + EscapeForClipsString(value) + "\")";
 }
@@ -1348,11 +1369,13 @@ std::string BuildMcpToolRequestFact(
         "");
     const std::string patch_id = params.GetString("patch_id");
     const std::string reason = params.GetString("reason");
+    const std::string normalized_primary_intent =
+        NormalizeMcpPrimaryIntentForClips(params.GetString("primary_intent"));
     const bool path_within_workspace = file_path.empty() ? true : IsWorkspacePatchPath(config, file_path);
     const bool preview_ready =
         tool_name == "lan_agent_apply_single_file_patch" ? HasPatchPreviewAuditEvent(config, patch_id) : false;
     const bool explicit_user_intent =
-        !Trim(reason).empty() || !Trim(params.GetString("repair_candidate_id")).empty() || params.GetString("primary_intent") == "refactor_file";
+        !Trim(reason).empty() || !Trim(params.GetString("repair_candidate_id")).empty() || normalized_primary_intent == "refactor_file";
     const bool probe_required =
         tool_name == "lan_agent_read_text_file"
         || tool_name == "lan_agent_find_line_metadata"
@@ -1437,7 +1460,7 @@ std::string BuildMcpToolRequestFact(
         + ClipsStringSlot("session_id", params.GetString("session_id")) + " "
         + ClipsStringSlot("turn_id", params.GetString("turn_id")) + " "
         + ClipsStringSlot("reasoning_level", params.GetString("reasoning_level")) + " "
-        + ClipsStringSlot("primary_intent", params.GetString("primary_intent")) + " "
+        + ClipsStringSlot("primary_intent", normalized_primary_intent) + " "
         + ClipsStringSlot("preflight_status", preflight_status) + " "
         + ClipsStringSlot("dedup_status", params.GetString("dedup_status")) + " "
         + ClipsStringSlot("canonical_slice_id", params.GetString("canonical_slice_id")) + " "
@@ -2036,7 +2059,8 @@ std::string BuildPreGuardRouteCallJson(
     const std::string & route_target,
     const JsonRequestView & params) {
     const std::string file_path = params.GetString("file_path");
-    const std::string primary_intent = params.GetString("primary_intent");
+    const std::string primary_intent =
+        NormalizeMcpPrimaryIntentForClips(params.GetString("primary_intent"));
     const std::string trace_id = params.GetString("trace_id");
     const std::string request_id = params.GetString("request_id");
     const bool recent_probe_ready = HasRecentProbePath(file_path);
@@ -2157,6 +2181,11 @@ void ApplyClipsPreflightRouteResult(
     result->fields["required_tool_name"] = route_target;
     result->fields["required_tool_arguments_json"] = next_call_json;
     result->fields["next_call_json"] = next_call_json;
+    result->fields["local_ai_guidance_enforced"] = "true";
+    result->fields["local_ai_required_first_tool"] = "lan_agent_mcp_overview";
+    result->fields["local_ai_uncertain_route_tool"] = "lan_agent_clips_decide";
+    result->fields["local_ai_completion_gate"] =
+        "terminal_state=true + completion_claim_allowed=true + final_answer_allowed=true + verification_ok=true";
     result->fields["clips_continuation_required"] = "true";
     result->fields["clips_continuation_policy"] =
         "do not treat reroute as failure; call required_tool_arguments_json and continue the declared chain";
@@ -2169,6 +2198,35 @@ void ApplyClipsPreflightRouteResult(
         decision.reason_code,
         fallback_error,
         "clips_route_required");
+    const std::string file_path = params.GetString("file_path");
+    if (!file_path.empty()) {
+        result->fields["file_path"] = file_path;
+        result->fields["normalized_path"] = file_path;
+    }
+    const std::string primary_intent =
+        NormalizeMcpPrimaryIntentForClips(params.GetString("primary_intent"));
+    if (!primary_intent.empty()) {
+        result->fields["primary_intent"] = primary_intent;
+    }
+    const std::string scan_mode = params.GetString("scan_mode");
+    if (!scan_mode.empty()) {
+        result->fields["scan_mode"] = scan_mode;
+    }
+    const std::string probe_ref = params.GetString("probe_ref");
+    if (!probe_ref.empty()) {
+        result->fields["probe_ref"] = probe_ref;
+    }
+    if (!probe_ref.empty() || params.GetBool("probe_ready", false)) {
+        result->fields["probe_ready"] = "true";
+    }
+    if (route_target == "lan_agent_delete_text_range_window_atomic") {
+        result->fields["operation_granularity"] = "bounded_line_window_text_range_delete";
+        result->fields["max_items_per_call"] = "200_lines";
+        result->fields["max_lines_per_call"] = "200";
+        result->fields["batch_mutation_allowed"] = "bounded_window_only";
+        result->fields["window_batch_scope"] = "single_file_bounded_line_window";
+        result->fields["effective_window_policy"] = "comment_cleanup_fixed_200_line_window";
+    }
     if (!decision.next_action.empty()) {
         result->fields["next_action"] = decision.next_action;
     }

@@ -556,6 +556,9 @@ std::string ResolveTextPayloadFromParams(
 CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
     const AgentConfig & config,
     const JsonRequestView & params);
+CommandResult BuildTaskMemoryResumeAndExecuteResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
 CommandResult BuildTaskMemoryMigrationAcceptanceResult(
     const AgentConfig & config,
     const JsonRequestView & params);
@@ -816,6 +819,10 @@ std::string ResolveNextActionSafetyClass(const std::string & tool_name) {
         || tool_name == "lan_agent_delete_next_text_range_atomic") {
         return "BOUNDED_FILE_WRITE";
     }
+    if (tool_name == "lan_agent_task_memory_freeze"
+        || tool_name == "lan_agent_task_memory_execute_continuation_budget") {
+        return "TASK_MEMORY_CONTINUATION";
+    }
     return std::string();
 }
 
@@ -831,12 +838,58 @@ bool IsSafeClipsContinuationAction(
         return GetFieldOrDefault(result, "cxparser_safety_class", "") == "READ_ONLY"
             || GetFieldOrDefault(result, "flow_safety_class", "") == "READ_ONLY";
     }
+    if (required_tool == "lan_agent_task_memory_freeze"
+        && safety_class == "TASK_MEMORY_CONTINUATION"
+        && GetFieldOrDefault(result, "task_execution_in_mcp_required", "") == "true"
+        && GetFieldOrDefault(result, "forced_task_memory_execution", "") == "true") {
+        return true;
+    }
+    if (required_tool == "lan_agent_task_memory_execute_continuation_budget"
+        && safety_class == "TASK_MEMORY_CONTINUATION"
+        && GetFieldOrDefault(result, "record_model", "") == "mcp_task_memory_freeze_response_v1"
+        && GetFieldOrDefault(result, "task_execution_in_mcp_required", "") == "true"
+        && GetFieldOrDefault(result, "forced_task_memory_execution", "") == "true"
+        && GetFieldOrDefault(result, "terminal_state", "") != "true") {
+        return true;
+    }
     if ((required_tool == "lan_agent_delete_text_range_window_atomic"
             || required_tool == "lan_agent_delete_next_text_range_atomic")
         && GetFieldOrDefault(result, "write_verified", "") == "true"
         && GetFieldOrDefault(result, "disk_write_completed", "") == "true"
         && GetFieldOrDefault(result, "window_batch_scope", "") != "multi_file") {
         return true;
+    }
+    if (required_tool == "lan_agent_delete_text_range_window_atomic"
+        && safety_class == "BOUNDED_FILE_WRITE"
+        && GetFieldOrDefault(result, "result", "") == "no_text_range_in_window"
+        && GetFieldOrDefault(result, "probe_ready", "") == "true"
+        && GetFieldOrDefault(result, "scan_mode", "") == "comments"
+        && GetFieldOrDefault(result, "has_more", "") == "true"
+        && GetFieldOrDefault(result, "window_batch_scope", "") == "single_file_bounded_line_window"
+        && GetFieldOrDefault(result, "batch_mutation_allowed", "") == "bounded_window_only") {
+        const int window_start_line = std::atoi(GetFieldOrDefault(result, "window_start_line", "0").c_str());
+        const int next_start_line = std::atoi(GetFieldOrDefault(result, "next_start_line", "0").c_str());
+        if (next_start_line > window_start_line) {
+            return true;
+        }
+    }
+    if (required_tool == "lan_agent_delete_text_range_window_atomic"
+        && safety_class == "BOUNDED_FILE_WRITE"
+        && GetFieldOrDefault(result, "result", "") == "pre_guard_rerouted"
+        && GetFieldOrDefault(result, "clips_gate", "") == "rerouted_before_execution"
+        && GetFieldOrDefault(result, "probe_ready", "") == "true"
+        && GetFieldOrDefault(result, "scan_mode", "") == "comments"
+        && GetFieldOrDefault(result, "window_batch_scope", "") == "single_file_bounded_line_window"
+        && GetFieldOrDefault(result, "batch_mutation_allowed", "") == "bounded_window_only") {
+        const std::string intent = GetFieldOrDefault(result, "primary_intent", "");
+        return intent == "comment_cleanup"
+            || intent == "delete_comments"
+            || intent == "remove_comments"
+            || intent == "delete comments"
+            || intent == "remove comments"
+            || intent == "strip comments"
+            || intent == "删除注释"
+            || intent == "清理注释";
     }
     if ((required_tool == "lan_agent_delete_text_range_window_atomic"
             || required_tool == "lan_agent_delete_next_text_range_atomic")
@@ -1012,10 +1065,12 @@ void ApplyServiceStepStatus(CommandResult * result) {
         result->fields["error"] = "";
         result->fields["error_code"] = "";
         result->fields["error_message"] = "";
+        result->fields["supervision_alarm"] = "false";
         return;
     }
 
     result->fields["status"] = "success";
+    result->fields["supervision_alarm"] = "false";
 }
 
 void ApplySupervisionProgressFields(CommandResult * result) {
@@ -1370,7 +1425,18 @@ void ApplySupervisionEnvelope(CommandResult * result) {
     const bool has_alarm = !alarm_code.empty()
         || GetFieldOrDefault(*result, "supervision_status", "") == "alarm";
 
-    if (has_alarm) {
+    if (!result->ok || result->exit_code != 0) {
+        result->fields["supervision_status"] = "failed";
+        result->fields["goal_status"] = "failed";
+        result->fields["assistant_response_allowed"] = "false";
+        result->fields["final_answer_allowed"] = "false";
+        result->fields["terminal_state"] = "false";
+        result->fields["task_done"] = "false";
+        result->fields["completion_claim_allowed"] = "false";
+        result->fields["supervision_alarm"] = has_alarm ? "true" : "false";
+        result->fields["completion_guard"] =
+            "FAILED_RESULT: do not claim completion; inspect error and execute an explicit recovery tool";
+    } else if (has_alarm) {
         result->fields["supervision_status"] = "alarm";
         result->fields["goal_status"] = "failed";
         result->fields["assistant_response_allowed"] = "false";
@@ -1451,6 +1517,9 @@ void ApplySupervisionEnvelope(CommandResult * result) {
                 "CLIPS produced a continuation action without a recognized read-only safety boundary.");
         } else {
             result->fields["next_actions_count"] = "1";
+            result->fields["supervision_alarm"] = "false";
+            result->fields["supervision_alarm_code"] = "";
+            result->fields["supervision_alarm_message"] = "";
             result->fields["next_action_0_action_id"] = FirstNonEmpty(
                 GetFieldOrDefault(*result, "required_next_action_type", ""),
                 "mcp_tool_call",
@@ -1466,6 +1535,65 @@ void ApplySupervisionEnvelope(CommandResult * result) {
             result->fields["next_action_0_trace_id"] = GetFieldOrDefault(*result, "trace_id", "");
             result->fields["next_action_0_goal_id"] = GetFieldOrDefault(*result, "goal_id", "");
             result->fields["next_action_0_params_hash"] = StableContentChecksum(next_action_json);
+            if (required_tool == "lan_agent_delete_text_range_window_atomic"
+                || required_tool == "lan_agent_delete_next_text_range_atomic") {
+                const bool budget_internal_step =
+                    GetFieldOrDefault(*result, "task_memory_budget_internal_step", "") == "true";
+                const std::string goal_id = FirstNonEmpty(
+                    GetFieldOrDefault(*result, "goal_id", ""),
+                    GetFieldOrDefault(*result, "trace_id", ""),
+                    "mcp-comment-cleanup");
+                const std::string trace_id = GetFieldOrDefault(*result, "trace_id", "");
+                const std::string freeze_status = GetFieldOrDefault(*result, "has_more", "") == "true"
+                    || GetFieldOrDefault(*result, "continue_required", "") == "true"
+                    ? "needs_continue"
+                    : GetFieldOrDefault(*result, "status", "");
+                result->fields["long_loop_budget_recommended"] = "true";
+                result->fields["long_loop_freeze_tool_name"] = "lan_agent_task_memory_freeze";
+                result->fields["long_loop_budget_tool_name"] = "lan_agent_task_memory_execute_continuation_budget";
+                result->fields["long_loop_budget_policy"] =
+                    "when the same continuation may exceed model context, freeze this next_call_json once, then run bounded budget steps";
+                result->fields["long_loop_freeze_arguments_json"] =
+                    "{\"name\":\"lan_agent_task_memory_freeze\",\"arguments\":{"
+                    "\"goal_id\":\"" + codex_lan_agent::JsonEscape(goal_id) + "\","
+                    "\"trace_id\":\"" + codex_lan_agent::JsonEscape(trace_id) + "\","
+                    "\"current_goal\":\"continue bounded comment cleanup until completion gate allows final answer\","
+                    "\"current_tool\":\"" + codex_lan_agent::JsonEscape(required_tool) + "\","
+                    "\"current_file\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "file_path", "")) + "\","
+                    "\"last_status\":\"" + codex_lan_agent::JsonEscape(freeze_status) + "\","
+                    "\"last_has_more\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "has_more", "")) + "\","
+                    "\"terminal_state\":false,"
+                    "\"completion_claim_allowed\":false,"
+                    "\"completed_step_count\":0,"
+                    "\"remaining_work\":\"continue required MCP tool calls until terminal_state=true\","
+                    "\"next_call_json\":\"" + codex_lan_agent::JsonEscape(next_action_json) + "\""
+                    "}}";
+                result->fields["long_loop_budget_arguments_json"] = "";
+                result->fields["long_loop_budget_precondition"] =
+                    "call required_tool_arguments_json for lan_agent_task_memory_freeze first; budget arguments are emitted by freeze";
+                result->fields["direct_continuation_tool_name"] = required_tool;
+                result->fields["direct_continuation_arguments_json"] = next_action_json;
+                if (!budget_internal_step) {
+                    result->fields["task_execution_in_mcp_required"] = "true";
+                    result->fields["forced_task_memory_execution"] = "true";
+                    result->fields["required_tool_name"] = "lan_agent_task_memory_freeze";
+                    result->fields["required_tool_arguments_json"] =
+                        result->fields["long_loop_freeze_arguments_json"];
+                    result->fields["next_call_json"] =
+                        result->fields["long_loop_freeze_arguments_json"];
+                    result->fields["next_action"] =
+                        "tool_call_only: freeze this long continuation into task_memory, then run lan_agent_task_memory_execute_continuation_budget";
+                    result->fields["next_action_0_tool_name"] = "lan_agent_task_memory_freeze";
+                    result->fields["next_action_0_safety_class"] =
+                        ResolveNextActionSafetyClass("lan_agent_task_memory_freeze");
+                    result->fields["next_action_0_params_json"] =
+                        result->fields["long_loop_freeze_arguments_json"];
+                    result->fields["next_action_0_params_hash"] =
+                        StableContentChecksum(result->fields["long_loop_freeze_arguments_json"]);
+                    result->fields["next_action_0_reason"] =
+                        "long loop must run under MCP task_memory budget instead of model-side repeated calls";
+                }
+            }
         }
     } else if (GetFieldOrDefault(*result, "next_actions_count", "").empty()) {
         result->fields["next_actions_count"] = "0";
@@ -1560,11 +1688,7 @@ std::string TaskMemoryRunnerField(
 }
 
 std::string NormalizeTaskMemoryRunnerNextCallJson(std::string value) {
-    value = Trim(value);
-    if (value == "\"\"" || value == "''" || ToLowerAscii(value) == "null") {
-        return std::string();
-    }
-    return value;
+    return codex_lan_agent::TaskMemoryNormalizeNextCallJson(value);
 }
 
 std::string BuildTaskMemoryRunnerAppendParamsJson(
@@ -1634,9 +1758,29 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
     if (resume_context.empty()) {
         result.ok = false;
         result.exit_code = 404;
+        result.fields["status"] = "failed";
+        result.fields["record_model"] = "mcp_task_memory_execute_continuation_budget_response_v1";
+        result.fields["goal_id"] = goal_id;
+        result.fields["budget_status"] = "blocked_missing_resume_context";
+        result.fields["terminal_state"] = "false";
+        result.fields["task_done"] = "false";
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["assistant_response_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        result.fields["continue_required"] = "false";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["budget_requires_frozen_resume_context"] = "true";
         result.fields["error"] = "resume context not found";
         result.fields["resume_context_path"] = resume_path.string();
-        result.fields["next_action"] = "call lan_agent_task_memory_freeze first";
+        codex_lan_agent::ApplyTaskMemoryCleanHandoffFields(
+            &result,
+            goal_id,
+            "",
+            max_steps,
+            false,
+            false);
+        result.fields["next_action"] =
+            "do not call budget directly before freeze; call the previous required_tool_arguments_json for lan_agent_task_memory_freeze first";
         return result;
     }
 
@@ -1648,6 +1792,7 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
     bool terminal_state = codex_lan_agent::TaskMemoryExtractBoolField(resume_context, "terminal_state", false);
     std::string current_call_json = NormalizeTaskMemoryRunnerNextCallJson(
         ExtractJsonString(resume_context, "next_call_json"));
+    bool missing_initial_next_call = !terminal_state && Trim(current_call_json).empty();
     const std::string now = IsoTimestampNow();
     const std::string budget_run_id = "budget-" + codex_lan_agent::TaskMemoryStableChecksum(
         goal_id + "|" + trace_id + "|" + std::to_string(last_verified_step) + "|" + now);
@@ -1661,6 +1806,10 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
     std::string block_reason;
     std::string last_tool;
     CommandResult last_step_result;
+    if (missing_initial_next_call) {
+        blocked = true;
+        block_reason = "NEXT_CALL_JSON_MISSING";
+    }
 
     while (!terminal_state && !Trim(current_call_json).empty() && executed_step_count < max_steps) {
         current_call_json = InjectTraceIdIntoContinuationCallJson(current_call_json, trace_id);
@@ -1691,6 +1840,7 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
 
         JsonRequestView step_params(arguments_json);
         CommandResult step_result = handler_it->second(config, step_params);
+        step_result.fields["task_memory_budget_internal_step"] = "true";
         ApplyRequestRuleFields(tool_name, step_params, &step_result);
         LanResultBuilder(&step_result).Finalize(config, tool_name);
         ApplyAiConclusionValidityGuards(&step_result);
@@ -1828,6 +1978,7 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
 
     result.ok = !blocked;
     result.exit_code = blocked ? 422 : 0;
+    result.fields["status"] = blocked ? "failed" : "success";
     result.fields["record_model"] = "mcp_task_memory_execute_continuation_budget_response_v1";
     result.fields["goal_id"] = goal_id;
     result.fields["trace_id"] = trace_id;
@@ -1851,6 +2002,7 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         TaskMemoryRunnerField(last_step_result, "summary"),
         TaskMemoryRunnerField(last_step_result, "result"),
         "");
+    result.fields["last_verification_ok"] = TaskMemoryRunnerField(last_step_result, "verification_ok");
     result.fields["resume_context_path"] = resume_path.string();
     result.fields["budget_plan_path"] = budget_path.string();
     result.fields["step_ledger_path"] = (root / "step_ledger.jsonl").string();
@@ -1861,7 +2013,18 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
     result.fields["auto_continue_required"] = continue_required ? "true" : "false";
     result.fields["assistant_response_allowed"] = completion_claim_allowed ? "true" : "false";
     result.fields["final_answer_allowed"] = completion_claim_allowed ? "true" : "false";
+    result.fields["verification_ok"] =
+        (completion_claim_allowed && TaskMemoryRunnerBoolField(last_step_result, "verification_ok", false))
+            ? "true"
+            : "false";
     result.fields["must_continue_until"] = terminal_state ? "" : "terminal_state=true";
+    codex_lan_agent::ApplyTaskMemoryCleanHandoffFields(
+        &result,
+        goal_id,
+        trace_id,
+        max_steps,
+        terminal_state,
+        continue_required);
     result.fields["next_call_json"] = current_call_json;
     result.fields["semantic_outcome"] = terminal_state
         ? "continuation_budget_terminal"
@@ -1911,6 +2074,75 @@ std::string BuildTaskMemoryAcceptanceParamsJson(
     }
     output << "}";
     return output.str();
+}
+
+CommandResult BuildTaskMemoryResumeAndExecuteResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    const std::string goal_id = params.GetString("goal_id");
+    CommandResult result;
+    if (goal_id.empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["status"] = "failed";
+        result.fields["record_model"] = "mcp_task_memory_resume_and_execute_response_v1";
+        result.fields["error"] = "goal_id is required";
+        result.fields["terminal_state"] = "false";
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        result.fields["next_action"] = "provide goal_id for the archived task memory";
+        return result;
+    }
+
+    const int max_steps = std::min(64, std::max(1, params.GetInt("max_steps", params.GetInt("step_budget", 10))));
+    const bool execute = params.GetBool("execute", true);
+    const bool dry_run = params.GetBool("dry_run", false);
+    CommandResult budget = BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
+        config,
+        JsonRequestView(BuildTaskMemoryAcceptanceParamsJson(
+            {
+                {"goal_id", goal_id},
+                {"trace_id", params.GetString("trace_id")}
+            },
+            {
+                {"max_steps", max_steps}
+            },
+            {
+                {"execute", execute},
+                {"dry_run", dry_run}
+            })));
+
+    result = budget;
+    result.fields["inner_record_model"] = GetFieldOrDefault(budget, "record_model", "");
+    result.fields["record_model"] = "mcp_task_memory_resume_and_execute_response_v1";
+    result.fields["resume_execute_entry"] = "true";
+    result.fields["resume_execute_mode"] = execute && !dry_run
+        ? "read_resume_context_and_execute_budget"
+        : "read_resume_context_and_plan_budget";
+    result.fields["max_steps"] = std::to_string(max_steps);
+    if (GetFieldOrDefault(result, "budget_requires_frozen_resume_context", "") == "true") {
+        result.fields["resume_recovery_status"] = "missing_archive_resume_context";
+        result.fields["resume_recovery_tool_name"] = "lan_agent_task_memory_freeze";
+        result.fields["resume_recovery_instruction"] =
+            "the prior task was not frozen; freeze the last known required continuation first, then call this resume tool again";
+        result.fields["next_action"] =
+            "archive resume context is missing; continue from the prior task by calling lan_agent_task_memory_freeze with the last required_tool_arguments_json";
+    } else if (GetFieldOrDefault(result, "continue_required", "") == "true") {
+        result.fields["required_next_action_type"] = "mcp_tool_call";
+        result.fields["required_tool_name"] = "lan_agent_task_memory_resume_and_execute";
+        result.fields["required_tool_arguments_json"] =
+            codex_lan_agent::BuildTaskMemoryResumeAndExecuteCallJson(
+                goal_id,
+                GetFieldOrDefault(result, "trace_id", params.GetString("trace_id")),
+                max_steps);
+        result.fields["next_call_json"] = result.fields["required_tool_arguments_json"];
+        result.fields["next_action"] =
+            "tool_call_only: call lan_agent_task_memory_resume_and_execute again until terminal_state=true";
+    } else if (GetFieldOrDefault(result, "terminal_state", "") == "true") {
+        result.fields["next_action"] =
+            "archived task reached terminal state; final claim still requires verification_ok=true";
+    }
+    return result;
 }
 
 std::string BuildTaskMemoryAcceptanceDeleteNextCallJson(
@@ -3343,7 +3575,14 @@ void ApplyAiConclusionValidityGuards(CommandResult * result) {
         || GetFieldOrDefault(*result, "supervision_status", "") == "closed_loop_continue"
         || GetFieldOrDefault(*result, "continue_required", "") == "true"
         || GetFieldOrDefault(*result, "has_more", "") == "true";
-    const bool tool_failed = !result->ok || result->exit_code != 0 || (explicit_not_verified && !continuation_required);
+    const bool explicit_failed_status =
+        GetFieldOrDefault(*result, "status", "") == "failed"
+        || GetFieldOrDefault(*result, "budget_status", "") == "blocked"
+        || GetFieldOrDefault(*result, "conversation_close_status", "") == "close_blocked_missing_continuation";
+    const bool tool_failed = !result->ok
+        || result->exit_code != 0
+        || explicit_failed_status
+        || (explicit_not_verified && !continuation_required);
     const bool analysis_blocked = GetFieldOrDefault(*result, "analysis_allowed", "true") == "false";
     const bool batch_incomplete = GetFieldOrDefault(*result, "batch_completion", "") == "incomplete"
         && std::atoi(GetFieldOrDefault(*result, "remaining_batch_file_count", "0").c_str()) != 0;

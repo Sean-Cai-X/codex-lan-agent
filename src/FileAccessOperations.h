@@ -15,6 +15,31 @@
 
 std::vector<std::string> SplitLinesPreserveText(const std::string & text);
 
+std::string NormalizeLocalAiPrimaryIntent(const std::string & primary_intent) {
+    const std::string lowered = ToLowerAscii(Trim(primary_intent));
+    if (lowered == "delete comments"
+        || lowered == "remove comments"
+        || lowered == "strip comments"
+        || lowered == "comment cleanup"
+        || lowered == "cleanup comments"
+        || lowered == "comment_cleanup"
+        || lowered == "delete_comments"
+        || lowered == "remove_comments"
+        || lowered == "strip_comments"
+        || lowered == "删除注释"
+        || lowered == "清理注释"
+        || lowered == "去除注释"
+        || lowered == "移除注释"
+        || lowered == "删注释") {
+        return "comment_cleanup";
+    }
+    return primary_intent;
+}
+
+bool IsLocalAiCommentCleanupIntent(const std::string & primary_intent) {
+    return NormalizeLocalAiPrimaryIntent(primary_intent) == "comment_cleanup";
+}
+
 std::string BuildJsonStringArrayFromStrings(const std::vector<std::string> & values) {
     std::ostringstream output;
     output << "[";
@@ -2527,8 +2552,11 @@ CommandResult ProbeTextFileResult(
         ++total_lines;
     }
 
-    const std::string lowered_intent = ToLowerAscii(Trim(primary_intent));
-    const bool segmented_intent = lowered_intent.find("comment") != std::string::npos
+    const std::string canonical_primary_intent = NormalizeLocalAiPrimaryIntent(primary_intent);
+    const std::string lowered_intent = ToLowerAscii(Trim(canonical_primary_intent));
+    const bool comment_cleanup_intent = IsLocalAiCommentCleanupIntent(primary_intent);
+    const bool segmented_intent = comment_cleanup_intent
+        || lowered_intent.find("comment") != std::string::npos
         || lowered_intent.find("cleanup") != std::string::npos
         || lowered_intent.find("localized") != std::string::npos
         || lowered_intent.find("edit") != std::string::npos
@@ -2538,19 +2566,34 @@ CommandResult ProbeTextFileResult(
         ? "large"
         : (file_bytes >= 64ULL * 1024ULL ? "medium" : "small");
     const int recommended_read_max_lines = file_bytes >= (256ULL * 1024ULL) || total_lines >= 3000 ? 200 : 500;
-    const std::string recommended_next_tool = segmented_intent
+    const std::string recommended_next_tool = comment_cleanup_intent
+        ? "lan_agent_delete_text_range_window_atomic"
+        : (segmented_intent
         ? "lan_agent_scan_text_ranges"
-        : "lan_agent_read_text_file";
+        : "lan_agent_read_text_file");
     const std::string recommended_scan_mode = segmented_intent ? "comments" : "";
 
     std::ostringstream next_call_json;
-    if (segmented_intent) {
+    if (comment_cleanup_intent) {
+        next_call_json << "{\"name\":\"lan_agent_delete_text_range_window_atomic\",\"arguments\":{\"file_path\":\""
+                       << codex_lan_agent::JsonEscape(file_path)
+                       << "\",\"scan_mode\":\"comments\",\"start_line\":1,\"next_start_line\":1,\"max_lines\":200"
+                       << ",\"primary_intent\":\"comment_cleanup\"";
+        if (!trace_id.empty()) {
+            next_call_json << ",\"trace_id\":\""
+                           << codex_lan_agent::JsonEscape(trace_id)
+                           << "\"";
+        }
+        next_call_json << ",\"probe_ref\":\""
+                       << codex_lan_agent::JsonEscape(normalized.string())
+                       << "\",\"probe_ready\":true}}";
+    } else if (segmented_intent) {
         next_call_json << "{\"name\":\"lan_agent_scan_text_ranges\",\"arguments\":{\"file_path\":\""
                        << codex_lan_agent::JsonEscape(file_path)
                        << "\",\"scan_mode\":\"comments\"";
-        if (!primary_intent.empty()) {
+        if (!canonical_primary_intent.empty()) {
             next_call_json << ",\"primary_intent\":\""
-                           << codex_lan_agent::JsonEscape(primary_intent)
+                           << codex_lan_agent::JsonEscape(canonical_primary_intent)
                            << "\"";
         }
         if (!trace_id.empty()) {
@@ -2567,9 +2610,9 @@ CommandResult ProbeTextFileResult(
                        << "\",\"max_lines\":"
                        << recommended_read_max_lines
                        << ",\"start_line\":1";
-        if (!primary_intent.empty()) {
+        if (!canonical_primary_intent.empty()) {
             next_call_json << ",\"primary_intent\":\""
-                           << codex_lan_agent::JsonEscape(primary_intent)
+                           << codex_lan_agent::JsonEscape(canonical_primary_intent)
                            << "\"";
         }
         if (!trace_id.empty()) {
@@ -2610,6 +2653,8 @@ CommandResult ProbeTextFileResult(
     result.fields["auto_continue_required"] = "false";
     result.fields["analysis_allowed"] = "true";
     result.fields["file_length_class"] = file_length_class;
+    result.fields["primary_intent"] = canonical_primary_intent;
+    result.fields["normalized_primary_intent"] = canonical_primary_intent;
     result.fields["recommended_next_tool"] = recommended_next_tool;
     result.fields["recommended_read_max_lines"] = std::to_string(recommended_read_max_lines);
     result.fields["recommended_scan_mode"] = recommended_scan_mode;
@@ -2618,7 +2663,9 @@ CommandResult ProbeTextFileResult(
     result.fields["evidence_ref"] = normalized.string();
     result.fields["next_tool_name"] = recommended_next_tool;
     result.fields["next_action"] = segmented_intent
-        ? "call lan_agent_scan_text_ranges first, then lan_agent_prepare_edit_windows for segmented edits"
+        ? (comment_cleanup_intent
+            ? "call lan_agent_delete_text_range_window_atomic with max_lines=200 and repeat next_call_json until has_more=false"
+            : "call lan_agent_scan_text_ranges first, then lan_agent_prepare_edit_windows for segmented edits")
         : "call lan_agent_read_text_file with a bounded page after the probe confirms file size";
     result.fields["summary"] = "text file probe complete";
     result.fields["status"] = "success";

@@ -270,6 +270,18 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "file_append"
         },
         {
+            "task_memory_resume_and_execute",
+            "Fresh-chat one-call entry for an archived MCP task. Reads latest_resume_context for goal_id, executes a bounded continuation budget inside MCP, refreshes task memory, and returns either terminal verification fields or the same tool as required next action.",
+            "lan_agent_task_memory_resume_and_execute",
+            "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"max_steps\":\"optional integer capped at 64\",\"step_budget\":\"optional integer alias\",\"dry_run\":\"optional bool default false\",\"execute\":\"optional bool default true\"}",
+            "{\"record_model\":\"mcp_task_memory_resume_and_execute_response_v1\",\"executed_step_count\":\"integer\",\"terminal_state\":\"bool\",\"verification_ok\":\"bool\"}",
+            "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"inspect current compact continuation state if resume execution is blocked\"}",
+            "[\"goal_id\",\"trace_id\",\"resume_execute_mode\",\"budget_status\",\"executed_step_count\",\"last_verified_step\",\"completion_claim_allowed\",\"terminal_state\",\"verification_ok\",\"continue_required\",\"required_tool_name\",\"required_tool_arguments_json\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
+            "medium",
+            "false",
+            "file_append"
+        },
+        {
             "task_memory_build_kv_snapshot",
             "Build a file-backed KV snapshot for one task_memory goal using the RocksDB-compatible key schema.",
             "lan_agent_task_memory_build_kv_snapshot",
@@ -1023,6 +1035,17 @@ const std::vector<McpCapabilitySpec> & GetMcpCapabilitySpecs() {
             "structured JSON + file refs",
             "bounded_continuation_budget",
             "Second-stage bridge from passive resume_context to bounded continuation execution. Phase 2 executes only allowlisted single-file text-range cleanup tools."
+        },
+        {
+            "task_memory_resume_and_execute",
+            "codex_lan_agent_task_memory",
+            "codex-lan-agent",
+            "goal_id,trace_id?,max_steps?,step_budget?,dry_run?,execute?",
+            "resume_execute_mode,budget_status,executed_step_count,last_verified_step,next_call_json,completion_claim_allowed,terminal_state,verification_ok,continue_required,result_ref,evidence_ref",
+            "data_root/task_memory/{goal_id}/latest_resume_context.json + budget_runs/{budget_run_id}.json",
+            "structured JSON + file refs",
+            "fresh_chat_resume_execution",
+            "One-call fresh-model continuation entry. Use this when an archived MCP task_memory goal already exists and the new chat should continue without re-reading the old conversation."
         },
         {
             "task_memory_build_kv_snapshot",

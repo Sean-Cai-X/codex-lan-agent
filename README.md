@@ -194,7 +194,7 @@ $response.result.tools.Count  # 应输出工具总数
 | `lan_agent_semantic_grid_context_bundle` | 根据任务意图生成 LLM 上下文 bundle | `artifact_summary_path` |
 | `lan_agent_semantic_grid_incremental_update` | 多轮增量追加，支持 content_hash 去重 | `artifact_summary_path`, `source_text` |
 
-### 4.3 Task Memory 工具（12 个）
+### 4.3 Task Memory 工具（13 个）
 
 Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上下文中的"任务进度/下一步调用/已验证步骤/关键切片"外移到文件对象层，使全新模型只需读取 `latest_resume_context.json` 即可续接。
 
@@ -204,6 +204,7 @@ Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上
 | `lan_agent_task_memory_append_step` | 追加一条已验证 continuation step 到 `step_ledger.jsonl`，并刷新 `latest_resume_context.json` | `goal_id` |
 | `lan_agent_task_memory_execute_continuation_budget` | 在 MCP 服务端执行 N 步 allowlisted continuation（默认 dry-run 写预算计划，`execute=true` 才真正执行）；预算耗尽时返回 `next_call_json`、`completion_claim_allowed=false` | `goal_id` |
 | `lan_agent_task_memory_resume_context` | 读取 `latest_resume_context.json`，作为新模型的首读入口（默认禁止读全历史） | `goal_id` |
+| `lan_agent_task_memory_resume_and_execute` | **fresh-chat 一次性续接入口**：读 `latest_resume_context.json` → 在 MCP 内执行 bounded continuation budget → 刷新任务记忆；返回终止验证字段或本工具自身的 `next_call_json`，直到 `terminal_state=true`。比手动 `resume_context` + `execute_continuation_budget` 链式调用更直接 | `goal_id` |
 | `lan_agent_task_memory_build_kv_snapshot` | 把 goal/latest/trace/slice/budget 索引到 `kv_snapshot/index.jsonl`，键 schema 与后续 RocksDB 后端一致 | `goal_id` |
 | `lan_agent_task_memory_kv_lookup` | 在文件 KV 快照上按 key 或 `kind=latest\|trace\|slice\|budget\|...` 查询 | `goal_id` |
 | `lan_agent_task_memory_rocksdb_mirror` | 把文件 KV 快照镜像到可选 RocksDB 读后端（`CODEX_LAN_AGENT_WITH_ROCKSDB=ON` 时启用）；写 `rocksdb_mirror_manifest.json`；**不替换文件对象层源真地位** | `goal_id` |
@@ -414,7 +415,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 | L5 | `lan_agent_build_program_slice` | 获取符号级切片（backward/forward） |
 | L6 | `lan_agent_query_*_artifact` | 从已写入的 artifact 二次查询，无需重跑 Clang |
 | SG | `lan_agent_semantic_grid_*` | 长文本语义网格：解构、归纳、检索、溯源、上下文重构、增量 |
-| TM | `lan_agent_task_memory_*` | 长任务记忆：freeze / append_step / continuation budget / kv snapshot / rocksdb mirror / parity check / structure manifest / migration acceptance |
+| TM | `lan_agent_task_memory_*` | 长任务记忆：freeze / append_step / continuation budget / **resume_and_execute（fresh-chat 一次性续接）** / kv snapshot / rocksdb mirror / parity check / structure manifest / migration acceptance |
 
 ### 5.3 模型决策规则
 
@@ -536,6 +537,28 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
        返回 completion_claim_allowed=false + 新的 next_call_json
   5. 任务完成后：terminal_state=true, completion_claim_allowed=true
 ```
+
+> **fresh-chat 简化路径**：若 `goal_id` 已 freeze 过，新会话直接调一次
+> `lan_agent_task_memory_resume_and_execute(goal_id=..., max_steps=10)`
+> 即可，无需手动走 `resume_context` + `execute_continuation_budget` 链。详见 9.4.1 / 9.9。
+
+### 5.8 local AI 上下文治理（Overview 字段）
+
+`lan_agent_mcp_overview` 工具返回一组 `local_ai_*` 治理字段，约束本地模型在 MCP 协作中的上下文使用、会话关闭与任务交接行为。这些字段与 Task Memory 配套，构成"模型上下文最小化 + 跨会话干净交接"的完整契约。
+
+| 字段 | 作用 |
+|---|---|
+| `local_ai_context_policy` | 模型上下文必须 task-minimal：只含 current goal / current file / 一个 next MCP call / completion gate / artifact refs；**禁止** paste `tools/list` schemas / 全历史对话 / 全日志 / 全 artifact JSON 进 prompt |
+| `local_ai_conversation_close_policy` | 每个 interrupted/finished 会话必须保留 `conversation_close_status`；新会话先调 `next_chat_status_check_arguments_json` 或 `lan_agent_task_memory_resume_context`，再执行续接工作 |
+| `local_ai_context_bootstrap_json` | `record_model=mcp_context_bootstrap_v1`，显式列出 `include`（user_goal / goal_id / trace_id / current_file / required_tool_name / required_tool_arguments_json / clean_chat_close_allowed / new_chat_entry_arguments_json / completion_gate / result_ref / evidence_ref）与 `exclude`（full_tools_list / tool_schemas / old_chat_history / full_file_content / full_log_content / full_artifact_json），`lookup_policy=use refs and MCP query tools on demand` |
+| `local_ai_long_loop_policy` | 长循环场景：freeze 一次 task_memory；新会话直接调 `lan_agent_task_memory_resume_and_execute` 续接（不再要求手动链式调用） |
+| `local_ai_completion_gate` | 只有 `terminal_state=true` + `completion_claim_allowed=true` + `final_answer_allowed=true` + `verification_ok=true` 才能声明完成；`clean_chat_close_allowed=true` 仅代表当前会话可安全交接，**不代表任务完成** |
+| `local_ai_guidance_json` | 结构化指引 v1，含 `context` / `file_ops` / `comment_cleanup` / `long_loop` / `fresh_chat_resume` / `clean_handoff` / `conversation_close_status` / `completion_gate` 八个子段 |
+
+**关键语义**：
+- `clean_chat_close_allowed=true` ≠ 任务完成 —— 仅代表当前会话可以安全停止并把工作交给下一个会话。
+- `new_chat_entry_arguments_json` —— 由 `latest_resume_context.json` 回填，新会话首调用入口（通常指向 `lan_agent_task_memory_resume_and_execute`）。
+- `handoff_completion_claim=not_task_complete` —— 交接时禁止使用任务完成的措辞。
 
 ---
 
@@ -1079,7 +1102,7 @@ Task Memory 工具链把"任务进度"从模型上下文外移到 MCP 服务端�
 
 ```
 <data_root>/task_memory/{goal_id}/
-├── latest_resume_context.json   ← 新模型首读入口（compact_summary + next_call_json）
+├── latest_resume_context.json   ← 新模型首读入口（compact_summary + next_call_json + new_chat_entry_arguments_json）
 ├── step_ledger.jsonl            ← 已验证步骤账本（每步一行 JSON）
 ├── slices.jsonl                 ← 关键切片（key slices，跨步骤证据）
 ├── index_manifest.json          ← 增量索引清单
@@ -1088,6 +1111,8 @@ Task Memory 工具链把"任务进度"从模型上下文外移到 MCP 服务端�
 ├── handover.md                  ← 迁移交接 Markdown
 ├── rag_thread_migration/        ← RAG 线程迁移资产
 │   └── ...
+├── budget_runs/                 ← continuation budget 运行记录（execute_continuation_budget / resume_and_execute 写入）
+│   └── budget-{checksum}.json   ← 单次 budget run 记录：record_model=mcp_continuation_budget_run_v1，含 step_events[]
 ├── kv_snapshot/                 ← 文件 KV 快照（build_kv_snapshot 写入）
 │   └── index.jsonl
 ├── rocksdb_native/              ← 可选 RocksDB 镜像（rocksdb_mirror 写入）
@@ -1108,10 +1133,29 @@ Task Memory 工具链把"任务进度"从模型上下文外移到 MCP 服务端�
 
 ### 9.4 工具调用顺序
 
+#### 9.4.1 fresh-chat 一次性续接（推荐，已有 goal_id 时）
+
+若一个 goal 已经 freeze 过（即 `task_memory/{goal_id}/latest_resume_context.json` 已存在），**新会话不要再手动链式调用** `resume_context` + `execute_continuation_budget`，直接调一次：
+
+```json
+{
+  "name": "lan_agent_task_memory_resume_and_execute",
+  "arguments": { "goal_id": "<已有 goal_id>", "max_steps": 10 }
+}
+```
+
+工具内部完成：读 `latest_resume_context.json` → 跑 bounded continuation budget → 刷新任务记忆 → 写 `budget_runs/budget-{checksum}.json`。返回字段中：
+
+- `continue_required=true` → 按返回的 `required_tool_arguments_json` 再次调用本工具，直到 `terminal_state=true`
+- `budget_requires_frozen_resume_context=true` → 上一任务未 freeze，先调 `lan_agent_task_memory_freeze`
+- `terminal_state=true` → 仍需 `verification_ok=true` 才能 final claim
+
+#### 9.4.2 迁移验收必走顺序（首次或全链路）
+
 迁移验收的**必走顺序**（详见 [TASK_MEMORY_MIGRATION_ACCEPTANCE.md](TASK_MEMORY_MIGRATION_ACCEPTANCE.md)）：
 
 1. `lan_agent_task_memory_freeze` —— 创建文件对象层，写 `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `index_manifest.json` / `rag_thread_migration/*`
-2. `lan_agent_task_memory_resume_context` —— 新模型首读
+2. `lan_agent_task_memory_resume_context` —— 新模型首读（或直接用 9.4.1 的 `resume_and_execute`）
 3. `lan_agent_task_memory_execute_continuation_budget` —— 执行 allowlisted bounded continuation；非终态预算耗尽必须返回 `terminal_state=false` / `completion_claim_allowed=false` / `final_answer_allowed=false`
 4. `lan_agent_task_memory_build_kv_snapshot` —— 构建文件 KV 快照（源真仍是文件对象层）
 5. `lan_agent_task_memory_rocksdb_mirror` —— 镜像 KV 快照到原生 RocksDB（`CODEX_LAN_AGENT_WITH_ROCKSDB=ON` 时）；RocksDB 角色为 `mirror_read_backend`，**不替换源真**
@@ -1186,6 +1230,45 @@ TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
 | `budget/{budget_run_id}` | continuation budget 运行记录 |
 
 `kv_lookup` / `rocksdb_lookup` 支持显式 `key` 或 `kind` selector（`goal` / `latest` / `resume_context` / `trace` / `trace_step` / `slice` / `budget` / `trace_budget`）。
+
+### 9.9 fresh-chat 一次性续接：`resume_and_execute` 详解
+
+`lan_agent_task_memory_resume_and_execute` 是 fresh-chat 场景下的单一入口工具，把"读 resume context + 跑 continuation budget + 刷新任务记忆"压缩成一次调用，避免新会话手动链式调用 `resume_context` + `execute_continuation_budget`。
+
+#### 参数
+
+| 参数 | 类型 | 必需 | 默认 | 说明 |
+|---|---|---|---|---|
+| `goal_id` | string | 是 | — | 已归档任务的 goal ID |
+| `trace_id` | string | 否 | 继承自 resume_context | 追踪 ID |
+| `max_steps` | integer | 否 | 10 | MCP 续跑步数上限，server policy 上限 64 |
+| `step_budget` | integer | 否 | — | `max_steps` 别名 |
+| `dry_run` | boolean | 否 | `false` | 仅规划预算（区别于 `execute_continuation_budget` 的默认 `true`） |
+| `execute` | boolean | 否 | `true` | 是否真正执行白名单续跑（区别于 `execute_continuation_budget` 的默认 `false`） |
+
+#### 返回字段
+
+| 字段 | 含义 |
+|---|---|
+| `record_model` | `mcp_task_memory_resume_and_execute_response_v1` |
+| `inner_record_model` | 委派的 budget 子结果的 record_model |
+| `resume_execute_entry` | 恒为 `"true"` |
+| `resume_execute_mode` | `read_resume_context_and_execute_budget`（执行）或 `read_resume_context_and_plan_budget`（dry_run） |
+| `max_steps` | 实际生效的步数上限（clamp 到 1~64） |
+| `goal_id` / `trace_id` / `budget_run_id` / `budget_status` | 透传自 budget 子结果 |
+| `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` | 终止与验证字段（透传） |
+| `required_next_action_type` / `required_tool_name` / `required_tool_arguments_json` / `next_call_json` | 仅 `continue_required=true` 分支出现，`required_tool_name` 为本工具自身 |
+| `resume_recovery_status` / `resume_recovery_tool_name` / `resume_recovery_instruction` | 仅 `budget_requires_frozen_resume_context=true` 分支出现，指引先调 `lan_agent_task_memory_freeze` |
+
+#### 三种分支
+
+1. **`continue_required=true`**（非终态预算耗尽）—— 模型按返回的 `required_tool_arguments_json` 再次调用本工具，直到 `terminal_state=true`。**禁止**改写参数或插入其他工具调用。
+2. **`budget_requires_frozen_resume_context=true`**（归档缺失）—— 上一任务未 freeze，先调 `lan_agent_task_memory_freeze` 写入 `latest_resume_context.json`，再回到本工具。
+3. **`terminal_state=true`**（终态）—— 仍需 `verification_ok=true` 才能 final claim；否则按 `next_action` 字段指引修复验证。
+
+#### 产物文件
+
+每次调用写入 `task_memory/{goal_id}/budget_runs/budget-{checksum}.json`，内容为 `record_model=mcp_continuation_budget_run_v1` 的 budget run 记录（含 `step_events[]` 数组、`executed_step_count`、`budget_exhausted`、`blocked`、`block_reason`）。同时每步追加到 `step_ledger.jsonl`，并刷新 `latest_resume_context.json`。
 
 ---
 

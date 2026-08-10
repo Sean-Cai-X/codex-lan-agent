@@ -513,6 +513,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_task_memory_execute_continuation_budget", [](const AgentConfig & config, const JsonRequestView & params) {
             return BuildTaskMemoryExecuteContinuationBudgetRunnerResult(config, params);
         }},
+        {"lan_agent_task_memory_resume_and_execute", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildTaskMemoryResumeAndExecuteResult(config, params);
+        }},
         {"lan_agent_task_memory_build_kv_snapshot", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildTaskMemoryBuildKvSnapshotResult(config, params);
         }},

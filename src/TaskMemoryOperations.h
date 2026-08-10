@@ -144,13 +144,113 @@ inline std::string TaskMemoryParamStringOrRaw(
     return fallback;
 }
 
+inline void TaskMemoryReplaceAll(
+    std::string * value,
+    const std::string & from,
+    const std::string & to) {
+    if (value == nullptr || from.empty()) {
+        return;
+    }
+    std::size_t position = 0;
+    while ((position = value->find(from, position)) != std::string::npos) {
+        value->replace(position, from.size(), to);
+        position += to.size();
+    }
+}
+
+inline void TaskMemoryNormalizeEscapedJsonKey(
+    std::string * value,
+    const std::string & key) {
+    TaskMemoryReplaceAll(
+        value,
+        "\"\\\"" + key + "\\\"\"",
+        "\"" + key + "\"");
+}
+
 inline std::string TaskMemoryNormalizeNextCallJson(std::string value) {
     value = Trim(value);
     const std::string lowered = ToLowerAscii(value);
     if (value == "\"\"" || value == "''" || lowered == "null") {
         return std::string();
     }
+    if (ExtractJsonString(value, "name").empty()
+        && value.find("\\\"name\\\"") != std::string::npos) {
+        TaskMemoryNormalizeEscapedJsonKey(&value, "name");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "arguments");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "file_path");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "scan_mode");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "start_line");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "next_start_line");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "max_lines");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "primary_intent");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "trace_id");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "probe_ref");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "probe_ready");
+    }
     return value;
+}
+
+inline std::string BuildTaskMemoryResumeAndExecuteCallJson(
+    const std::string & goal_id,
+    const std::string & trace_id,
+    int max_steps) {
+    return "{\"name\":\"lan_agent_task_memory_resume_and_execute\",\"arguments\":{"
+        "\"goal_id\":\"" + JsonEscape(goal_id) + "\","
+        "\"trace_id\":\"" + JsonEscape(trace_id) + "\","
+        "\"max_steps\":" + std::to_string(std::max(1, max_steps)) + ","
+        "\"execute\":true,"
+        "\"dry_run\":false"
+        "}}";
+}
+
+inline std::string BuildTaskMemoryResumeContextCallJson(
+    const std::string & goal_id) {
+    return "{\"name\":\"lan_agent_task_memory_resume_context\",\"arguments\":{"
+        "\"goal_id\":\"" + JsonEscape(goal_id) + "\""
+        "}}";
+}
+
+inline void ApplyTaskMemoryCleanHandoffFields(
+    CommandResult * result,
+    const std::string & goal_id,
+    const std::string & trace_id,
+    int max_steps,
+    bool terminal_state,
+    bool continuation_available) {
+    if (result == nullptr) {
+        return;
+    }
+    result->fields["clean_chat_close_allowed"] =
+        (terminal_state || continuation_available) ? "true" : "false";
+    result->fields["conversation_close_allowed"] =
+        (terminal_state || continuation_available) ? "true" : "false";
+    result->fields["handoff_state"] = terminal_state
+        ? "terminal_complete"
+        : (continuation_available ? "ready_for_new_chat_resume" : "blocked_missing_continuation");
+    result->fields["conversation_close_status"] = terminal_state
+        ? "terminal_complete"
+        : (continuation_available ? "handoff_ready_not_complete" : "close_blocked_missing_continuation");
+    result->fields["handoff_completion_claim"] = terminal_state
+        ? "task_completion_gate_required"
+        : "not_task_complete";
+    result->fields["next_chat_status_check_required"] =
+        (terminal_state || continuation_available) ? "true" : "false";
+    result->fields["next_chat_status_check_tool_name"] =
+        (terminal_state || continuation_available) ? "lan_agent_task_memory_resume_context" : "";
+    result->fields["next_chat_status_check_arguments_json"] =
+        (terminal_state || continuation_available) ? BuildTaskMemoryResumeContextCallJson(goal_id) : "";
+    result->fields["next_chat_must_verify_fields_json"] =
+        "[\"terminal_state\",\"completion_claim_allowed\",\"final_answer_allowed\",\"verification_ok\","
+        "\"clean_chat_close_allowed\",\"conversation_close_status\",\"new_chat_entry_arguments_json\"]";
+    result->fields["new_chat_entry_tool_name"] = continuation_available
+        ? "lan_agent_task_memory_resume_and_execute"
+        : "";
+    result->fields["new_chat_entry_arguments_json"] = continuation_available
+        ? BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, max_steps)
+        : "";
+    result->fields["new_chat_resume_instruction"] = continuation_available
+        ? "start a new chat and call new_chat_entry_arguments_json; do not reload the old conversation"
+        : (terminal_state ? "no resume is required; inspect verification fields before final claim" : "repair or freeze continuation before ending the chat");
 }
 
 inline std::string BuildDefaultRagMigrationManifest(
@@ -251,6 +351,11 @@ inline std::string BuildResumeContextJson(
     const bool completion_claim_allowed = params.GetBool("completion_claim_allowed", false) && terminal_state;
     const std::string next_call_json = TaskMemoryNormalizeNextCallJson(
         TaskMemoryParamStringOrRaw(params, "next_call_json"));
+    const bool continuation_available = !terminal_state && !Trim(next_call_json).empty();
+    const int resume_max_steps = std::max(1, params.GetInt("budget_max_steps", 10));
+    const std::string conversation_close_status = terminal_state
+        ? "terminal_complete"
+        : (continuation_available ? "handoff_ready_not_complete" : "close_blocked_missing_continuation");
     std::ostringstream output;
     output
         << "{\n"
@@ -260,6 +365,18 @@ inline std::string BuildResumeContextJson(
         << "  \"trace_id\":\"" << JsonEscape(trace_id) << "\",\n"
         << "  \"terminal_state\":" << (terminal_state ? "true" : "false") << ",\n"
         << "  \"completion_claim_allowed\":" << (completion_claim_allowed ? "true" : "false") << ",\n"
+        << "  \"final_answer_allowed\":" << (completion_claim_allowed ? "true" : "false") << ",\n"
+        << "  \"verification_ok\":" << (params.GetBool("verification_ok", false) && terminal_state ? "true" : "false") << ",\n"
+        << "  \"clean_chat_close_allowed\":" << ((terminal_state || continuation_available) ? "true" : "false") << ",\n"
+        << "  \"conversation_close_allowed\":" << ((terminal_state || continuation_available) ? "true" : "false") << ",\n"
+        << "  \"conversation_close_status\":\"" << JsonEscape(conversation_close_status) << "\",\n"
+        << "  \"handoff_completion_claim\":\"" << (terminal_state ? "task_completion_gate_required" : "not_task_complete") << "\",\n"
+        << "  \"next_chat_status_check_required\":" << ((terminal_state || continuation_available) ? "true" : "false") << ",\n"
+        << "  \"next_chat_status_check_tool_name\":\"" << ((terminal_state || continuation_available) ? "lan_agent_task_memory_resume_context" : "") << "\",\n"
+        << "  \"next_chat_status_check_arguments_json\":\"" << JsonEscape((terminal_state || continuation_available) ? BuildTaskMemoryResumeContextCallJson(goal_id) : "") << "\",\n"
+        << "  \"next_chat_must_verify_fields_json\":\"[\\\"terminal_state\\\",\\\"completion_claim_allowed\\\",\\\"final_answer_allowed\\\",\\\"verification_ok\\\",\\\"clean_chat_close_allowed\\\",\\\"conversation_close_status\\\",\\\"new_chat_entry_arguments_json\\\"]\",\n"
+        << "  \"new_chat_entry_tool_name\":\"" << (continuation_available ? "lan_agent_task_memory_resume_and_execute" : "") << "\",\n"
+        << "  \"new_chat_entry_arguments_json\":\"" << JsonEscape(continuation_available ? BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, resume_max_steps) : "") << "\",\n"
         << "  \"current_tool\":\"" << JsonEscape(params.GetString("current_tool")) << "\",\n"
         << "  \"next_call_json\":\"" << JsonEscape(next_call_json) << "\",\n"
         << "  \"compact_summary\":\"" << JsonEscape(params.GetString("compact_summary")) << "\",\n"
@@ -550,6 +667,37 @@ inline CommandResult BuildTaskMemoryFreezeResult(
     const std::string handover = TaskMemoryFirstNonEmpty(
         params.GetString("migration_handover_markdown"),
         BuildMigrationHandoverMarkdown(goal_id, trace_id));
+    const bool terminal_state = params.GetBool("terminal_state", false);
+    const std::string freeze_next_call_json = TaskMemoryNormalizeNextCallJson(
+        TaskMemoryParamStringOrRaw(params, "next_call_json"));
+    if (!terminal_state && Trim(freeze_next_call_json).empty()) {
+        result.ok = false;
+        result.exit_code = 422;
+        result.fields["status"] = "failed";
+        result.fields["record_model"] = "mcp_task_memory_freeze_response_v1";
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        result.fields["error"] = "NEXT_CALL_JSON_MISSING_FOR_FREEZE";
+        result.fields["terminal_state"] = "false";
+        result.fields["task_done"] = "false";
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["assistant_response_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        result.fields["verification_ok"] = "false";
+        result.fields["continue_required"] = "false";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["must_continue_until"] = "valid_next_call_json";
+        ApplyTaskMemoryCleanHandoffFields(
+            &result,
+            goal_id,
+            trace_id,
+            std::max(1, params.GetInt("budget_max_steps", 10)),
+            false,
+            false);
+        result.fields["next_action"] =
+            "freeze rejected: non-terminal task_memory handoff requires the exact previous next_call_json; do not claim completion";
+        return result;
+    }
     const std::string resume_context = BuildResumeContextJson(
         params,
         goal_id,
@@ -607,6 +755,8 @@ inline CommandResult BuildTaskMemoryFreezeResult(
         return result;
     }
 
+    result.ok = true;
+    result.exit_code = 0;
     result.fields["record_model"] = "mcp_task_memory_freeze_response_v1";
     result.fields["goal_id"] = goal_id;
     result.fields["trace_id"] = trace_id;
@@ -623,15 +773,45 @@ inline CommandResult BuildTaskMemoryFreezeResult(
     result.fields["resume_context_path"] = (root / "latest_resume_context.json").string();
     result.fields["completion_claim_allowed"] =
         (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
-    result.fields["terminal_state"] = params.GetBool("terminal_state", false) ? "true" : "false";
-    result.fields["task_done"] = params.GetBool("terminal_state", false) ? "true" : "false";
+    const bool completion_claim_allowed =
+        params.GetBool("completion_claim_allowed", false) && terminal_state;
+    const std::string budget_arguments_json =
+        "{\"name\":\"lan_agent_task_memory_execute_continuation_budget\",\"arguments\":{"
+        "\"goal_id\":\"" + JsonEscape(goal_id) + "\","
+        "\"trace_id\":\"" + JsonEscape(trace_id) + "\","
+        "\"max_steps\":" + std::to_string(std::max(1, params.GetInt("budget_max_steps", 10))) + ","
+        "\"execute\":true,"
+        "\"dry_run\":false"
+        "}}";
+    result.fields["status"] = terminal_state ? "success" : "needs_continue";
+    result.fields["terminal_state"] = terminal_state ? "true" : "false";
+    result.fields["task_done"] = terminal_state ? "true" : "false";
     result.fields["final_answer_allowed"] =
-        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
+        completion_claim_allowed ? "true" : "false";
     result.fields["assistant_response_allowed"] =
-        (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
-    result.fields["must_continue_until"] = params.GetBool("terminal_state", false) ? "" : "terminal_state=true";
+        completion_claim_allowed ? "true" : "false";
+    result.fields["continue_required"] = terminal_state ? "false" : "true";
+    result.fields["auto_continue_required"] = terminal_state ? "false" : "true";
+    result.fields["must_continue_until"] = terminal_state ? "" : "terminal_state=true";
+    ApplyTaskMemoryCleanHandoffFields(
+        &result,
+        goal_id,
+        trace_id,
+        std::max(1, params.GetInt("budget_max_steps", 10)),
+        terminal_state,
+        !terminal_state && !Trim(freeze_next_call_json).empty());
+    if (!terminal_state) {
+        result.fields["task_execution_in_mcp_required"] = "true";
+        result.fields["forced_task_memory_execution"] = "true";
+        result.fields["required_next_action_type"] = "mcp_tool_call";
+        result.fields["required_tool_name"] = "lan_agent_task_memory_execute_continuation_budget";
+        result.fields["required_tool_arguments_json"] = budget_arguments_json;
+        result.fields["next_call_json"] = budget_arguments_json;
+    }
     result.fields["semantic_outcome"] = "task_memory_frozen";
-    result.fields["next_action"] = "read lan_agent_task_memory_resume_context before continuing this goal";
+    result.fields["next_action"] = terminal_state
+        ? "task memory frozen at terminal state"
+        : "tool_call_only: run lan_agent_task_memory_execute_continuation_budget with execute=true and dry_run=false";
     result.fields["result_ref"] = (root / "latest_resume_context.json").string();
     result.fields["evidence_ref"] = (migration_dir / "4_migration_handover.md").string();
     return result;
@@ -652,6 +832,34 @@ inline CommandResult BuildTaskMemoryAppendStepResult(
     const int step_index = std::max(0, params.GetInt("step_index", 0));
     const std::filesystem::path root = BuildTaskMemoryRoot(config, goal_id);
     const std::filesystem::path ledger_path = root / "step_ledger.jsonl";
+    const bool terminal_state = params.GetBool("terminal_state", false);
+    const bool has_more = params.GetBool("has_more", false);
+    const std::string append_next_call_json = TaskMemoryNormalizeNextCallJson(
+        TaskMemoryParamStringOrRaw(params, "next_call_json"));
+    if (!terminal_state && has_more && Trim(append_next_call_json).empty()) {
+        result.ok = false;
+        result.exit_code = 422;
+        result.fields["status"] = "failed";
+        result.fields["record_model"] = "mcp_task_memory_append_step_response_v1";
+        result.fields["goal_id"] = goal_id;
+        result.fields["trace_id"] = trace_id;
+        result.fields["error"] = "NEXT_CALL_JSON_MISSING_FOR_APPEND_STEP";
+        result.fields["terminal_state"] = "false";
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        result.fields["verification_ok"] = "false";
+        result.fields["must_continue_until"] = "valid_next_call_json";
+        ApplyTaskMemoryCleanHandoffFields(
+            &result,
+            goal_id,
+            trace_id,
+            10,
+            false,
+            false);
+        result.fields["next_action"] =
+            "append_step rejected: has_more=true requires next_call_json; do not claim completion";
+        return result;
+    }
 
     std::ostringstream record;
     record
@@ -667,7 +875,7 @@ inline CommandResult BuildTaskMemoryAppendStepResult(
         << JsonStringField("summary", params.GetString("summary"))
         << JsonStringField("result_ref", params.GetString("result_ref"))
         << JsonStringField("evidence_ref", params.GetString("evidence_ref"))
-        << JsonStringField("next_call_json", TaskMemoryParamStringOrRaw(params, "next_call_json"))
+        << JsonStringField("next_call_json", append_next_call_json)
         << "\"step_index\":" << step_index << ","
         << "\"has_more\":" << (params.GetBool("has_more", false) ? "true" : "false") << ","
         << "\"terminal_state\":" << (params.GetBool("terminal_state", false) ? "true" : "false") << ","
@@ -705,6 +913,13 @@ inline CommandResult BuildTaskMemoryAppendStepResult(
     result.fields["assistant_response_allowed"] =
         (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false)) ? "true" : "false";
     result.fields["must_continue_until"] = params.GetBool("terminal_state", false) ? "" : "terminal_state=true";
+    ApplyTaskMemoryCleanHandoffFields(
+        &result,
+        goal_id,
+        trace_id,
+        10,
+        params.GetBool("terminal_state", false),
+        !TaskMemoryParamStringOrRaw(params, "next_call_json").empty());
     result.fields["semantic_outcome"] = "task_memory_step_appended";
     result.fields["next_action"] = "continue with next_call_json while completion_claim_allowed=false";
     result.fields["result_ref"] = (root / "latest_resume_context.json").string();
@@ -733,9 +948,29 @@ inline CommandResult BuildTaskMemoryExecuteContinuationBudgetResult(
     if (resume_context.empty()) {
         result.ok = false;
         result.exit_code = 404;
+        result.fields["status"] = "failed";
+        result.fields["record_model"] = "mcp_task_memory_execute_continuation_budget_response_v1";
+        result.fields["goal_id"] = goal_id;
+        result.fields["budget_status"] = "blocked_missing_resume_context";
+        result.fields["terminal_state"] = "false";
+        result.fields["task_done"] = "false";
+        result.fields["completion_claim_allowed"] = "false";
+        result.fields["assistant_response_allowed"] = "false";
+        result.fields["final_answer_allowed"] = "false";
+        result.fields["continue_required"] = "false";
+        result.fields["auto_continue_required"] = "false";
+        result.fields["budget_requires_frozen_resume_context"] = "true";
         result.fields["error"] = "resume context not found";
         result.fields["resume_context_path"] = resume_path.string();
-        result.fields["next_action"] = "call lan_agent_task_memory_freeze first";
+        ApplyTaskMemoryCleanHandoffFields(
+            &result,
+            goal_id,
+            "",
+            max_steps,
+            false,
+            false);
+        result.fields["next_action"] =
+            "do not call budget directly before freeze; call the previous required_tool_arguments_json for lan_agent_task_memory_freeze first";
         return result;
     }
 
@@ -843,6 +1078,13 @@ inline CommandResult BuildTaskMemoryExecuteContinuationBudgetResult(
     result.fields["assistant_response_allowed"] = completion_claim_allowed ? "true" : "false";
     result.fields["final_answer_allowed"] = completion_claim_allowed ? "true" : "false";
     result.fields["must_continue_until"] = terminal_state ? "" : "terminal_state=true";
+    ApplyTaskMemoryCleanHandoffFields(
+        &result,
+        goal_id,
+        trace_id,
+        max_steps,
+        terminal_state,
+        can_plan_next);
     result.fields["next_call_json"] = next_call_json;
     result.fields["semantic_outcome"] = "continuation_budget_planned";
     result.fields["next_action"] = can_plan_next
@@ -1559,6 +1801,22 @@ inline CommandResult BuildTaskMemoryResumeContextResult(
     result.fields["migration_handover_path"] = (root / "rag_thread_migration" / "4_migration_handover.md").string();
     result.fields["terminal_state"] = ExtractJsonRawValue(resume_context, "terminal_state");
     result.fields["completion_claim_allowed"] = ExtractJsonRawValue(resume_context, "completion_claim_allowed");
+    result.fields["final_answer_allowed"] = ExtractJsonRawValue(resume_context, "final_answer_allowed");
+    result.fields["verification_ok"] = ExtractJsonRawValue(resume_context, "verification_ok");
+    result.fields["clean_chat_close_allowed"] = ExtractJsonRawValue(resume_context, "clean_chat_close_allowed");
+    result.fields["conversation_close_allowed"] = ExtractJsonRawValue(resume_context, "conversation_close_allowed");
+    result.fields["conversation_close_status"] = ExtractJsonString(resume_context, "conversation_close_status");
+    result.fields["handoff_completion_claim"] = ExtractJsonString(resume_context, "handoff_completion_claim");
+    result.fields["next_chat_status_check_required"] = ExtractJsonRawValue(resume_context, "next_chat_status_check_required");
+    result.fields["next_chat_status_check_tool_name"] = ExtractJsonString(resume_context, "next_chat_status_check_tool_name");
+    result.fields["next_chat_status_check_arguments_json"] = ExtractJsonString(resume_context, "next_chat_status_check_arguments_json");
+    result.fields["next_chat_must_verify_fields_json"] = ExtractJsonString(resume_context, "next_chat_must_verify_fields_json");
+    result.fields["new_chat_entry_tool_name"] = ExtractJsonString(resume_context, "new_chat_entry_tool_name");
+    result.fields["new_chat_entry_arguments_json"] = ExtractJsonString(resume_context, "new_chat_entry_arguments_json");
+    result.fields["project_flow_role"] = "mcp_project_step_ledger_and_state_machine";
+    result.fields["single_round_flow"] = "read_state,run_one_bounded_slice,write_step_record,summarize,next_round_entry";
+    result.fields["slice_execution_policy"] = "one_chat_one_bounded_slice_then_record_state";
+    result.fields["model_context_policy"] = "use resume state and refs only; do not reload full historical chat";
     result.fields["current_tool"] = ExtractJsonString(resume_context, "current_tool");
     result.fields["next_call_json"] = ExtractJsonString(resume_context, "next_call_json");
     result.fields["compact_summary"] = ExtractJsonString(resume_context, "compact_summary");

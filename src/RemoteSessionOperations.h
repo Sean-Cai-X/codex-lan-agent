@@ -558,6 +558,51 @@ std::string BuildRemoteSessionToolAvailabilitySnapshot(const AgentConfig & confi
     return output.str();
 }
 
+std::string TruncateRemoteSessionPromptField(
+    const std::string & value,
+    std::size_t max_chars,
+    const std::string & field_name) {
+    const std::string trimmed = Trim(value);
+    if (trimmed.size() <= max_chars) {
+        return trimmed;
+    }
+    return trimmed.substr(0, max_chars)
+        + "\n[truncated_by_codex_lan_agent field="
+        + field_name
+        + " original_chars="
+        + std::to_string(trimmed.size())
+        + "]";
+}
+
+std::string BuildRemoteSessionCompactToolSnapshot(const AgentConfig & config) {
+    const std::vector<RemoteSessionMcpToolSpec> specs = BuildRemoteSessionMountedToolSpecs(config);
+    std::ostringstream output;
+    output
+        << "{"
+        << "\"snapshot_source\":\"codex_lan_agent\","
+        << "\"payload_mode\":\"compact_remote_ai_turn_v2\","
+        << "\"mounted_tool_count\":" << specs.size() << ","
+        << "\"tool_execution_owner\":\"codex_mcp\","
+        << "\"remote_ai_role\":\"suggest_or_summarize_only\","
+        << "\"full_tool_catalog_policy\":\"do_not_inject_into_model_prompt\","
+        << "\"critical_entry_tools\":["
+        << "\"lan_agent_mcp_overview\","
+        << "\"lan_agent_clips_decide\","
+        << "\"lan_agent_task_memory_resume_and_execute\","
+        << "\"lan_agent_probe_text_file\","
+        << "\"lan_agent_delete_text_range_window_atomic\""
+        << "],"
+        << "\"completion_gate\":["
+        << "\"terminal_state=true\","
+        << "\"completion_claim_allowed=true\","
+        << "\"final_answer_allowed=true\","
+        << "\"verification_ok=true\""
+        << "],"
+        << "\"clean_handoff\":\"clean_chat_close_allowed=true allows chat handoff but not task completion\""
+        << "}";
+    return output.str();
+}
+
 std::string BuildRemoteSessionMountedToolsJson(const AgentConfig & config) {
     std::ostringstream output;
     output << "[";
@@ -905,9 +950,17 @@ std::string BuildRemoteSessionTurnBody(
     const std::string effective_prompt_text = prompt_text.empty()
         ? "Provide one compact controlled reply for CODEX based on the supplied task fields and context_refs."
         : prompt_text;
+    const std::string model_prompt_text = TruncateRemoteSessionPromptField(
+        effective_prompt_text,
+        1600,
+        "prompt_text");
+    const std::string model_context_refs = TruncateRemoteSessionPromptField(
+        context_refs,
+        1600,
+        "context_refs");
     const std::string provider_id = "llama_cpp_b8851_remote_session";
     const std::string capability_id = "remote_session_turn";
-    const std::string tool_availability_snapshot = BuildRemoteSessionToolAvailabilitySnapshot(config);
+    const std::string tool_availability_snapshot = BuildRemoteSessionCompactToolSnapshot(config);
     const std::string preferred_remote_session_slices_root = ResolveRemoteSessionSlicesRoot(config);
     const std::string preferred_dialog_slices_root = BuildDialogSlicesDir(config);
     const std::string preferred_session_dispatch_root = BuildSessionDispatchDir(config);
@@ -916,14 +969,14 @@ std::string BuildRemoteSessionTurnBody(
     const std::string speaker_mode_json = JsonValueFromRawOrString(speaker_mode);
     const std::string reasoning_level_json = JsonValueFromRawOrString(reasoning_level);
     const std::string prompt_purpose_json = JsonValueFromRawOrString(prompt_purpose);
-    const std::string context_refs_json = JsonValueFromRawOrString(context_refs);
+    const std::string context_refs_json = JsonValueFromRawOrString(model_context_refs);
     const std::string response_mode_json = JsonValueFromRawOrString(response_mode);
-    const std::string prompt_text_json = JsonValueFromRawOrString(effective_prompt_text);
+    const std::string prompt_text_json = JsonValueFromRawOrString(model_prompt_text);
     const std::string write_mode_json = JsonValueFromRawOrString(write_mode);
     const std::string provider_id_json = JsonValueFromRawOrString(provider_id);
     const std::string capability_id_json = JsonValueFromRawOrString(capability_id);
     const std::string tool_availability_snapshot_json = JsonValueFromRawOrString(tool_availability_snapshot);
-    const std::string mounted_tools_json = BuildRemoteSessionMountedToolsJson(config);
+    const std::string mounted_tools_json = "[]";
     const std::string preferred_remote_session_slices_root_json = JsonValueFromRawOrString(preferred_remote_session_slices_root);
     const std::string preferred_dialog_slices_root_json = JsonValueFromRawOrString(preferred_dialog_slices_root);
     const std::string preferred_session_dispatch_root_json = JsonValueFromRawOrString(preferred_session_dispatch_root);
@@ -950,6 +1003,7 @@ std::string BuildRemoteSessionTurnBody(
         << "\"write_mode\":" << write_mode_json << ","
         << "\"backend_sampling\":false,"
         << "\"chat_template_kwargs\":{\"enable_thinking\":false},"
+        << "\"payload_mode\":\"compact_remote_ai_turn_v2\","
         << "\"source_type\":\"codex\","
         << "\"source_label\":\"codex\","
         << "\"handoff_from\":\"codex\","
@@ -958,7 +1012,9 @@ std::string BuildRemoteSessionTurnBody(
         << "\"provider_id\":" << provider_id_json << ","
         << "\"capability_id\":" << capability_id_json << ","
         << "\"tools\":" << mounted_tools_json << ","
-        << "\"tool_choice\":{\"type\":\"auto\"},"
+        << "\"tool_choice\":\"none\","
+        << "\"remote_tool_execution_policy\":\"codex_mcp_controls_tools_remote_ai_suggests_only\","
+        << "\"full_tool_catalog_policy\":\"not_in_prompt_use_mcp_overview_or_capability_registry_by_ref\","
         << "\"preferred_remote_session_slices_root\":" << preferred_remote_session_slices_root_json << ","
         << "\"preferred_dialog_slices_root\":" << preferred_dialog_slices_root_json << ","
         << "\"preferred_session_dispatch_root\":" << preferred_session_dispatch_root_json << ","
@@ -972,6 +1028,7 @@ std::string BuildRemoteSessionTurnBody(
         << "\"long_session_policy\":\"compress_task_state_drop_old_safety_noise\","
         << "\"permission_policy\":\"tool_error_required_for_permission_conclusion\","
         << "\"async_reply_policy\":\"no_please_wait_final_without_task_id\","
+        << "\"prompt_budget_policy\":\"compact_1600_chars_each_for_prompt_text_and_context_refs\","
         << "\"metadata\":{"
         << "\"task_id\":" << task_id_json << ","
         << "\"session_id\":" << session_id_json << ","
@@ -989,11 +1046,14 @@ std::string BuildRemoteSessionTurnBody(
         << "\"preferred_session_dispatch_root\":" << preferred_session_dispatch_root_json << ","
         << "\"preferred_workspace_root\":" << preferred_workspace_root_json << ","
         << "\"preferred_log_root\":" << preferred_log_root_json << ","
-        << "\"tool_availability_snapshot\":" << tool_availability_snapshot_json << ","
+        << "\"tool_availability_summary\":" << tool_availability_snapshot_json << ","
+        << "\"tools_omitted_from_prompt\":true,"
         << "\"multi_file_read_policy\":\"batch_3_to_5_then_continue\","
         << "\"long_session_policy\":\"compress_task_state_drop_old_safety_noise\","
         << "\"permission_policy\":\"tool_error_required_for_permission_conclusion\","
         << "\"async_reply_policy\":\"no_please_wait_final_without_task_id\","
+        << "\"prompt_text_original_chars\":" << effective_prompt_text.size() << ","
+        << "\"context_refs_original_chars\":" << context_refs.size() << ","
         << "\"codex_request_id\":" << codex_request_id_json << ","
         << "\"agent_dispatch_id\":" << agent_dispatch_id_json
         << "}"
