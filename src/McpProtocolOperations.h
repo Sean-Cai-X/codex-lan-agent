@@ -35,6 +35,8 @@ std::string BuildMcpCapabilitiesResponse() {
         "\"endpoint\":\"/mcp\","
         "\"methods\":[\"HEAD\",\"GET\",\"POST\"],"
         "\"accept\":[\"application/json\",\"text/event-stream\"],"
+        "\"streamable_http_mode\":\"POST JSON-RPC; GET returns JSON capabilities unless Accept requests text/event-stream\","
+        "\"get_event_stream\":\"not_supported_post_json_rpc_only\","
         "\"message\":\"use POST /mcp for JSON-RPC requests\""
         "}";
 }
@@ -205,9 +207,51 @@ void ApplyMcpTransport(HttpResponseSpec * response, McpResponseMode mode) {
     }
 }
 
+bool UseFullMcpToolSurface() {
+    const char * value = std::getenv("CODEX_LAN_AGENT_MCP_TOOL_SURFACE");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    const std::string lowered = ToLowerAscii(Trim(value));
+    return lowered == "full" ||
+           lowered == "all" ||
+           lowered == "legacy" ||
+           lowered == "153";
+}
+
+std::string BuildMcpRouteOnlyToolsListResponse(const std::string & id_raw) {
+    std::ostringstream buffer;
+    buffer << "{"
+           << "\"jsonrpc\":\"2.0\","
+           << "\"id\":" << (id_raw.empty() ? "null" : id_raw) << ","
+           << "\"result\":{\"tools\":["
+           << "{"
+           << "\"name\":\"lan_agent_mcp_route\","
+           << "\"description\":\"Single chat-facing MCP gateway. Always call this tool for local file/code/task requests instead of saying local files are inaccessible. If mode is omitted but request_text, primary_intent, file_path, or source_file is present, MCP treats the call as mode=route. mode=overview returns guidance only; mode=route returns tool_use_decision, current_tool_chain_node, chain_state, required_tool_name, and required_tool_arguments_json; mode=call executes one internal MCP tool by target_tool_name while the full internal catalog remains hidden. Completion claims must obey terminal_state, completion_claim_allowed, final_answer_allowed, and verification_ok.\","
+           << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+           << "\"mode\":{\"type\":\"string\",\"description\":\"overview, route, or call. Omit mode for natural-language local tasks; MCP auto-routes when request_text/file_path/primary_intent is present.\"},"
+           << "\"request_text\":{\"type\":\"string\",\"description\":\"Natural-language request for route mode.\"},"
+           << "\"primary_intent\":{\"type\":\"string\"},"
+           << "\"target_tool_name\":{\"type\":\"string\",\"description\":\"Internal MCP tool name for mode=call.\"},"
+           << "\"arguments\":{\"type\":\"object\",\"description\":\"Arguments object passed to target_tool_name when mode=call.\",\"additionalProperties\":true},"
+           << "\"arguments_json\":{\"type\":\"string\",\"description\":\"Alternative raw JSON object string passed to target_tool_name when mode=call.\"},"
+           << "\"goal_id\":{\"type\":\"string\"},"
+           << "\"trace_id\":{\"type\":\"string\"},"
+           << "\"max_steps\":{\"type\":\"integer\"}"
+           << "},\"additionalProperties\":true}"
+           << "}"
+           << "]}}";
+    return buffer.str();
+}
+
 std::string BuildMcpToolsListResponse(
     const std::string & id_raw,
     const AgentConfig & config) {
+    if (!UseFullMcpToolSurface()) {
+        (void)config;
+        return BuildMcpRouteOnlyToolsListResponse(id_raw);
+    }
+
     std::ostringstream buffer;
     buffer << "{"
            << "\"jsonrpc\":\"2.0\","
@@ -1117,7 +1161,7 @@ std::string BuildMcpToolsListResponse(
         << "},"
         << "{"
         << "\"name\":\"lan_agent_format_code_file\","
-        << "\"description\":\"Format one allowed local source file with clang-format. dry_run=true formats a temporary copy and reports would_change without touching the source; dry_run=false writes the formatted file and returns backup/hash/log fields for audit.\","
+        << "\"description\":\"Format one allowed local source file with clang-format. Use this for C/C++ source whitespace cleanup, indentation cleanup, extra blank lines, or redundant newline cleanup. dry_run=true formats a temporary copy and reports would_change without touching the source; dry_run=false writes the formatted file and returns backup/hash/log fields for audit. Do not use comment scan/delete tools for formatting cleanup.\","
         << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
         << "\"source_file\":{\"type\":\"string\"},"
         << "\"file_path\":{\"type\":\"string\"},"
@@ -1259,6 +1303,14 @@ std::string BuildMcpToolsListResponse(
         << "\"compact_summary\":{\"type\":\"string\"},"
         << "\"remaining_work\":{\"type\":\"string\"},"
         << "\"current_state_markdown\":{\"type\":\"string\"},"
+        << "\"next_tool_name\":{\"type\":\"string\",\"description\":\"Optional flat continuation tool name. When supplied, MCP builds internal next_call_json without exposing nested JSON to the model.\"},"
+        << "\"next_file_path\":{\"type\":\"string\"},"
+        << "\"next_scan_mode\":{\"type\":\"string\"},"
+        << "\"next_primary_intent\":{\"type\":\"string\"},"
+        << "\"next_start_line\":{\"type\":\"integer\"},"
+        << "\"next_max_lines\":{\"type\":\"integer\"},"
+        << "\"next_probe_ref\":{\"type\":\"string\"},"
+        << "\"next_probe_ready\":{\"type\":\"boolean\"},"
         << "\"key_slices_jsonl\":{\"type\":\"string\"},"
         << "\"incremental_index_manifest_json\":{\"type\":\"string\"},"
         << "\"migration_handover_markdown\":{\"type\":\"string\"}"
@@ -1309,6 +1361,15 @@ std::string BuildMcpToolsListResponse(
         << "\"dry_run\":{\"type\":\"boolean\",\"description\":\"Default false for this fresh-chat entry.\"},"
         << "\"execute\":{\"type\":\"boolean\",\"description\":\"Default true for this fresh-chat entry.\"}"
         << "},\"required\":[\"goal_id\"],\"additionalProperties\":false}"
+        << "},"
+        << "{"
+        << "\"name\":\"lan_agent_task_memory_new_chat_round_selftest\","
+        << "\"description\":\"Self-test MCP-owned continuation semantics in one tool call. llama.cpp is treated as relay/display only. The tool creates an MCP round manifest, freezes a tiny archived continuation, resumes it through lan_agent_task_memory_resume_and_execute using goal_id-only fresh entry semantics, executes a bounded step, and verifies terminal_state/completion_claim_allowed/final_answer_allowed/verification_ok without relying on old model context. It does not reset or inspect host chat history; chat_context_reset_acknowledged remains false until the client confirms a fresh context.\","
+        << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+        << "\"goal_id\":{\"type\":\"string\",\"description\":\"Optional explicit selftest goal id.\"},"
+        << "\"trace_id\":{\"type\":\"string\",\"description\":\"Optional explicit trace id.\"},"
+        << "\"max_steps\":{\"type\":\"integer\",\"description\":\"Maximum continuation steps for the fresh round, capped by server policy.\"}"
+        << "},\"additionalProperties\":false}"
         << "},"
         << "{"
         << "\"name\":\"lan_agent_task_memory_build_kv_snapshot\","

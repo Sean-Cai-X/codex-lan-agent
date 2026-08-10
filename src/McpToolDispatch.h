@@ -362,8 +362,353 @@ CommandResult ProbeTextFileResult(
     const std::string & file_path,
     const std::string & primary_intent = std::string(),
     const std::string & trace_id = std::string());
+CommandResult ReadTextFileResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    int max_lines,
+    int start_line,
+    const std::string & trace_id,
+    std::size_t start_byte_offset,
+    const std::string & probe_ref);
+CommandResult TailTextFileResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    int max_lines);
+CommandResult ListDirectoryResult(
+    const AgentConfig & config,
+    const std::string & directory_path,
+    int max_entries,
+    const std::string & trace_id);
+CommandResult ReadDirectoryFilesResult(
+    const AgentConfig & config,
+    const std::string & directory_path,
+    const std::string & file_extensions_csv,
+    int max_files,
+    int max_lines_per_file,
+    int max_files_per_call,
+    int max_total_lines,
+    int file_index,
+    int start_line,
+    const std::string & trace_id,
+    std::size_t start_byte_offset);
+
+std::string ExtractMcpRouteWindowsPathFromText(const std::string & text) {
+    for (std::size_t i = 0; i + 2 < text.size(); ++i) {
+        const unsigned char drive = static_cast<unsigned char>(text[i]);
+        if (!std::isalpha(drive) || text[i + 1] != ':' || (text[i + 2] != '\\' && text[i + 2] != '/')) {
+            continue;
+        }
+        std::size_t end = i + 3;
+        while (end < text.size()) {
+            const unsigned char ch = static_cast<unsigned char>(text[end]);
+            if (ch >= 128 || std::iscntrl(ch) || ch == '"' || ch == '\'' || ch == '<' || ch == '>' || ch == '|') {
+                break;
+            }
+            if (std::isspace(ch)) {
+                break;
+            }
+            ++end;
+        }
+        std::string candidate = text.substr(i, end - i);
+        const std::string lowered_candidate = ToLowerAscii(candidate);
+        std::size_t extension_pos_best = std::string::npos;
+        std::size_t extension_end = std::string::npos;
+        const std::vector<std::string> source_extensions = {
+            ".cpp", ".cxx", ".cc", ".c", ".hpp", ".hh", ".h", ".ipp", ".txt", ".md", ".json", ".clp"
+        };
+        for (const std::string & extension : source_extensions) {
+            const std::size_t extension_pos = lowered_candidate.find(extension);
+            if (extension_pos == std::string::npos) {
+                continue;
+            }
+            const std::size_t candidate_end = extension_pos + extension.size();
+            if (extension_pos_best == std::string::npos
+                || extension_pos < extension_pos_best
+                || (extension_pos == extension_pos_best && candidate_end > extension_end)) {
+                extension_pos_best = extension_pos;
+                extension_end = candidate_end;
+            }
+        }
+        if (extension_end != std::string::npos) {
+            candidate = candidate.substr(0, extension_end);
+        }
+        while (!candidate.empty()) {
+            const char tail = candidate.back();
+            if (tail == '.' || tail == ',' || tail == ';' || tail == ':' || tail == ')' || tail == ']' || tail == '}') {
+                candidate.pop_back();
+                continue;
+            }
+            break;
+        }
+        if (!candidate.empty()) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+std::string InferMcpRoutePrimaryIntent(
+    const std::string & primary_intent,
+    const std::string & request_text) {
+    const std::string normalized = NormalizeMcpPrimaryIntentForClips(primary_intent);
+    const std::string lowered_intent = ToLowerAscii(Trim(normalized));
+    const std::string lowered_request = ToLowerAscii(request_text);
+    const bool mentions_source_file =
+        lowered_request.find(".cpp") != std::string::npos
+        || lowered_request.find(".cxx") != std::string::npos
+        || lowered_request.find(".cc") != std::string::npos
+        || lowered_request.find(".c") != std::string::npos
+        || lowered_request.find(".hpp") != std::string::npos
+        || lowered_request.find(".hh") != std::string::npos
+        || lowered_request.find(".h") != std::string::npos;
+    bool has_non_ascii_or_lossy_action_text = false;
+    for (const unsigned char ch : request_text) {
+        if (ch > 0x7F || ch == '?') {
+            has_non_ascii_or_lossy_action_text = true;
+            break;
+        }
+    }
+    const bool mentions_comment =
+        lowered_intent.find("comment") != std::string::npos
+        || lowered_request.find("comment") != std::string::npos
+        || (lowered_intent.find("cleanup") != std::string::npos
+            && mentions_source_file)
+        || ((lowered_intent == "file_modification"
+                || lowered_intent == "file modification"
+                || lowered_intent == "source_edit"
+                || lowered_intent == "source edit")
+            && mentions_source_file
+            && has_non_ascii_or_lossy_action_text)
+        || request_text.find("\xE6\xB3\xA8") != std::string::npos
+        || request_text.find("\xE6\xB3\xA8\xE9\x87\x8A") != std::string::npos
+        || request_text.find("注释") != std::string::npos;
+    if (mentions_comment) {
+        return "comment_cleanup";
+    }
+    const bool mentions_format =
+        lowered_intent == "format"
+        || lowered_intent == "format_code"
+        || lowered_intent == "code_format"
+        || lowered_intent.find("format code") != std::string::npos
+        || lowered_intent.find("code format") != std::string::npos
+        || lowered_intent.find("formatting") != std::string::npos
+        || lowered_intent.find("newline") != std::string::npos
+        || lowered_intent.find("whitespace") != std::string::npos
+        || lowered_request.find("format") != std::string::npos
+        || lowered_request.find("newline") != std::string::npos
+        || lowered_request.find("whitespace") != std::string::npos
+        || request_text.find("回车") != std::string::npos
+        || request_text.find("换行") != std::string::npos
+        || request_text.find("空行") != std::string::npos;
+    if (mentions_format) {
+        return "code_format";
+    }
+    return normalized;
+}
+
+std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
+    const std::string request_text = params.GetString("request_text");
+    const std::string file_path = FirstNonEmpty(
+        params.GetString("file_path"),
+        params.GetString("source_file"),
+        ExtractMcpRouteWindowsPathFromText(request_text),
+        "");
+    const std::string primary_intent =
+        InferMcpRoutePrimaryIntent(params.GetString("primary_intent"), request_text);
+    std::string json = "{";
+    bool first = true;
+    AppendJsonStringField(&json, &first, "decision_domain", params.GetString("decision_domain", "mcp_tool_guard"));
+    AppendJsonStringField(&json, &first, "tool_name", params.GetString("tool_name", "lan_agent_clips_decide"));
+    AppendJsonStringField(&json, &first, "request_text", request_text);
+    AppendJsonStringField(&json, &first, "file_path", file_path);
+    AppendJsonStringField(&json, &first, "source_file", file_path);
+    AppendJsonStringField(&json, &first, "primary_intent", primary_intent);
+    AppendJsonStringField(&json, &first, "scan_mode", params.GetString("scan_mode", primary_intent == "comment_cleanup" ? "comments" : ""));
+    AppendJsonStringField(&json, &first, "trace_id", params.GetString("trace_id"));
+    AppendJsonStringField(&json, &first, "request_id", params.GetString("request_id"));
+    AppendJsonStringField(&json, &first, "probe_ref", params.GetString("probe_ref"));
+    AppendJsonBoolField(&json, &first, "probe_ready", params.GetBool("probe_ready", false), params.GetBool("probe_ready", false));
+    json += "}";
+    return json;
+}
+
 const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegistry() {
     static const std::unordered_map<std::string, McpToolHandler> handlers = {
+        {"lan_agent_mcp_route", [](const AgentConfig & config, const JsonRequestView & params) {
+            const std::string requested_mode = ToLowerAscii(params.GetString("mode"));
+            const bool has_routable_request =
+                !Trim(params.GetString("request_text")).empty()
+                || !Trim(params.GetString("primary_intent")).empty()
+                || !Trim(params.GetString("file_path")).empty()
+                || !Trim(params.GetString("source_file")).empty();
+            const std::string mode = requested_mode.empty()
+                ? (has_routable_request ? std::string("route") : std::string("overview"))
+                : requested_mode;
+            if (mode.empty() || mode == "overview" || mode == "guide" || mode == "guidance") {
+                CommandResult result = BuildMcpOverviewResult(config);
+                result.fields["mcp_route_mode"] = "overview";
+                result.fields["tool_use_decision"] = "guidance_only";
+                result.fields["current_tool_chain_node"] = "overview";
+                result.fields["chain_state"] = "no_execution_started";
+                result.fields["tool_surface_policy"] = "chat_layer_single_gateway";
+                result.fields["visible_tool_count"] = "1";
+                result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                result.fields["internal_tool_surface"] = "full_registry_hidden_from_tools_list";
+                result.fields["next_action"] =
+                    "Use mode=route to ask MCP for an internal tool decision, or mode=call with target_tool_name and arguments to execute one internal tool.";
+                return result;
+            }
+
+            if (mode == "route" || mode == "decide" || mode == "decision") {
+                const std::string route_params_json = BuildMcpRouteDecisionParamsJson(params);
+                JsonRequestView route_params(route_params_json);
+                CommandResult result = BuildClipsDecisionResult(config, route_params);
+                result.fields["mcp_route_mode"] = "route";
+                result.fields["tool_surface_policy"] = "chat_layer_single_gateway";
+                result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                result.fields["internal_execution_performed"] = "false";
+                result.fields["current_tool_chain_node"] = "route_decision";
+                const std::string inferred_intent =
+                    NormalizeMcpPrimaryIntentForClips(route_params.GetString("primary_intent"));
+                const std::string route_target = FirstNonEmpty(
+                    GetFieldOrDefault(result, "route_target", ""),
+                    route_params.GetString("route_hint"),
+                    route_params.GetString("file_path").empty()
+                        ? std::string()
+                        : (inferred_intent == "code_format"
+                            ? std::string("lan_agent_format_code_file")
+                            : std::string("lan_agent_probe_text_file")),
+                    "");
+                if (!route_target.empty()) {
+                    const std::string next_call_json = BuildPreGuardRouteCallJson(route_target, route_params);
+                    result.fields["tool_use_decision"] = "use_tool";
+                    result.fields["chain_state"] = "needs_tool_call";
+                    result.fields["route_target"] = route_target;
+                    result.fields["required_next_action_type"] = "mcp_tool_call";
+                    result.fields["required_tool_name"] = route_target;
+                    result.fields["required_tool_arguments_json"] = next_call_json;
+                    result.fields["next_call_json"] = next_call_json;
+                    result.fields["next_action"] =
+                        "tool_call_only: call lan_agent_mcp_route with mode=call, target_tool_name=required_tool_name, and arguments from required_tool_arguments_json; do not ask for local file permissions.";
+                    result.fields["status"] = "CONTINUE";
+                    result.fields["supervision_status"] = "closed_loop_continue";
+                    result.fields["goal_status"] = "not_complete";
+                    result.fields["continue_required"] = "true";
+                    result.fields["terminal_state"] = "false";
+                    result.fields["completion_claim_allowed"] = "false";
+                    result.fields["final_answer_allowed"] = "false";
+                    result.fields["verification_ok"] = "false";
+                    result.fields["semantic_model_clamp"] = "tool_call_only";
+                    result.fields["route_params_enriched"] = "true";
+                    result.fields["route_pipeline"] =
+                        inferred_intent == "comment_cleanup"
+                            ? "comment_cleanup_then_optional_code_format"
+                            : inferred_intent;
+                } else {
+                    result.fields["tool_use_decision"] = "no_tool_resolved";
+                    result.fields["chain_state"] = "needs_user_or_route_detail";
+                    result.fields["next_action"] =
+                        "route decision did not resolve an internal tool; provide file_path and primary_intent, or call overview for guidance.";
+                }
+                return result;
+            }
+
+            if (mode != "call" && mode != "execute") {
+                CommandResult result;
+                result.ok = false;
+                result.exit_code = 400;
+                result.fields["status"] = "failed";
+                result.fields["result"] = "invalid_mcp_route_mode";
+                result.fields["mcp_route_mode"] = mode;
+                result.fields["error"] = "mode must be overview, route, or call";
+                return result;
+            }
+
+            const std::string target_tool_name = params.GetString("target_tool_name");
+            if (target_tool_name.empty()) {
+                CommandResult result;
+                result.ok = false;
+                result.exit_code = 400;
+                result.fields["status"] = "failed";
+                result.fields["result"] = "missing_target_tool_name";
+                result.fields["mcp_route_mode"] = "call";
+                result.fields["error"] = "mode=call requires target_tool_name";
+                return result;
+            }
+            if (target_tool_name == "lan_agent_mcp_route") {
+                CommandResult result;
+                result.ok = false;
+                result.exit_code = 400;
+                result.fields["status"] = "failed";
+                result.fields["result"] = "recursive_mcp_route_blocked";
+                result.fields["mcp_route_mode"] = "call";
+                result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["error"] = "lan_agent_mcp_route cannot call itself";
+                return result;
+            }
+
+            const auto & registry = BuildMcpToolHandlerRegistry();
+            const auto tool_it = registry.find(target_tool_name);
+            if (tool_it == registry.end()) {
+                CommandResult result;
+                result.ok = false;
+                result.exit_code = 404;
+                result.fields["status"] = "failed";
+                result.fields["result"] = "internal_tool_not_found";
+                result.fields["mcp_route_mode"] = "call";
+                result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["error"] = "target_tool_name is not registered in the internal MCP registry";
+                return result;
+            }
+
+            std::string arguments_json = params.GetString("arguments_json");
+            if (arguments_json.empty()) {
+                arguments_json = ExtractJsonObjectRaw(params.body(), "arguments");
+            }
+            if (arguments_json.empty()) {
+                arguments_json = ExtractJsonObjectRaw(params.body(), "params");
+            }
+            if (arguments_json.empty()) {
+                arguments_json = "{}";
+            }
+            JsonRequestView routed_params(arguments_json);
+            CommandResult result = tool_it->second(config, routed_params);
+            LanResultBuilder(&result).Finalize(config, target_tool_name);
+            result.fields["mcp_route_mode"] = "call";
+            result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
+            result.fields["routed_tool_name"] = target_tool_name;
+            result.fields["routed_tool_surface"] = "internal_registry_hidden_from_tools_list";
+            result.fields["internal_execution_performed"] = "true";
+            result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+            result.fields["tool_use_decision"] = "used_tool";
+            result.fields["current_tool_chain_node"] = target_tool_name;
+            const std::string required_next_tool = GetFieldOrDefault(result, "required_tool_name", "");
+            if (!required_next_tool.empty() && required_next_tool != target_tool_name) {
+                result.fields["chain_state"] = "needs_tool_call";
+                result.fields["status"] = "needs_continue";
+                result.fields["supervision_status"] = "closed_loop_continue";
+                result.fields["goal_status"] = "not_complete";
+                result.fields["continue_required"] = "true";
+                result.fields["terminal_state"] = "false";
+                result.fields["completion_claim_allowed"] = "false";
+                result.fields["final_answer_allowed"] = "false";
+                result.fields["verification_ok"] = "false";
+                result.fields["semantic_model_clamp"] = "tool_call_only";
+                result.fields["required_next_action_type"] = "mcp_tool_call";
+                if (GetFieldOrDefault(result, "next_call_json", "").empty()
+                    && !GetFieldOrDefault(result, "required_tool_arguments_json", "").empty()) {
+                    result.fields["next_call_json"] = GetFieldOrDefault(result, "required_tool_arguments_json", "");
+                }
+                result.fields["next_action"] =
+                    "tool_call_only: call required_tool_arguments_json through lan_agent_mcp_route mode=call; do not claim completion yet.";
+            } else if (GetFieldOrDefault(result, "final_answer_allowed", "") == "true"
+                && GetFieldOrDefault(result, "verification_ok", "") == "true") {
+                result.fields["chain_state"] = "terminal";
+            } else {
+                result.fields["chain_state"] = "tool_result_returned";
+            }
+            return result;
+        }},
         {"lan_agent_health", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildHealthResult(config);
         }},
@@ -505,6 +850,21 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 std::max(1000, params.GetInt("timeout_ms", 15000)));
         }},
         {"lan_agent_task_memory_freeze", [](const AgentConfig & config, const JsonRequestView & params) {
+            if (Trim(params.GetString("next_call_json")).empty()
+                && Trim(params.GetString("next_tool_name")).empty()) {
+                const std::string recovered_arguments =
+                    ::codex_lan_agent::LookupTaskMemoryPendingFreezeArguments(
+                        params.GetString("goal_id"),
+                        params.GetString("trace_id"));
+                if (!Trim(recovered_arguments).empty()) {
+                    JsonRequestView recovered_params(recovered_arguments);
+                    CommandResult recovered =
+                        ::codex_lan_agent::BuildTaskMemoryFreezeResult(config, recovered_params);
+                    recovered.fields["task_memory_freeze_recovery"] = "pending_arguments_cache";
+                    recovered.fields["task_memory_freeze_recovered_from_short_call"] = "true";
+                    return recovered;
+                }
+            }
             return ::codex_lan_agent::BuildTaskMemoryFreezeResult(config, params);
         }},
         {"lan_agent_task_memory_append_step", [](const AgentConfig & config, const JsonRequestView & params) {
@@ -515,6 +875,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         }},
         {"lan_agent_task_memory_resume_and_execute", [](const AgentConfig & config, const JsonRequestView & params) {
             return BuildTaskMemoryResumeAndExecuteResult(config, params);
+        }},
+        {"lan_agent_task_memory_new_chat_round_selftest", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildTaskMemoryNewChatRoundSelftestResult(config, params);
         }},
         {"lan_agent_task_memory_build_kv_snapshot", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildTaskMemoryBuildKvSnapshotResult(config, params);
@@ -809,15 +1172,23 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("probe_ref"));
         }},
         {"lan_agent_delete_text_range_window_atomic", [](const AgentConfig & config, const JsonRequestView & params) {
+            const std::string file_path = params.GetString("file_path", params.GetString("next_file_path"));
+            const std::string probe_ref = FirstNonEmpty(
+                params.GetString("probe_ref"),
+                params.GetString("next_probe_ref"),
+                params.GetBool("probe_ready", false) || params.GetBool("next_probe_ready", false)
+                    ? file_path
+                    : std::string(),
+                "");
             return DeleteTextRangeWindowAtomicResult(
                 config,
-                params.GetString("file_path"),
-                params.GetString("scan_mode", "comments"),
+                file_path,
+                params.GetString("scan_mode", params.GetString("next_scan_mode", "comments")),
                 std::max(1, params.GetInt("start_line", params.GetInt("next_start_line", 1))),
-                std::min(200, std::max(1, params.GetInt("max_lines", 200))),
-                params.GetString("primary_intent", "comment_cleanup"),
+                std::min(200, std::max(1, params.GetInt("max_lines", params.GetInt("next_max_lines", 200)))),
+                params.GetString("primary_intent", params.GetString("next_primary_intent", "comment_cleanup")),
                 params.GetString("trace_id"),
-                params.GetString("probe_ref"));
+                probe_ref);
         }},
         {"lan_agent_prepare_edit_windows", [](const AgentConfig & config, const JsonRequestView & params) {
             return PrepareEditWindowsResult(
@@ -838,6 +1209,51 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("file_path"),
                 params.GetString("primary_intent"),
                 params.GetString("trace_id"));
+        }},
+        {"lan_agent_read_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
+            const long long raw_start_byte_offset =
+                static_cast<long long>(params.GetInt("start_byte_offset", 0));
+            return ReadTextFileResult(
+                config,
+                params.GetString("file_path"),
+                std::max(1, params.GetInt("max_lines", 500)),
+                std::max(1, params.GetInt("start_line", 1)),
+                params.GetString("trace_id"),
+                raw_start_byte_offset > 0
+                    ? static_cast<std::size_t>(raw_start_byte_offset)
+                    : static_cast<std::size_t>(0),
+                params.GetString("probe_ref"));
+        }},
+        {"lan_agent_tail_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
+            return TailTextFileResult(
+                config,
+                params.GetString("file_path"),
+                std::max(1, params.GetInt("max_lines", 120)));
+        }},
+        {"lan_agent_list_directory", [](const AgentConfig & config, const JsonRequestView & params) {
+            return ListDirectoryResult(
+                config,
+                params.GetString("directory_path"),
+                std::max(1, params.GetInt("max_entries", 200)),
+                params.GetString("trace_id"));
+        }},
+        {"lan_agent_read_directory_files", [](const AgentConfig & config, const JsonRequestView & params) {
+            const long long raw_start_byte_offset =
+                static_cast<long long>(params.GetInt("start_byte_offset", 0));
+            return ReadDirectoryFilesResult(
+                config,
+                params.GetString("directory_path"),
+                params.GetString("file_extensions_csv"),
+                std::max(1, params.GetInt("max_files", 200)),
+                std::max(1, params.GetInt("max_lines_per_file", 500)),
+                std::max(1, params.GetInt("max_files_per_call", 5)),
+                std::max(1, params.GetInt("max_total_lines", 2500)),
+                std::max(0, params.GetInt("file_index", 0)),
+                std::max(1, params.GetInt("start_line", 1)),
+                params.GetString("trace_id"),
+                raw_start_byte_offset > 0
+                    ? static_cast<std::size_t>(raw_start_byte_offset)
+                    : static_cast<std::size_t>(0));
         }},
         {"lan_agent_record_dialog_slice", [](const AgentConfig & config, const JsonRequestView & params) {
             const std::string record_user_text = FirstNonEmpty(
@@ -1173,6 +1589,7 @@ struct RequestRule {
 
 const std::vector<RequestRule> & GetRequestRules() {
     static const std::vector<RequestRule> rules = {
+        {"lan_agent_mcp_route", "mcp_gateway_route", "mcp_route", "medium", "mcp,gateway,router,chat_layer,single_entry"},
         {"lan_agent_health", "read_observe", "health", "low", "runtime,health,read_only"},
         {"lan_agent_runtime_overview", "read_observe", "runtime_overview", "low", "runtime,overview,read_only"},
         {"lan_agent_remote_session_overview", "read_observe", "remote_session_overview", "low", "remote-session,overview,read_only"},

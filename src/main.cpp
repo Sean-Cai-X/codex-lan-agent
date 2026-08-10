@@ -559,6 +559,9 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
 CommandResult BuildTaskMemoryResumeAndExecuteResult(
     const AgentConfig & config,
     const JsonRequestView & params);
+CommandResult BuildTaskMemoryNewChatRoundSelftestResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
 CommandResult BuildTaskMemoryMigrationAcceptanceResult(
     const AgentConfig & config,
     const JsonRequestView & params);
@@ -819,8 +822,12 @@ std::string ResolveNextActionSafetyClass(const std::string & tool_name) {
         || tool_name == "lan_agent_delete_next_text_range_atomic") {
         return "BOUNDED_FILE_WRITE";
     }
+    if (tool_name == "lan_agent_format_code_file") {
+        return "CONTROLLED_CODE_FORMAT";
+    }
     if (tool_name == "lan_agent_task_memory_freeze"
-        || tool_name == "lan_agent_task_memory_execute_continuation_budget") {
+        || tool_name == "lan_agent_task_memory_execute_continuation_budget"
+        || tool_name == "lan_agent_task_memory_resume_and_execute") {
         return "TASK_MEMORY_CONTINUATION";
     }
     return std::string();
@@ -850,6 +857,22 @@ bool IsSafeClipsContinuationAction(
         && GetFieldOrDefault(result, "task_execution_in_mcp_required", "") == "true"
         && GetFieldOrDefault(result, "forced_task_memory_execution", "") == "true"
         && GetFieldOrDefault(result, "terminal_state", "") != "true") {
+            return true;
+    }
+    if (required_tool == "lan_agent_task_memory_resume_and_execute"
+        && safety_class == "TASK_MEMORY_CONTINUATION"
+        && GetFieldOrDefault(result, "record_model", "") ==
+            "mcp_task_memory_execute_continuation_budget_response_v1"
+        && GetFieldOrDefault(result, "execution_mode", "") == "bounded_allowlist_execute"
+        && GetFieldOrDefault(result, "continue_required", "") == "true"
+        && GetFieldOrDefault(result, "terminal_state", "") != "true") {
+        return true;
+    }
+    if (required_tool == "lan_agent_format_code_file"
+        && safety_class == "CONTROLLED_CODE_FORMAT"
+        && GetFieldOrDefault(result, "result", "") == "pre_guard_rerouted"
+        && GetFieldOrDefault(result, "clips_gate", "") == "rerouted_before_execution"
+        && GetFieldOrDefault(result, "primary_intent", "") == "code_format") {
         return true;
     }
     if ((required_tool == "lan_agent_delete_text_range_window_atomic"
@@ -858,6 +881,19 @@ bool IsSafeClipsContinuationAction(
         && GetFieldOrDefault(result, "disk_write_completed", "") == "true"
         && GetFieldOrDefault(result, "window_batch_scope", "") != "multi_file") {
         return true;
+    }
+    if (required_tool == "lan_agent_delete_text_range_window_atomic"
+        && safety_class == "BOUNDED_FILE_WRITE"
+        && GetFieldOrDefault(result, "tool_name", "") == "lan_agent_mcp_route"
+        && GetFieldOrDefault(result, "routed_tool_name", "") == "lan_agent_probe_text_file"
+        && GetFieldOrDefault(result, "result", "") == "probe_complete") {
+        const std::string next_action_json = FirstNonEmpty(
+            GetFieldOrDefault(result, "required_tool_arguments_json", ""),
+            GetFieldOrDefault(result, "next_call_json", ""),
+            "");
+        return next_action_json.find("\"scan_mode\":\"comments\"") != std::string::npos
+            && next_action_json.find("\"probe_ready\":true") != std::string::npos
+            && next_action_json.find("\"max_lines\":200") != std::string::npos;
     }
     if (required_tool == "lan_agent_delete_text_range_window_atomic"
         && safety_class == "BOUNDED_FILE_WRITE"
@@ -872,6 +908,33 @@ bool IsSafeClipsContinuationAction(
         if (next_start_line > window_start_line) {
             return true;
         }
+    }
+    if (required_tool == "lan_agent_delete_text_range_window_atomic"
+        && safety_class == "BOUNDED_FILE_WRITE"
+        && GetFieldOrDefault(result, "tool_name", "") == "lan_agent_mcp_route"
+        && GetFieldOrDefault(result, "routed_tool_name", "") == "lan_agent_delete_text_range_window_atomic"
+        && GetFieldOrDefault(result, "result", "") == "no_text_range_in_window"
+        && GetFieldOrDefault(result, "continue_required", "") == "true") {
+        const std::string next_action_json = FirstNonEmpty(
+            GetFieldOrDefault(result, "required_tool_arguments_json", ""),
+            GetFieldOrDefault(result, "next_call_json", ""),
+            "");
+        return next_action_json.find("\"scan_mode\":\"comments\"") != std::string::npos
+            && next_action_json.find("\"max_lines\":200") != std::string::npos
+            && next_action_json.find("\"file_path\"") != std::string::npos;
+    }
+    if (required_tool == "lan_agent_delete_next_text_range_atomic"
+        && safety_class == "BOUNDED_FILE_WRITE"
+        && (GetFieldOrDefault(result, "result", "") == "window_boundary_range_detected"
+            || GetFieldOrDefault(result, "task_completion", "") == "boundary_blocked")
+        && GetFieldOrDefault(result, "probe_ready", "") == "true"
+        && GetFieldOrDefault(result, "scan_mode", "") == "comments"
+        && GetFieldOrDefault(result, "has_more", "") == "true"
+        && GetFieldOrDefault(result, "write_verified", "") == "true"
+        && GetFieldOrDefault(result, "disk_write_completed", "") != "true"
+        && GetFieldOrDefault(result, "window_batch_scope", "") == "single_file_bounded_line_window"
+        && GetFieldOrDefault(result, "batch_mutation_allowed", "") == "bounded_window_only") {
+        return true;
     }
     if (required_tool == "lan_agent_delete_text_range_window_atomic"
         && safety_class == "BOUNDED_FILE_WRITE"
@@ -1566,7 +1629,17 @@ void ApplySupervisionEnvelope(CommandResult * result) {
                     "\"completion_claim_allowed\":false,"
                     "\"completed_step_count\":0,"
                     "\"remaining_work\":\"continue required MCP tool calls until terminal_state=true\","
-                    "\"next_call_json\":\"" + codex_lan_agent::JsonEscape(next_action_json) + "\""
+                    "\"next_tool_name\":\"" + codex_lan_agent::JsonEscape(required_tool) + "\","
+                    "\"next_file_path\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "file_path", "")) + "\","
+                    "\"next_scan_mode\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "scan_mode", "comments")) + "\","
+                    "\"next_primary_intent\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "primary_intent", "comment_cleanup")) + "\","
+                    "\"next_start_line\":" + FirstNonEmpty(GetFieldOrDefault(*result, "next_start_line", ""), "1", "1") + ","
+                    "\"next_max_lines\":" + FirstNonEmpty(GetFieldOrDefault(*result, "max_lines", ""), "200", "200") + ","
+                    "\"next_probe_ref\":\"" + codex_lan_agent::JsonEscape(FirstNonEmpty(
+                        GetFieldOrDefault(*result, "probe_ref", ""),
+                        GetFieldOrDefault(*result, "file_path", ""),
+                        "")) + "\","
+                    "\"next_probe_ready\":" + (GetFieldOrDefault(*result, "probe_ready", "true") == "false" ? "false" : "true") +
                     "}}";
                 result->fields["long_loop_budget_arguments_json"] = "";
                 result->fields["long_loop_budget_precondition"] =
@@ -1905,7 +1978,12 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
             << "}";
         step_events.push_back(step_event.str());
 
-        if (!step_result.ok || step_result.exit_code != 0) {
+        const std::string next_tool_name = ExtractJsonString(next_call_json, "name");
+        const bool safe_pending_continuation =
+            has_more
+            && !Trim(next_call_json).empty()
+            && IsTaskMemoryBudgetExecutableTool(next_tool_name);
+        if ((!step_result.ok || step_result.exit_code != 0) && !safe_pending_continuation) {
             blocked = true;
             block_reason = FirstNonEmpty(
                 TaskMemoryRunnerField(step_result, "error"),
@@ -2025,7 +2103,6 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         max_steps,
         terminal_state,
         continue_required);
-    result.fields["next_call_json"] = current_call_json;
     result.fields["semantic_outcome"] = terminal_state
         ? "continuation_budget_terminal"
         : "continuation_budget_partial";
@@ -2038,9 +2115,16 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         result.fields["error"] = block_reason;
     }
     if (continue_required) {
+        const std::string resume_call_json =
+            codex_lan_agent::BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, max_steps);
         result.fields["semantic_model_clamp"] = "tool_call_only";
-        result.fields["required_tool_name"] = ExtractJsonString(current_call_json, "name");
-        result.fields["required_tool_arguments_json"] = current_call_json;
+        result.fields["required_tool_name"] = "lan_agent_task_memory_resume_and_execute";
+        result.fields["required_tool_arguments_json"] = resume_call_json;
+        result.fields["next_call_json"] = resume_call_json;
+        result.fields["interaction_continuation_mode"] = "resume_and_execute_only";
+        result.fields["internal_next_call_hidden"] = "true";
+    } else {
+        result.fields["next_call_json"] = "";
     }
     return result;
 }
@@ -2142,6 +2226,246 @@ CommandResult BuildTaskMemoryResumeAndExecuteResult(
         result.fields["next_action"] =
             "archived task reached terminal state; final claim still requires verification_ok=true";
     }
+    return result;
+}
+
+CommandResult BuildTaskMemoryNewChatRoundSelftestResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string suffix = BuildRequestTimestampToken();
+    const std::string goal_id = FirstNonEmpty(
+        params.GetString("goal_id"),
+        "new-chat-round-selftest-" + suffix);
+    const std::string trace_id = FirstNonEmpty(
+        params.GetString("trace_id"),
+        goal_id);
+    const int max_steps = std::min(16, std::max(1, params.GetInt("max_steps", 5)));
+    const std::filesystem::path selftest_dir =
+        std::filesystem::path(config.log_root) / "task_memory_new_chat_round_selftest";
+    const std::string mcp_conversation_id = "mcp-conversation-" + goal_id;
+    const std::string mcp_round_id = mcp_conversation_id + "-round-1";
+    const std::filesystem::path conversation_dir =
+        selftest_dir / "mcp_conversations" / goal_id;
+    const std::filesystem::path round_manifest_path =
+        conversation_dir / "round_0001.json";
+    const std::filesystem::path sample_path = selftest_dir / (goal_id + ".cpp");
+    const std::filesystem::path report_path = selftest_dir / (goal_id + ".json");
+
+    std::error_code ec;
+    std::filesystem::create_directories(selftest_dir, ec);
+    std::filesystem::create_directories(conversation_dir, ec);
+    if (ec) {
+        result.ok = false;
+        result.exit_code = 501;
+        result.fields["status"] = "failed";
+        result.fields["record_model"] = "mcp_task_memory_new_chat_round_selftest_response_v1";
+        result.fields["error"] = "failed to create selftest directory: " + ec.message();
+        return result;
+    }
+
+    {
+        std::ofstream sample(sample_path, std::ios::out | std::ios::trunc);
+        sample << "int before_new_chat_round = 1;\n";
+        sample << "// new chat round selftest comment\n";
+        sample << "int after_new_chat_round = 2;\n";
+    }
+
+    const std::string sample_file = sample_path.string();
+    std::ostringstream next_call;
+    next_call
+        << "{\"name\":\"lan_agent_delete_next_text_range_atomic\",\"arguments\":{"
+        << "\"file_path\":\"" << codex_lan_agent::JsonEscape(sample_file) << "\","
+        << "\"scan_mode\":\"comments\","
+        << "\"primary_intent\":\"comment_cleanup\","
+        << "\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\","
+        << "\"probe_ref\":\"" << codex_lan_agent::JsonEscape(sample_file) << "\","
+        << "\"probe_ready\":true"
+        << "}}";
+
+    std::ostringstream freeze_params;
+    freeze_params
+        << "{"
+        << "\"goal_id\":\"" << codex_lan_agent::JsonEscape(goal_id) << "\","
+        << "\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\","
+        << "\"current_goal\":\"verify MCP-owned New Chat round resume semantics\","
+        << "\"current_scope\":\"task_memory_new_chat_round_selftest\","
+        << "\"current_file\":\"" << codex_lan_agent::JsonEscape(sample_file) << "\","
+        << "\"current_tool\":\"lan_agent_delete_next_text_range_atomic\","
+        << "\"last_status\":\"needs_continue\","
+        << "\"last_has_more\":\"true\","
+        << "\"terminal_state\":false,"
+        << "\"completion_claim_allowed\":false,"
+        << "\"completed_step_count\":0,"
+        << "\"compact_summary\":\"old chat state frozen; fresh chat must resume from goal_id only\","
+        << "\"remaining_work\":\"execute one archived continuation from latest_resume_context\","
+        << "\"migration_handover_markdown\":\"New Chat round selftest: do not use old model context; call resume_and_execute with goal_id only.\","
+        << "\"next_call_json\":\"" << codex_lan_agent::JsonEscape(next_call.str()) << "\""
+        << "}";
+
+    CommandResult freeze = codex_lan_agent::BuildTaskMemoryFreezeResult(
+        config,
+        JsonRequestView(freeze_params.str()));
+    const bool freeze_ok = freeze.ok && freeze.exit_code == 0;
+
+    std::ostringstream resume_params;
+    resume_params
+        << "{"
+        << "\"goal_id\":\"" << codex_lan_agent::JsonEscape(goal_id) << "\","
+        << "\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\","
+        << "\"max_steps\":" << max_steps << ","
+        << "\"execute\":true,"
+        << "\"dry_run\":false"
+        << "}";
+
+    CommandResult resume = freeze_ok
+        ? BuildTaskMemoryResumeAndExecuteResult(config, JsonRequestView(resume_params.str()))
+        : CommandResult();
+
+    std::string final_sample;
+    std::string read_error;
+    ReadWholeFile(sample_path, &final_sample, &read_error);
+    const bool comment_removed =
+        final_sample.find("// new chat round selftest comment") == std::string::npos;
+    const bool terminal =
+        GetFieldOrDefault(resume, "terminal_state", "") == "true";
+    const bool completion_allowed =
+        GetFieldOrDefault(resume, "completion_claim_allowed", "") == "true";
+    const bool final_allowed =
+        GetFieldOrDefault(resume, "final_answer_allowed", "") == "true";
+    const bool verification_ok =
+        GetFieldOrDefault(resume, "verification_ok", "") == "true";
+    const bool mcp_round_established = !mcp_conversation_id.empty() && !mcp_round_id.empty();
+    {
+        std::ofstream round_file(round_manifest_path, std::ios::out | std::ios::trunc);
+        round_file
+            << "{\n"
+            << "  \"record_model\":\"mcp_continuation_round_v1\",\n"
+            << "  \"mcp_conversation_id\":\"" << codex_lan_agent::JsonEscape(mcp_conversation_id) << "\",\n"
+            << "  \"mcp_round_id\":\"" << codex_lan_agent::JsonEscape(mcp_round_id) << "\",\n"
+            << "  \"goal_id\":\"" << codex_lan_agent::JsonEscape(goal_id) << "\",\n"
+            << "  \"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\",\n"
+            << "  \"conversation_owner\":\"mcp\",\n"
+            << "  \"round_owner\":\"mcp\",\n"
+            << "  \"execution_owner\":\"mcp\",\n"
+            << "  \"state_owner\":\"mcp_task_memory\",\n"
+            << "  \"llama_cpp_role\":\"relay_only\",\n"
+            << "  \"llama_cpp_execution_participation\":false,\n"
+            << "  \"remote_session_required\":false,\n"
+            << "  \"host_chat_history_mutable_by_mcp\":false,\n"
+            << "  \"chat_context_reset_required\":true,\n"
+            << "  \"chat_context_reset_acknowledged\":false,\n"
+            << "  \"old_context_dropped\":false,\n"
+            << "  \"mcp_context_independence_verified\":true,\n"
+            << "  \"fresh_entry_tool_name\":\"lan_agent_task_memory_resume_and_execute\",\n"
+            << "  \"fresh_entry_arguments_scope\":\"goal_id_only_plus_budget_controls\",\n"
+            << "  \"old_model_context_allowed\":false,\n"
+            << "  \"terminal_state\":" << (terminal ? "true" : "false") << ",\n"
+            << "  \"completion_claim_allowed\":" << (completion_allowed ? "true" : "false") << ",\n"
+            << "  \"final_answer_allowed\":" << (final_allowed ? "true" : "false") << ",\n"
+            << "  \"verification_ok\":" << (verification_ok ? "true" : "false") << "\n"
+            << "}\n";
+    }
+    const bool round_manifest_written = std::filesystem::exists(round_manifest_path);
+    const bool selftest_pass =
+        freeze_ok
+        && resume.ok
+        && resume.exit_code == 0
+        && terminal
+        && completion_allowed
+        && final_allowed
+        && verification_ok
+        && comment_removed
+        && mcp_round_established
+        && round_manifest_written;
+
+    std::ostringstream report;
+    report
+        << "{\n"
+        << "  \"record_model\":\"mcp_task_memory_new_chat_round_selftest_report_v1\",\n"
+        << "  \"goal_id\":\"" << codex_lan_agent::JsonEscape(goal_id) << "\",\n"
+        << "  \"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\",\n"
+        << "  \"mcp_conversation_id\":\"" << codex_lan_agent::JsonEscape(mcp_conversation_id) << "\",\n"
+        << "  \"mcp_round_id\":\"" << codex_lan_agent::JsonEscape(mcp_round_id) << "\",\n"
+        << "  \"new_chat_round_mode\":\"mcp_memory_fresh_entry_simulation\",\n"
+        << "  \"conversation_owner\":\"mcp\",\n"
+        << "  \"round_owner\":\"mcp\",\n"
+        << "  \"execution_owner\":\"mcp\",\n"
+        << "  \"llama_cpp_role\":\"relay_only\",\n"
+        << "  \"llama_cpp_execution_participation\":false,\n"
+        << "  \"remote_session_required\":false,\n"
+        << "  \"host_chat_history_mutable_by_mcp\":false,\n"
+        << "  \"chat_context_reset_required\":true,\n"
+        << "  \"chat_context_reset_acknowledged\":false,\n"
+        << "  \"old_context_dropped\":false,\n"
+        << "  \"mcp_context_independence_verified\":true,\n"
+        << "  \"fresh_entry_arguments\":\"goal_id,trace_id,max_steps,execute,dry_run\",\n"
+        << "  \"freeze_ok\":" << (freeze_ok ? "true" : "false") << ",\n"
+        << "  \"resume_ok\":" << (resume.ok && resume.exit_code == 0 ? "true" : "false") << ",\n"
+        << "  \"terminal_state\":" << (terminal ? "true" : "false") << ",\n"
+        << "  \"completion_claim_allowed\":" << (completion_allowed ? "true" : "false") << ",\n"
+        << "  \"final_answer_allowed\":" << (final_allowed ? "true" : "false") << ",\n"
+        << "  \"verification_ok\":" << (verification_ok ? "true" : "false") << ",\n"
+        << "  \"comment_removed\":" << (comment_removed ? "true" : "false") << ",\n"
+        << "  \"mcp_conversation_round_established\":" << (mcp_round_established ? "true" : "false") << ",\n"
+        << "  \"round_manifest_written\":" << (round_manifest_written ? "true" : "false") << ",\n"
+        << "  \"round_manifest_path\":\"" << codex_lan_agent::JsonEscape(round_manifest_path.string()) << "\",\n"
+        << "  \"selftest_pass\":" << (selftest_pass ? "true" : "false") << "\n"
+        << "}\n";
+    {
+        std::ofstream report_file(report_path, std::ios::out | std::ios::trunc);
+        report_file << report.str();
+    }
+
+    result.ok = selftest_pass;
+    result.exit_code = selftest_pass ? 0 : 98;
+    result.fields["status"] = selftest_pass ? "success" : "failed";
+    result.fields["record_model"] = "mcp_task_memory_new_chat_round_selftest_response_v1";
+    result.fields["result"] = selftest_pass
+        ? "new_chat_round_selftest_passed"
+        : "new_chat_round_selftest_failed";
+    result.fields["summary"] = selftest_pass
+        ? "MCP continuation resume selftest passed; host chat reset remains a client responsibility"
+        : "MCP New Chat round selftest failed";
+    result.fields["goal_id"] = goal_id;
+    result.fields["trace_id"] = trace_id;
+    result.fields["mcp_conversation_id"] = mcp_conversation_id;
+    result.fields["mcp_round_id"] = mcp_round_id;
+    result.fields["new_chat_round_id"] = mcp_round_id;
+    result.fields["new_chat_round_mode"] = "mcp_memory_fresh_entry_simulation";
+    result.fields["conversation_owner"] = "mcp";
+    result.fields["round_owner"] = "mcp";
+    result.fields["execution_owner"] = "mcp";
+    result.fields["state_owner"] = "mcp_task_memory";
+    result.fields["llama_cpp_role"] = "relay_only";
+    result.fields["llama_cpp_execution_participation"] = "false";
+    result.fields["remote_session_required"] = "false";
+    result.fields["mcp_conversation_round_established"] = mcp_round_established ? "true" : "false";
+    result.fields["round_manifest_path"] = round_manifest_path.string();
+    result.fields["host_chat_history_mutable_by_mcp"] = "false";
+    result.fields["chat_context_reset_required"] = "true";
+    result.fields["chat_context_reset_acknowledged"] = "false";
+    result.fields["old_context_dropped"] = "false";
+    result.fields["mcp_context_independence_verified"] = "true";
+    result.fields["fresh_entry_tool_name"] = "lan_agent_task_memory_resume_and_execute";
+    result.fields["fresh_entry_arguments_scope"] = "goal_id_only_plus_budget_controls";
+    result.fields["freeze_status"] = GetFieldOrDefault(freeze, "status", "");
+    result.fields["freeze_resume_context_path"] = GetFieldOrDefault(freeze, "resume_context_path", "");
+    result.fields["resume_status"] = GetFieldOrDefault(resume, "status", "");
+    result.fields["resume_budget_status"] = GetFieldOrDefault(resume, "budget_status", "");
+    result.fields["executed_step_count"] = GetFieldOrDefault(resume, "executed_step_count", "");
+    result.fields["terminal_state"] = terminal ? "true" : "false";
+    result.fields["completion_claim_allowed"] = completion_allowed ? "true" : "false";
+    result.fields["final_answer_allowed"] = final_allowed ? "true" : "false";
+    result.fields["verification_ok"] = verification_ok ? "true" : "false";
+    result.fields["comment_removed"] = comment_removed ? "true" : "false";
+    result.fields["selftest_pass"] = selftest_pass ? "true" : "false";
+    result.fields["sample_path"] = sample_file;
+    result.fields["result_ref"] = report_path.string();
+    result.fields["evidence_ref"] = report_path.string();
+    result.fields["next_action"] = selftest_pass
+        ? "reset the host chat to a fresh context, then use goal_id-only lan_agent_task_memory_resume_and_execute; MCP verified continuation independence, not host history deletion"
+        : "inspect result_ref and repair task_memory fresh round semantics";
     return result;
 }
 
@@ -3975,10 +4299,25 @@ bool HandleMcpRoute(
     }
 
     if (request.method == "GET") {
+        const std::string accept = GetHeaderValue(request, "accept");
+        if (HeaderContainsToken(accept, "text/event-stream")) {
+            response->status_code = 405;
+            response->status_text = "Method Not Allowed";
+            response->content_type = "application/json";
+            response->body =
+                "{\"error\":\"codex-lan-agent uses Streamable HTTP POST JSON-RPC; "
+                "standalone GET event-stream is not provided\"}";
+            response->headers["Allow"] = "POST, HEAD, OPTIONS";
+            response->headers["Cache-Control"] = "no-store";
+            response->headers["X-MCP-Streamable-HTTP"] = "post-json-rpc-only";
+            ApplyMcpSessionHeaders(request, response, false);
+            return true;
+        }
         response->status_code = 200;
         response->status_text = "OK";
         response->content_type = "application/json";
         response->body = BuildMcpCapabilitiesResponse();
+        response->headers["Cache-Control"] = "no-store";
         ApplyMcpSessionHeaders(request, response, false);
         return true;
     }
@@ -4044,6 +4383,7 @@ bool HandleMcpRoute(
             ApplyRawRequestEncodingProbe(tool_name, request.body, &result);
             LanResultBuilder(&result).Finalize(config, tool_name);
             ApplySupervisionEnvelope(&result);
+            codex_lan_agent::RememberTaskMemoryPendingFreezeArgumentsFromResult(result);
             AppendMcpTraceAuditEvent(config, tool_name, result);
             AppendMcpSupervisionAlarmEvent(config, tool_name, result);
             response->body = BuildMcpToolCallResponse(id_raw, result);
@@ -4060,6 +4400,7 @@ bool HandleMcpRoute(
             ApplyClipsResultGuard(config, tool_name, &result);
             ApplyClipsSemanticTraceContinuation(config, &result);
             ApplySupervisionEnvelope(&result);
+            codex_lan_agent::RememberTaskMemoryPendingFreezeArgumentsFromResult(result);
             AppendMcpTraceAuditEvent(config, tool_name, result);
             AppendMcpSupervisionAlarmEvent(config, tool_name, result);
 

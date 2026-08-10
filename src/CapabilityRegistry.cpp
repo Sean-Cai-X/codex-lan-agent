@@ -237,7 +237,7 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "task_memory_freeze",
             "Freeze a long RAG/main-thread state into MCP-owned migration files, slices, manifest, ledger, and latest resume_context.",
             "lan_agent_task_memory_freeze",
-            "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"current_goal\":\"optional string\",\"current_scope\":\"optional string\",\"current_file\":\"optional string\",\"last_status\":\"optional string\",\"last_has_more\":\"optional string\",\"terminal_state\":\"optional bool\",\"completion_claim_allowed\":\"optional bool\",\"completed_step_count\":\"optional integer\",\"current_tool\":\"optional string\",\"next_call_json\":\"optional string\",\"compact_summary\":\"optional string\",\"remaining_work\":\"optional string\",\"key_slices_jsonl\":\"optional JSONL string\",\"incremental_index_manifest_json\":\"optional JSON string\"}",
+            "{\"goal_id\":\"required string\",\"trace_id\":\"optional string\",\"current_goal\":\"optional string\",\"current_scope\":\"optional string\",\"current_file\":\"optional string\",\"last_status\":\"optional string\",\"last_has_more\":\"optional string\",\"terminal_state\":\"optional bool\",\"completion_claim_allowed\":\"optional bool\",\"completed_step_count\":\"optional integer\",\"current_tool\":\"optional string\",\"next_call_json\":\"optional string\",\"next_tool_name\":\"optional flat continuation tool name\",\"next_file_path\":\"optional string\",\"next_start_line\":\"optional integer\",\"next_max_lines\":\"optional integer\",\"next_probe_ref\":\"optional string\",\"next_probe_ready\":\"optional bool\",\"compact_summary\":\"optional string\",\"remaining_work\":\"optional string\",\"key_slices_jsonl\":\"optional JSONL string\",\"incremental_index_manifest_json\":\"optional JSON string\"}",
             "{\"record_model\":\"mcp_task_memory_freeze_response_v1\",\"resume_context_path\":\"non_empty\"}",
             "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"verify resume context after freeze\"}",
             "[\"goal_id\",\"trace_id\",\"task_memory_root\",\"migration_dir\",\"current_state_path\",\"key_slices_path\",\"incremental_index_manifest_path\",\"migration_handover_path\",\"step_ledger_path\",\"resume_context_path\",\"completion_claim_allowed\",\"terminal_state\",\"result_ref\",\"evidence_ref\",\"next_action\"]",
@@ -280,6 +280,18 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "medium",
             "false",
             "file_append"
+        },
+        {
+            "task_memory_new_chat_round_selftest",
+            "Self-test MCP-owned continuation semantics in one tool call: create an MCP round manifest, keep llama.cpp as relay/display-only, freeze an archived continuation, resume through goal_id-only fresh entry, execute a bounded step, and expose that host chat context reset still requires client acknowledgement.",
+            "lan_agent_task_memory_new_chat_round_selftest",
+            "{\"goal_id\":\"optional string\",\"trace_id\":\"optional string\",\"max_steps\":\"optional integer capped at 16\"}",
+            "{\"record_model\":\"mcp_task_memory_new_chat_round_selftest_response_v1\",\"selftest_pass\":\"bool\",\"new_chat_round_mode\":\"mcp_memory_fresh_entry_simulation\",\"llama_cpp_role\":\"relay_only\",\"chat_context_reset_acknowledged\":\"false until client ack\"}",
+            "{\"tool\":\"lan_agent_task_memory_resume_context\",\"reason\":\"inspect the selftest goal resume context\"}",
+            "[\"goal_id\",\"trace_id\",\"mcp_conversation_id\",\"mcp_round_id\",\"new_chat_round_mode\",\"conversation_owner\",\"execution_owner\",\"llama_cpp_role\",\"remote_session_required\",\"chat_context_reset_required\",\"chat_context_reset_acknowledged\",\"old_context_dropped\",\"mcp_context_independence_verified\",\"fresh_entry_tool_name\",\"resume_budget_status\",\"executed_step_count\",\"terminal_state\",\"completion_claim_allowed\",\"final_answer_allowed\",\"verification_ok\",\"selftest_pass\",\"result_ref\",\"evidence_ref\"]",
+            "medium",
+            "false",
+            "file_write"
         },
         {
             "task_memory_build_kv_snapshot",

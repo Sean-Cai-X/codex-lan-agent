@@ -473,6 +473,40 @@ inline CommandResult BuildFormatCodeFileResult(
         result.fields["summary"] = would_change
             ? "clang-format would change the source file"
             : "source file is already clang-format stable";
+        if (would_change) {
+            std::ostringstream next_call;
+            next_call
+                << "{\"name\":\"lan_agent_format_code_file\",\"arguments\":{"
+                << "\"source_file\":\"" << JsonEscape(normalized_source.string()) << "\","
+                << "\"dry_run\":false,"
+                << "\"style\":\"" << JsonEscape(style) << "\","
+                << "\"fallback_style\":\"" << JsonEscape(fallback_style) << "\"";
+            const std::string trace_id = params.GetString("trace_id");
+            if (!trace_id.empty()) {
+                next_call << ",\"trace_id\":\"" << JsonEscape(trace_id) << "\"";
+            }
+            next_call << "}}";
+            result.fields["status"] = "needs_continue";
+            result.fields["result"] = "format_dry_run_requires_apply";
+            result.fields["format_apply_required"] = "true";
+            result.fields["dry_run_only"] = "true";
+            result.fields["continue_required"] = "true";
+            result.fields["auto_continue_required"] = "true";
+            result.fields["semantic_model_clamp"] = "tool_call_only";
+            result.fields["required_next_action_type"] = "mcp_tool_call";
+            result.fields["required_tool_name"] = "lan_agent_format_code_file";
+            result.fields["required_tool_arguments_json"] = next_call.str();
+            result.fields["next_call_json"] = next_call.str();
+            result.fields["terminal_state"] = "false";
+            result.fields["task_done"] = "false";
+            result.fields["completion_claim_allowed"] = "false";
+            result.fields["final_answer_allowed"] = "false";
+            result.fields["verification_ok"] = "false";
+            result.fields["completion_guard"] =
+                "FORMAT_DRY_RUN_ONLY: do not claim completion; apply required_tool_arguments_json with dry_run=false";
+            result.fields["next_action"] =
+                "tool_call_only: formatting preview found changes; call lan_agent_mcp_route mode=call with target_tool_name=lan_agent_format_code_file and required_tool_arguments_json";
+        }
         return result;
     }
 

@@ -9,8 +9,10 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,22 @@ inline std::string SanitizeTaskMemoryToken(const std::string & value) {
         output.push_back(safe ? static_cast<char>(ch) : '_');
     }
     return output.empty() ? "default_goal" : output;
+}
+
+inline std::string TaskMemoryPendingFreezeKey(
+    const std::string & goal_id,
+    const std::string & trace_id) {
+    return SanitizeTaskMemoryToken(goal_id) + "|" + SanitizeTaskMemoryToken(trace_id);
+}
+
+inline std::unordered_map<std::string, std::string> & TaskMemoryPendingFreezeArgumentsMap() {
+    static std::unordered_map<std::string, std::string> pending;
+    return pending;
+}
+
+inline std::mutex & TaskMemoryPendingFreezeArgumentsMutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 inline std::string TaskMemoryStableChecksum(const std::string & content) {
@@ -190,6 +208,109 @@ inline std::string TaskMemoryNormalizeNextCallJson(std::string value) {
     return value;
 }
 
+inline std::string BuildTaskMemoryFlatContinuationJson(const JsonRequestView & params) {
+    const std::string tool_name = TaskMemoryFirstNonEmpty(
+        params.GetString("next_tool_name"),
+        params.GetString("continuation_tool_name"));
+    if (tool_name.empty()) {
+        return std::string();
+    }
+    const std::string file_path = TaskMemoryFirstNonEmpty(
+        params.GetString("next_file_path"),
+        params.GetString("file_path"),
+        params.GetString("current_file"));
+    const std::string scan_mode = TaskMemoryFirstNonEmpty(
+        params.GetString("next_scan_mode"),
+        params.GetString("scan_mode"),
+        "comments");
+    const std::string primary_intent = TaskMemoryFirstNonEmpty(
+        params.GetString("next_primary_intent"),
+        params.GetString("primary_intent"),
+        "comment_cleanup");
+    const std::string trace_id = params.GetString("trace_id");
+    const std::string probe_ref = TaskMemoryFirstNonEmpty(
+        params.GetString("next_probe_ref"),
+        params.GetString("probe_ref"),
+        file_path);
+    const bool probe_ready = params.GetBool("next_probe_ready", params.GetBool("probe_ready", true));
+
+    if (file_path.empty()) {
+        return std::string();
+    }
+
+    std::ostringstream output;
+    output << "{\"name\":\"" << JsonEscape(tool_name) << "\",\"arguments\":{"
+           << "\"file_path\":\"" << JsonEscape(file_path) << "\","
+           << "\"scan_mode\":\"" << JsonEscape(scan_mode) << "\","
+           << "\"primary_intent\":\"" << JsonEscape(primary_intent) << "\"";
+    if (tool_name == "lan_agent_delete_text_range_window_atomic") {
+        const int start_line = std::max(
+            1,
+            params.GetInt("next_start_line", params.GetInt("start_line", 1)));
+        const int max_lines = std::max(
+            1,
+            params.GetInt("next_max_lines", params.GetInt("max_lines", 200)));
+        output << ",\"start_line\":" << start_line
+               << ",\"next_start_line\":" << start_line
+               << ",\"max_lines\":" << max_lines;
+    }
+    if (!trace_id.empty()) {
+        output << ",\"trace_id\":\"" << JsonEscape(trace_id) << "\"";
+    }
+    if (!probe_ref.empty()) {
+        output << ",\"probe_ref\":\"" << JsonEscape(probe_ref) << "\"";
+    }
+    output << ",\"probe_ready\":" << (probe_ready ? "true" : "false")
+           << "}}";
+    return output.str();
+}
+
+inline void RememberTaskMemoryPendingFreezeArguments(
+    const std::string & full_freeze_call_json) {
+    const std::string tool_name = ExtractJsonString(full_freeze_call_json, "name");
+    if (tool_name != "lan_agent_task_memory_freeze") {
+        return;
+    }
+    const std::string arguments_json = ExtractJsonObjectRaw(full_freeze_call_json, "arguments");
+    if (Trim(arguments_json).empty()) {
+        return;
+    }
+    const std::string goal_id = ExtractJsonString(arguments_json, "goal_id");
+    const std::string trace_id = ExtractJsonString(arguments_json, "trace_id");
+    if (Trim(goal_id).empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(TaskMemoryPendingFreezeArgumentsMutex());
+    TaskMemoryPendingFreezeArgumentsMap()[TaskMemoryPendingFreezeKey(goal_id, trace_id)] = arguments_json;
+    TaskMemoryPendingFreezeArgumentsMap()[TaskMemoryPendingFreezeKey(goal_id, "")] = arguments_json;
+}
+
+inline void RememberTaskMemoryPendingFreezeArgumentsFromResult(const CommandResult & result) {
+    const std::string full_freeze_call_json = TaskMemoryFirstNonEmpty(
+        GetFieldOrDefault(result, "long_loop_freeze_arguments_json", ""),
+        GetFieldOrDefault(result, "required_tool_name", "") == "lan_agent_task_memory_freeze"
+            ? GetFieldOrDefault(result, "required_tool_arguments_json", "")
+            : std::string(),
+        GetFieldOrDefault(result, "next_call_json", ""));
+    RememberTaskMemoryPendingFreezeArguments(full_freeze_call_json);
+}
+
+inline std::string LookupTaskMemoryPendingFreezeArguments(
+    const std::string & goal_id,
+    const std::string & trace_id) {
+    if (Trim(goal_id).empty()) {
+        return std::string();
+    }
+    std::lock_guard<std::mutex> lock(TaskMemoryPendingFreezeArgumentsMutex());
+    auto & pending = TaskMemoryPendingFreezeArgumentsMap();
+    const auto exact = pending.find(TaskMemoryPendingFreezeKey(goal_id, trace_id));
+    if (exact != pending.end()) {
+        return exact->second;
+    }
+    const auto by_goal = pending.find(TaskMemoryPendingFreezeKey(goal_id, ""));
+    return by_goal == pending.end() ? std::string() : by_goal->second;
+}
+
 inline std::string BuildTaskMemoryResumeAndExecuteCallJson(
     const std::string & goal_id,
     const std::string & trace_id,
@@ -230,6 +351,15 @@ inline void ApplyTaskMemoryCleanHandoffFields(
     result->fields["conversation_close_status"] = terminal_state
         ? "terminal_complete"
         : (continuation_available ? "handoff_ready_not_complete" : "close_blocked_missing_continuation");
+    // MCP owns the durable continuation, but it cannot erase the host chat's
+    // message history. The chat/client layer must acknowledge the reset.
+    const bool reset_required = !terminal_state && continuation_available;
+    result->fields["chat_context_reset_required"] = reset_required ? "true" : "false";
+    result->fields["chat_context_reset_requested"] = reset_required ? "true" : "false";
+    result->fields["chat_context_reset_acknowledged"] = "false";
+    result->fields["host_chat_history_mutable_by_mcp"] = "false";
+    result->fields["old_context_dropped"] = "false";
+    result->fields["mcp_continuation_ready"] = continuation_available ? "true" : "false";
     result->fields["handoff_completion_claim"] = terminal_state
         ? "task_completion_gate_required"
         : "not_task_complete";
@@ -249,7 +379,7 @@ inline void ApplyTaskMemoryCleanHandoffFields(
         ? BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, max_steps)
         : "";
     result->fields["new_chat_resume_instruction"] = continuation_available
-        ? "start a new chat and call new_chat_entry_arguments_json; do not reload the old conversation"
+        ? "chat/client must reset to a fresh context, then call new_chat_entry_arguments_json; MCP does not reload or retain old chat history"
         : (terminal_state ? "no resume is required; inspect verification fields before final claim" : "repair or freeze continuation before ending the chat");
 }
 
@@ -346,12 +476,16 @@ inline std::string BuildResumeContextJson(
     const JsonRequestView & params,
     const std::string & goal_id,
     const std::string & trace_id,
-    int last_verified_step) {
+    int last_verified_step,
+    const std::string & next_call_json_override = std::string()) {
     const bool terminal_state = params.GetBool("terminal_state", false);
     const bool completion_claim_allowed = params.GetBool("completion_claim_allowed", false) && terminal_state;
     const std::string next_call_json = TaskMemoryNormalizeNextCallJson(
-        TaskMemoryParamStringOrRaw(params, "next_call_json"));
+        Trim(next_call_json_override).empty()
+            ? TaskMemoryParamStringOrRaw(params, "next_call_json")
+            : next_call_json_override);
     const bool continuation_available = !terminal_state && !Trim(next_call_json).empty();
+    const bool reset_required = !terminal_state && continuation_available;
     const int resume_max_steps = std::max(1, params.GetInt("budget_max_steps", 10));
     const std::string conversation_close_status = terminal_state
         ? "terminal_complete"
@@ -370,6 +504,12 @@ inline std::string BuildResumeContextJson(
         << "  \"clean_chat_close_allowed\":" << ((terminal_state || continuation_available) ? "true" : "false") << ",\n"
         << "  \"conversation_close_allowed\":" << ((terminal_state || continuation_available) ? "true" : "false") << ",\n"
         << "  \"conversation_close_status\":\"" << JsonEscape(conversation_close_status) << "\",\n"
+        << "  \"chat_context_reset_required\":" << (reset_required ? "true" : "false") << ",\n"
+        << "  \"chat_context_reset_requested\":" << (reset_required ? "true" : "false") << ",\n"
+        << "  \"chat_context_reset_acknowledged\":false,\n"
+        << "  \"host_chat_history_mutable_by_mcp\":false,\n"
+        << "  \"old_context_dropped\":false,\n"
+        << "  \"mcp_continuation_ready\":" << (continuation_available ? "true" : "false") << ",\n"
         << "  \"handoff_completion_claim\":\"" << (terminal_state ? "task_completion_gate_required" : "not_task_complete") << "\",\n"
         << "  \"next_chat_status_check_required\":" << ((terminal_state || continuation_available) ? "true" : "false") << ",\n"
         << "  \"next_chat_status_check_tool_name\":\"" << ((terminal_state || continuation_available) ? "lan_agent_task_memory_resume_context" : "") << "\",\n"
@@ -668,8 +808,12 @@ inline CommandResult BuildTaskMemoryFreezeResult(
         params.GetString("migration_handover_markdown"),
         BuildMigrationHandoverMarkdown(goal_id, trace_id));
     const bool terminal_state = params.GetBool("terminal_state", false);
-    const std::string freeze_next_call_json = TaskMemoryNormalizeNextCallJson(
+    std::string freeze_next_call_json = TaskMemoryNormalizeNextCallJson(
         TaskMemoryParamStringOrRaw(params, "next_call_json"));
+    if (Trim(freeze_next_call_json).empty()) {
+        freeze_next_call_json = TaskMemoryNormalizeNextCallJson(
+            BuildTaskMemoryFlatContinuationJson(params));
+    }
     if (!terminal_state && Trim(freeze_next_call_json).empty()) {
         result.ok = false;
         result.exit_code = 422;
@@ -702,7 +846,8 @@ inline CommandResult BuildTaskMemoryFreezeResult(
         params,
         goal_id,
         trace_id,
-        std::max(0, params.GetInt("completed_step_count", 0)));
+        std::max(0, params.GetInt("completed_step_count", 0)),
+        freeze_next_call_json);
 
     std::error_code ec;
     std::filesystem::create_directories(evidence_dir, ec);

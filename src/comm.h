@@ -963,6 +963,8 @@ struct CommOperations final {
             "\"endpoint\":\"/mcp\","
             "\"methods\":[\"HEAD\",\"GET\",\"POST\"],"
             "\"accept\":[\"application/json\",\"text/event-stream\"],"
+            "\"streamable_http_mode\":\"POST JSON-RPC; GET returns JSON capabilities unless Accept requests text/event-stream\","
+            "\"get_event_stream\":\"not_supported_post_json_rpc_only\","
             "\"message\":\"use POST /mcp for JSON-RPC requests\""
             "}";
     }

@@ -432,8 +432,10 @@ CommandResult BuildMcpOverviewResult(const AgentConfig & config) {
         "model context must stay task-minimal: include current user goal, current file/path, one next MCP call, completion gate, and artifact refs only; never paste tools/list schemas, full old chat, full logs, or full artifacts into prompt";
     result.fields["local_ai_comment_cleanup_policy"] =
         "for comment deletion use lan_agent_probe_text_file then lan_agent_delete_text_range_window_atomic max_lines=200; do not read the whole file and batch edit from model memory";
+    result.fields["local_ai_code_format_policy"] =
+        "for C/C++ source whitespace, extra blank lines, indentation, or newline cleanup use lan_agent_format_code_file: dry_run=true first, then dry_run=false when would_change=true; do not scan comments or delete text ranges for formatting";
     result.fields["local_ai_long_loop_policy"] =
-        "when continuation may exceed model context, freeze task_memory once; in a fresh chat with an existing goal_id call lan_agent_task_memory_resume_and_execute directly";
+        "when continuation may exceed model context, freeze task_memory once; the chat/client must reset to a fresh context, then call lan_agent_task_memory_resume_and_execute with goal_id; MCP cannot erase host chat history itself";
     result.fields["local_ai_completion_gate"] =
         "only claim completion when terminal_state=true, completion_claim_allowed=true, final_answer_allowed=true, and verification_ok=true; clean_chat_close_allowed only means the current chat may hand off safely";
     result.fields["local_ai_conversation_close_policy"] =
@@ -444,15 +446,16 @@ CommandResult BuildMcpOverviewResult(const AgentConfig & config) {
         "\"context\":[\"current goal\",\"current file/path\",\"one next MCP call\",\"completion gate\",\"result_ref/evidence_ref only\",\"no full old chat\",\"no full tools/list schemas\",\"no full logs/artifacts in prompt\"],"
         "\"file_ops\":[\"probe first\",\"single file\",\"bounded window or one atomic mutation\",\"verify each step\",\"follow next_call_json until terminal\"],"
         "\"comment_cleanup\":[\"lan_agent_probe_text_file\",\"lan_agent_delete_text_range_window_atomic max_lines=200\",\"repeat next_call_json until has_more=false\"],"
-        "\"long_loop\":[\"lan_agent_task_memory_freeze\",\"lan_agent_task_memory_execute_continuation_budget\",\"lan_agent_task_memory_resume_context\"],"
+        "\"code_format_cleanup\":[\"lan_agent_format_code_file dry_run=true\",\"if would_change=true and user requested cleanup then lan_agent_format_code_file dry_run=false\",\"never use scan_text_ranges/delete_text_range_window_atomic for whitespace/newline formatting\"],"
+        "\"long_loop\":[\"lan_agent_task_memory_freeze\",\"lan_agent_task_memory_execute_continuation_budget\",\"chat/client resets to a fresh context\",\"lan_agent_task_memory_resume_and_execute with goal_id\"],"
         "\"fresh_chat_resume\":[\"lan_agent_task_memory_resume_and_execute with goal_id\",\"repeat returned required_tool_arguments_json only if continue_required=true\"],"
-        "\"clean_handoff\":[\"clean_chat_close_allowed=true means current chat can stop without claiming task completion\",\"new chat calls new_chat_entry_arguments_json\",\"handoff_completion_claim=not_task_complete forbids completion wording\"],"
+        "\"clean_handoff\":[\"clean_chat_close_allowed=true means current chat can stop without claiming task completion\",\"chat_context_reset_required=true requires the chat/client to start a fresh context\",\"MCP cannot delete host history; old_context_dropped remains false until client acknowledgment\",\"new chat calls new_chat_entry_arguments_json\",\"handoff_completion_claim=not_task_complete forbids completion wording\"],"
         "\"conversation_close_status\":[\"old chat must expose conversation_close_status\",\"new chat first calls next_chat_status_check_arguments_json\",\"then verify next_chat_must_verify_fields_json before continuing\"],"
         "\"completion_gate\":[\"terminal_state=true\",\"completion_claim_allowed=true\",\"final_answer_allowed=true\",\"verification_ok=true\"]}";
     result.fields["local_ai_context_bootstrap_json"] =
         "{\"record_model\":\"mcp_context_bootstrap_v1\","
         "\"max_prompt_payload\":\"short\","
-        "\"include\":[\"user_goal\",\"goal_id\",\"trace_id\",\"current_file\",\"required_tool_name\",\"required_tool_arguments_json\",\"clean_chat_close_allowed\",\"new_chat_entry_arguments_json\",\"completion_gate\",\"result_ref\",\"evidence_ref\"],"
+        "\"include\":[\"user_goal\",\"goal_id\",\"trace_id\",\"current_file\",\"required_tool_name\",\"required_tool_arguments_json\",\"clean_chat_close_allowed\",\"chat_context_reset_required\",\"chat_context_reset_acknowledged\",\"old_context_dropped\",\"new_chat_entry_arguments_json\",\"completion_gate\",\"result_ref\",\"evidence_ref\"],"
         "\"exclude\":[\"full_tools_list\",\"tool_schemas\",\"old_chat_history\",\"full_file_content\",\"full_log_content\",\"full_artifact_json\"],"
         "\"lookup_policy\":\"use refs and MCP query tools on demand\"}";
     result.fields["result"] = "mcp_overview";

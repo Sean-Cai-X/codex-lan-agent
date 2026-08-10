@@ -33,11 +33,33 @@ std::string NormalizeLocalAiPrimaryIntent(const std::string & primary_intent) {
         || lowered == "删注释") {
         return "comment_cleanup";
     }
+    if (lowered == "format code"
+        || lowered == "code format"
+        || lowered == "format_code"
+        || lowered == "code_format"
+        || lowered == "formatting"
+        || lowered == "whitespace_cleanup"
+        || lowered == "whitespace cleanup"
+        || lowered == "newline_cleanup"
+        || lowered == "newline cleanup"
+        || lowered == "remove extra newlines"
+        || lowered == "delete extra newlines"
+        || lowered == "删除多余回车换行"
+        || lowered == "删除多余的回车换行"
+        || lowered == "清理多余回车换行"
+        || lowered == "清理空白"
+        || lowered == "格式化代码") {
+        return "code_format";
+    }
     return primary_intent;
 }
 
 bool IsLocalAiCommentCleanupIntent(const std::string & primary_intent) {
     return NormalizeLocalAiPrimaryIntent(primary_intent) == "comment_cleanup";
+}
+
+bool IsLocalAiCodeFormatIntent(const std::string & primary_intent) {
+    return NormalizeLocalAiPrimaryIntent(primary_intent) == "code_format";
 }
 
 std::string BuildJsonStringArrayFromStrings(const std::vector<std::string> & values) {
@@ -2555,9 +2577,10 @@ CommandResult ProbeTextFileResult(
     const std::string canonical_primary_intent = NormalizeLocalAiPrimaryIntent(primary_intent);
     const std::string lowered_intent = ToLowerAscii(Trim(canonical_primary_intent));
     const bool comment_cleanup_intent = IsLocalAiCommentCleanupIntent(primary_intent);
+    const bool code_format_intent = IsLocalAiCodeFormatIntent(primary_intent);
     const bool segmented_intent = comment_cleanup_intent
+        || (!code_format_intent && lowered_intent.find("cleanup") != std::string::npos)
         || lowered_intent.find("comment") != std::string::npos
-        || lowered_intent.find("cleanup") != std::string::npos
         || lowered_intent.find("localized") != std::string::npos
         || lowered_intent.find("edit") != std::string::npos
         || lowered_intent.find("source_edit_planning") != std::string::npos;
@@ -2566,7 +2589,9 @@ CommandResult ProbeTextFileResult(
         ? "large"
         : (file_bytes >= 64ULL * 1024ULL ? "medium" : "small");
     const int recommended_read_max_lines = file_bytes >= (256ULL * 1024ULL) || total_lines >= 3000 ? 200 : 500;
-    const std::string recommended_next_tool = comment_cleanup_intent
+    const std::string recommended_next_tool = code_format_intent
+        ? "lan_agent_format_code_file"
+        : comment_cleanup_intent
         ? "lan_agent_delete_text_range_window_atomic"
         : (segmented_intent
         ? "lan_agent_scan_text_ranges"
@@ -2574,7 +2599,11 @@ CommandResult ProbeTextFileResult(
     const std::string recommended_scan_mode = segmented_intent ? "comments" : "";
 
     std::ostringstream next_call_json;
-    if (comment_cleanup_intent) {
+    if (code_format_intent) {
+        next_call_json << "{\"name\":\"lan_agent_format_code_file\",\"arguments\":{\"source_file\":\""
+                       << codex_lan_agent::JsonEscape(file_path)
+                       << "\",\"dry_run\":true}}";
+    } else if (comment_cleanup_intent) {
         next_call_json << "{\"name\":\"lan_agent_delete_text_range_window_atomic\",\"arguments\":{\"file_path\":\""
                        << codex_lan_agent::JsonEscape(file_path)
                        << "\",\"scan_mode\":\"comments\",\"start_line\":1,\"next_start_line\":1,\"max_lines\":200"
@@ -2662,7 +2691,9 @@ CommandResult ProbeTextFileResult(
     result.fields["result_ref"] = normalized.string();
     result.fields["evidence_ref"] = normalized.string();
     result.fields["next_tool_name"] = recommended_next_tool;
-    result.fields["next_action"] = segmented_intent
+    result.fields["next_action"] = code_format_intent
+        ? "call lan_agent_format_code_file with dry_run=true first; if would_change=true and user requested cleanup, call it again with dry_run=false"
+        : segmented_intent
         ? (comment_cleanup_intent
             ? "call lan_agent_delete_text_range_window_atomic with max_lines=200 and repeat next_call_json until has_more=false"
             : "call lan_agent_scan_text_ranges first, then lan_agent_prepare_edit_windows for segmented edits")

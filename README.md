@@ -214,7 +214,139 @@ Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上
 | `lan_agent_task_memory_structure_manifest` | 写 `memory_structure.json`，固化"新模型首读 → 二读 → 查询读 → 全历史读禁用"契约 | `goal_id` |
 | `lan_agent_task_memory_migration_acceptance` | 在 MCP 内一站式跑完整迁移验收链（freeze → budget → kv → mirror → parity → manifest），返回 `migration_acceptance_status=ACCEPTED/PARTIAL` | — |
 
-### 4.4 通用参数说明
+### 4.4 MCP 单一网关入口：`lan_agent_mcp_route`
+
+`lan_agent_mcp_route` 是**聊天层唯一可见的 MCP 工具**——把所有内部 MCP 工具（代码分析、语义网格、Task Memory、文件访问等）隐藏在自身之后。本地模型只需看到这 1 个工具，通过三种模式与 MCP 交互。启用条件：`UseFullMcpToolSurface()=false`（默认），此时 `tools/list` 只返回 `lan_agent_mcp_route`。
+
+#### 三种模式
+
+| mode | 行为 | 关键返回字段 |
+|---|---|---|
+| `overview` | 返回 MCP 能力指引（不执行工具） | `mcp_route_mode=overview`、`tool_use_decision=guidance_only`、`chain_state=no_execution_started`、`visible_tool_count=1`、`visible_tool_name=lan_agent_mcp_route` |
+| `route` | CLIPS 规则推断路由目标，构造 `required_tool_arguments_json` | `mcp_route_mode=route`、`route_target`、`required_tool_name`、`required_tool_arguments_json`、`next_call_json`、`chain_state=needs_tool_call`、`semantic_model_clamp=tool_call_only` |
+| `call` | 通过内部注册表查找 `target_tool_name` 并执行（递归保护：禁止 `mcp_route` 调自身） | `mcp_route_mode=call`、`routed_tool_name`、`internal_execution_performed=true`、`current_tool_chain_node`，透传内部工具所有 result 字段 |
+
+#### 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `mode` | string | `overview` / `route` / `call`。省略时：有 `request_text`/`primary_intent`/`file_path`/`source_file` 任一非空 → 默认 `route`，否则 `overview` |
+| `request_text` | string | 自然语言请求（route 模式） |
+| `primary_intent` | string | 主意图（route 模式） |
+| `target_tool_name` | string | call 模式要执行的内部工具名 |
+| `arguments` | object | call 模式传给 `target_tool_name` 的参数对象 |
+| `arguments_json` | string | call 模式的参数 JSON 字符串（`arguments` 的替代形式） |
+| `goal_id` / `trace_id` | string | 任务追踪标识 |
+| `max_steps` | integer | 续跑步数上限 |
+
+#### 典型调用流程
+
+```
+1. mode=route（或省略 mode + 提供自然语言请求）
+   → MCP 返回 required_tool_name=lan_agent_delete_text_range_window_atomic
+              required_tool_arguments_json={...}
+
+2. mode=call, target_tool_name=lan_agent_delete_text_range_window_atomic,
+   arguments=<上一步的 required_tool_arguments_json>
+   → MCP 执行内部工具，返回 result 字段 + chain_state
+
+3. 根据 chain_state / terminal_state / verification_ok 判断继续或终结
+   → 非终态：回到步骤 1 或 2 继续调用
+   → 终态：terminal_state=true + completion_claim_allowed=true → 可输出自然语言结论
+```
+
+#### 安全约束
+
+- **递归保护**：`target_tool_name=lan_agent_mcp_route` 时返回 `recursive_mcp_route_blocked`
+- **未注册工具**：返回 `internal_tool_not_found`（404）
+- **安全分级**：`safety_class=mcp_gateway_route`、`risk=medium`、`trigger=mcp_route`
+
+### 4.5 文件访问工具组（4 个）
+
+文件访问工具组负责远程工作区/日志目录的文件读取和目录列举，是本地模型 inspect 远程文件系统的主要通道。
+
+| 工具 | 功能 | 必需参数 | risk |
+|---|---|---|---|
+| `lan_agent_read_text_file` | 分页读文本文件（默认 500 行/页），支持 line 和 byte-offset 分页；`has_more=true` 时自动返回 `next_start_line` 续读 | `file_path` | low |
+| `lan_agent_tail_text_file` | 读文件尾部 N 行（默认 120），适合轮询最新构建/看门狗日志 | `file_path` | low |
+| `lan_agent_list_directory` | 列目录（默认 200 条）；传 `trace_id` 时自动写目录读取 manifest，返回 `next_batch_tool_name=lan_agent_read_directory_files` | `directory_path` | low |
+| `lan_agent_read_directory_files` | 按 `file_extensions_csv` 批读目录内匹配文件，单页+多文件接力直到 `batch_completion=complete`；内部复用 `read_text_file` | `directory_path` | low |
+
+#### 目录批读链
+
+```
+lan_agent_list_directory(trace_id=X)
+    │  写 manifest → next_batch_tool_name=lan_agent_read_directory_files
+    ▼
+lan_agent_read_directory_files(file_index=0, trace_id=X)
+    │  内部调用 read_text_file → 单文件单页
+    │  返回 next_file_index / next_start_line / next_call_json
+    ▼
+lan_agent_read_directory_files(file_index=N, start_line=M, trace_id=X)
+    │  循环直到 batch_completion=complete
+    ▼
+完成（analysis_allowed=true）
+```
+
+> **注意**：当 `analysis_allowed=false` 或 `batch_completion=incomplete` 时，**不要重新列目录**，继续该链直到 manifest 所有文件读完。
+
+#### `lan_agent_read_text_file` 参数
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `file_path` | string | — (required) | 文件路径 |
+| `max_lines` | integer | 500 | 每页行数 |
+| `start_line` | integer | 1 | 起始行 |
+| `start_byte_offset` | integer | 0 | 字节偏移（大文件单行体场景） |
+| `primary_intent` | string | — | 主意图 |
+| `trace_id` / `request_id` | string | — | 追踪标识 |
+
+> 描述中明确推荐：对于注释清理/编辑流，应优先使用 `lan_agent_scan_text_ranges` + `lan_agent_prepare_edit_windows`，而非 `read_text_file`。
+
+### 4.6 Task Memory 自检工具：`lan_agent_task_memory_new_chat_round_selftest`
+
+`lan_agent_task_memory_new_chat_round_selftest` 是**新会话轮续接语义的自检工具**——在单次调用中编排 `freeze` → `resume_and_execute` → `delete_next_text_range_atomic`（通过 continuation budget runner），验证"换新对话"场景下 MCP 仅凭 `goal_id` 就能恢复并完成端到端任务，不依赖旧模型上下文。
+
+#### 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `goal_id` | string | 可选，缺省生成 `new-chat-round-selftest-<timestamp>` |
+| `trace_id` | string | 可选，缺省等于 goal_id |
+| `max_steps` | integer | 可选，服务端上限 16，默认 5 |
+
+#### 执行流程
+
+1. 生成 `goal_id` / `mcp_conversation_id` / `mcp_round_id`
+2. 写测试样本文件 `<log_root>/task_memory_new_chat_round_selftest/<goal_id>.cpp`（含待删注释）
+3. 构造 `next_call_json` 指向 `lan_agent_delete_next_text_range_atomic`
+4. 调用 `BuildTaskMemoryFreezeResult` 冻结归档 continuation
+5. 调用 `BuildTaskMemoryResumeAndExecuteResult` 用 goal_id-only 语义恢复执行
+6. 验证 `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` / `comment_removed` / `mcp_round_established`
+
+#### 关键返回字段
+
+| 字段 | 含义 |
+|---|---|
+| `record_model` | `mcp_task_memory_new_chat_round_selftest_response_v1` |
+| `selftest_pass` | bool，全部验证通过为 true |
+| `llama_cpp_role` | `relay_only`（llama.cpp 被显式标记为中继） |
+| `chat_context_reset_required` | `true`（客户端需自行 reset host chat） |
+| `chat_context_reset_acknowledged` | `false until client ack` |
+| `mcp_context_independence_verified` | `true`（MCP 上下文独立性已验证） |
+| `fresh_entry_tool_name` | `lan_agent_task_memory_resume_and_execute` |
+| `fresh_entry_arguments_scope` | `goal_id_only_plus_budget_controls` |
+
+#### 产物文件
+
+```
+<log_root>/task_memory_new_chat_round_selftest/
+├── <goal_id>.cpp                                          ← 测试样本
+├── <goal_id>.json                                         ← selftest 报告
+└── mcp_conversations/<goal_id>/round_0001.json            ← MCP round manifest
+```
+
+### 4.7 通用参数说明
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
@@ -236,7 +368,7 @@ Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上
 | `include_path_metadata` | boolean | 是否计算 path-sensitive 元数据（CFG 分支/环） |
 | `max_interprocedural_bindings` | integer | 过程间绑定候选最大数，默认 512 |
 
-### 4.5 语义网格参数说明
+### 4.8 语义网格参数说明
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
@@ -266,7 +398,7 @@ Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上
 | `max_chars` | integer | 上下文 bundle 最大字符数 |
 | `dedupe_existing` | boolean | 增量更新时按 content_hash 去重，默认 true |
 
-### 4.6 Task Memory 参数说明
+### 4.9 Task Memory 参数说明
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
@@ -301,14 +433,14 @@ Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上
 | `rocksdb_path` | string | 显式 RocksDB 目录（默认 `task_memory/<goal_id>/rocksdb_native`） |
 | `max_final_steps` | integer | migration_acceptance 最终 continuation budget，默认 8 |
 
-### 4.7 compile_commands.json 发现顺序
+### 4.10 compile_commands.json 发现顺序
 
 1. 显式 `compilation_database_path` → 直接使用
 2. 显式 `compile_db_dir` → 拼接 `compile_commands.json`
 3. `project_root` + 常见构建目录 → 自动搜索 `build/`, `AIbuild/`, `cmake-build-*/`
 4. 均未找到 → 降级为无编译数据库模式（`compile_db_mode=none`，复杂文件可能失败）
 
-### 4.8 CMM 工具清单（codebase-memory-mcp 桥接）
+### 4.11 CMM 工具清单（codebase-memory-mcp 桥接）
 
 CMM（Codebase Memory MCP）工具通过 `codex_lan_agent` 桥接到独立的 `codebase-memory-mcp` 服务，提供基于**预建索引**的项目级代码图查询能力。使用前需先调用 `lan_agent_cmm_index_repository` 建立索引。
 
@@ -407,7 +539,8 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 
 | 层级 | 操作 | 语义 |
 |---|---|---|
-| L0 | `tools/list` | 发现可用工具和能力 |
+| L0 | `tools/list` | 发现可用工具和能力（默认只返回 `lan_agent_mcp_route` 单一网关入口） |
+| GW | `lan_agent_mcp_route` | **单一网关入口**：mode=overview/route/call 三模式收敛所有内部工具 |
 | L1 | `lan_agent_run_clang_ast_parser` | 获取文件级 AST 概览（函数列表、类结构、调用引用） |
 | L2 | `lan_agent_build_cfg` | 获取函数级控制流（基本块、分支、圈复杂度） |
 | L3 | `lan_agent_build_call_graph` | 获取文件级调用关系 |
@@ -415,7 +548,8 @@ Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -Co
 | L5 | `lan_agent_build_program_slice` | 获取符号级切片（backward/forward） |
 | L6 | `lan_agent_query_*_artifact` | 从已写入的 artifact 二次查询，无需重跑 Clang |
 | SG | `lan_agent_semantic_grid_*` | 长文本语义网格：解构、归纳、检索、溯源、上下文重构、增量 |
-| TM | `lan_agent_task_memory_*` | 长任务记忆：freeze / append_step / continuation budget / **resume_and_execute（fresh-chat 一次性续接）** / kv snapshot / rocksdb mirror / parity check / structure manifest / migration acceptance |
+| TM | `lan_agent_task_memory_*` | 长任务记忆：freeze / append_step / continuation budget / **resume_and_execute（fresh-chat 一次性续接）** / kv snapshot / rocksdb mirror / parity check / structure manifest / migration acceptance / **new_chat_round_selftest（续接自检）** |
+| FA | `lan_agent_read_text_file` / `tail_text_file` / `list_directory` / `read_directory_files` | 文件访问：分页读 / 尾部读 / 列目录 / 批读目录文件 |
 
 ### 5.3 模型决策规则
 

@@ -114,6 +114,31 @@
     (next_action "provide a concrete single target file_path before write or patch execution")
     (matched_rule "block-high-risk-write-without-path"))))
 
+(defrule route-code-format-cleanup-to-clang-format
+  (declare (salience 85))
+  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
+                                          (eq ?tool "lan_agent_scan_text_ranges")
+                                          (eq ?tool "lan_agent_prepare_edit_windows")
+                                          (eq ?tool "lan_agent_delete_line_atomic")
+                                          (eq ?tool "lan_agent_delete_content_atomic")
+                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")
+                                          (eq ?tool "lan_agent_delete_text_range_window_atomic")
+                                          (eq ?tool "lan_agent_write_text_file")
+                                          (eq ?tool "lan_agent_apply_single_file_patch")
+                                          (eq ?tool "lan_agent_apply_diff_patch")))
+                    (primary_intent "code_format")
+                    (file_path ?file_path&:(neq ?file_path "")))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "verified")
+    (reason_code "code_format_cleanup_prefers_clang_format")
+    (route_target "lan_agent_format_code_file")
+    (next_action "use lan_agent_format_code_file dry_run=true first for whitespace/newline/code-format cleanup; do not scan comments or delete text ranges for formatting")
+    (matched_rule "route-code-format-cleanup-to-clang-format"))))
+
 (defrule route-file-text-operations-to-probe-first
   (declare (salience 84))
   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
@@ -171,8 +196,7 @@
 (defrule route-comment-cleanup-scaffold-to-window-delete
   (declare (salience 83))
   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_scan_text_ranges")
-                                          (eq ?tool "lan_agent_prepare_edit_windows")
-                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                                          (eq ?tool "lan_agent_prepare_edit_windows")))
                     (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
                                                  (eq ?intent "remove_comments")
                                                  (eq ?intent "strip_comments")

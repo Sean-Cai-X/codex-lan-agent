@@ -61,6 +61,24 @@ std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent
         || lowered == "删注释") {
         return "comment_cleanup";
     }
+    if (lowered == "format code"
+        || lowered == "code format"
+        || lowered == "format_code"
+        || lowered == "code_format"
+        || lowered == "formatting"
+        || lowered == "whitespace_cleanup"
+        || lowered == "whitespace cleanup"
+        || lowered == "newline_cleanup"
+        || lowered == "newline cleanup"
+        || lowered == "remove extra newlines"
+        || lowered == "delete extra newlines"
+        || lowered == "删除多余回车换行"
+        || lowered == "删除多余的回车换行"
+        || lowered == "清理多余回车换行"
+        || lowered == "清理空白"
+        || lowered == "格式化代码") {
+        return "code_format";
+    }
     return primary_intent;
 }
 
@@ -404,6 +422,30 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (reason_code "missing_file_path")
                       (next_action "provide a concrete single target file_path before write or patch execution")
                       (matched_rule "block-high-risk-write-without-path")))))",
+            R"((defrule route-code-format-cleanup-to-clang-format
+                  (declare (salience 85))
+                  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
+                                                          (eq ?tool "lan_agent_scan_text_ranges")
+                                                          (eq ?tool "lan_agent_prepare_edit_windows")
+                                                          (eq ?tool "lan_agent_delete_line_atomic")
+                                                          (eq ?tool "lan_agent_delete_content_atomic")
+                                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")
+                                                          (eq ?tool "lan_agent_delete_text_range_window_atomic")
+                                                          (eq ?tool "lan_agent_write_text_file")
+                                                          (eq ?tool "lan_agent_apply_single_file_patch")
+                                                          (eq ?tool "lan_agent_apply_diff_patch")))
+                                    (primary_intent "code_format")
+                                    (file_path ?file_path&:(neq ?file_path "")))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "verified")
+                      (reason_code "code_format_cleanup_prefers_clang_format")
+                      (route_target "lan_agent_format_code_file")
+                      (next_action "use lan_agent_format_code_file dry_run=true first for whitespace/newline/code-format cleanup; do not scan comments or delete text ranges for formatting")
+                      (matched_rule "route-code-format-cleanup-to-clang-format")))))",
             R"((defrule route-file-text-operations-to-probe-first
                   (declare (salience 84))
                   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
@@ -459,8 +501,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
             R"((defrule route-comment-cleanup-scaffold-to-window-delete
                   (declare (salience 83))
                   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_scan_text_ranges")
-                                                          (eq ?tool "lan_agent_prepare_edit_windows")
-                                                          (eq ?tool "lan_agent_delete_next_text_range_atomic")))
+                                                          (eq ?tool "lan_agent_prepare_edit_windows")))
                                     (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
                                                                  (eq ?intent "remove_comments")
                                                                  (eq ?intent "strip_comments")
@@ -2076,6 +2117,17 @@ std::string BuildPreGuardRouteCallJson(
     AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
     AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
 
+    if (route_target == "lan_agent_format_code_file") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(&arguments_json, &first_field, "source_file", file_path);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"dry_run\":true";
+        first_field = false;
+    }
+
     if (route_target == "lan_agent_scan_text_ranges") {
         AppendJsonStringField(
             &arguments_json,
@@ -2443,11 +2495,14 @@ void ApplyClipsResultGuard(
         result->fields["not_verified_reason"].clear();
     }
     if (decision.decision == "route" || pending_text_range_delete) {
+        const std::string required_arguments = GetFieldOrDefault(*result, "next_call_json", "");
+        const std::string existing_required_tool = GetFieldOrDefault(*result, "required_tool_name", "");
         const std::string required_tool = FirstNonEmpty(
+            tool_name == "lan_agent_mcp_route" ? existing_required_tool : std::string(),
             decision.route_target,
+            ExtractJsonString(required_arguments, "name"),
             GetFieldOrDefault(*result, "next_tool_name", ""),
             tool_name);
-        const std::string required_arguments = GetFieldOrDefault(*result, "next_call_json", "");
         result->fields["semantic_model_clamp"] = "tool_call_only";
         result->fields["assistant_response_allowed"] = "false";
         result->fields["final_answer_allowed"] = "false";
@@ -2505,6 +2560,30 @@ void ApplyClipsResultGuard(
         } else if (result->fields["status"] == "FAILED") {
             result->fields["error_code"] = "tool_exit_" + std::to_string(result->exit_code);
         }
+    }
+    const bool pending_mcp_route_continuation =
+        tool_name == "lan_agent_mcp_route"
+        && GetFieldOrDefault(*result, "continue_required", "false") == "true"
+        && !GetFieldOrDefault(*result, "required_tool_name", "").empty();
+    if (pending_mcp_route_continuation) {
+        result->ok = true;
+        result->exit_code = 0;
+        result->fields["ok"] = "true";
+        result->fields["status"] = "needs_continue";
+        result->fields["error"].clear();
+        result->fields["error_code"].clear();
+        result->fields["error_message"].clear();
+        result->fields["failure_mode"] = "none";
+        result->fields["semantic_model_clamp"] = "tool_call_only";
+        result->fields["supervision_status"] = "closed_loop_continue";
+        result->fields["goal_status"] = "not_complete";
+        result->fields["terminal_state"] = "false";
+        result->fields["completion_claim_allowed"] = "false";
+        result->fields["final_answer_allowed"] = "false";
+        result->fields["verification_ok"] = "false";
+        result->fields["required_next_action_type"] = "mcp_tool_call";
+        result->fields["next_action"] =
+            "tool_call_only: result is non-terminal; continue with required_tool_arguments_json before any completion claim";
     }
     result->fields["result_hash"] = BuildResultEnvelopeHash(*result);
     result->fields["clips_post_result_fact"] = BuildMcpToolResultFact(tool_name, *result);
