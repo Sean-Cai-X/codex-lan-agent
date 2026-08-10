@@ -1,4 +1,4 @@
-﻿name: release-windows-x64
+name: release-windows-x64
 
 # ================================================================
 # Fully-online release pipeline (NO local uploads, NO vendored libs).
@@ -40,7 +40,7 @@ env:
   LLVM_VERSION: 18.1.8
   # Cache key encodes: LLVM version + compile flags + toolchain.
   # Bump the -vN suffix ONLY when changing LLVM compile flags or upgrading.
-  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-v2
+  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-v3
   ARCH: x64
 
 jobs:
@@ -124,6 +124,11 @@ jobs:
           if exist %LLVM_SRC%\llvm\include\llvm-c xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm-c %LLVM_ROOT_FLAT%\include\llvm-c >nul
           :: (3) LLVM generated config (llvm/Config/llvm-config.h, config.h, abi-breaking.h, ...)
           xcopy /y /e /i %LLVM_BUILD%\include\llvm\Config %LLVM_ROOT_FLAT%\include\llvm\Config >nul
+          :: (3b) LLVM generated headers (TableGen .inc under build/include/llvm)
+          ::     e.g. llvm/Frontend/OpenMP/OMP.inc required by clang/AST/ASTFwd.h.
+          ::     Merges ALL build-tree generated llvm headers on top of source headers
+          ::     (Intrinsics*.inc, Frontend/OpenMP/OMP.inc, etc.) - not just Config.
+          xcopy /y /e /i %LLVM_BUILD%\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
           :: (4) Clang TableGen generated files (*.inc) + clang/Config/Version.inc etc.
           ::     Covers all known CMake layout variants:
           ::     - ENABLE_PROJECTS=clang -> build/tools/clang/include/clang
@@ -150,6 +155,9 @@ jobs:
           if not exist %LLVM_ROOT_FLAT%\include\clang\Basic\DiagnosticCommonKinds.inc (
             echo ERROR: TableGen DiagnosticCommonKinds.inc missing - assembly incomplete & exit /b 1
           )
+          if not exist %LLVM_ROOT_FLAT%\include\llvm\Frontend\OpenMP\OMP.inc (
+            echo ERROR: LLVM generated OMP.inc missing - assembly incomplete & exit /b 1
+          )
           if not exist %LLVM_ROOT_FLAT%\lib\clangTooling.lib (
             echo ERROR: clangTooling.lib missing & exit /b 1
           )
@@ -163,13 +171,16 @@ jobs:
           $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
           $h    = Join-Path $Root "include\clang\AST\ASTConsumer.h"
           $inc  = Join-Path $Root "include\clang\Basic\DiagnosticCommonKinds.inc"
+          $omp  = Join-Path $Root "include\llvm\Frontend\OpenMP\OMP.inc"
           $l    = Join-Path $Root "lib\clangTooling.lib"
           if (-not (Test-Path $h))   { Write-Error "Missing $h"; exit 1 }
           if (-not (Test-Path $inc)) { Write-Error "Missing TableGen header $inc (clang .inc assembly incomplete)"; exit 1 }
+          if (-not (Test-Path $omp)) { Write-Error "Missing LLVM generated header $omp (llvm .inc assembly incomplete)"; exit 1 }
           if (-not (Test-Path $l))   { Write-Error "Missing $l"; exit 1 }
           $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
           $incCount = (Get-ChildItem (Join-Path $Root "include\clang") -Recurse -Filter "*.inc").Count
-          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, .inc count: $incCount)"
+          $llvmIncCount = (Get-ChildItem (Join-Path $Root "include\llvm") -Recurse -Filter "*.inc").Count
+          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, clang .inc: $incCount, llvm .inc: $llvmIncCount)"
 
       - name: Export LLVM_ROOT path for downstream job
         id: llvm-root-output
@@ -217,13 +228,16 @@ jobs:
           $Root = Join-Path "${{ runner.workspace }}" "llvm_root"
           $h    = Join-Path $Root "include\clang\AST\ASTConsumer.h"
           $inc  = Join-Path $Root "include\clang\Basic\DiagnosticCommonKinds.inc"
+          $omp  = Join-Path $Root "include\llvm\Frontend\OpenMP\OMP.inc"
           $l    = Join-Path $Root "lib\clangTooling.lib"
           if (-not (Test-Path $h))   { Write-Error "Missing $h"; exit 1 }
           if (-not (Test-Path $inc)) { Write-Error "Missing TableGen header $inc (clang .inc assembly incomplete)"; exit 1 }
+          if (-not (Test-Path $omp)) { Write-Error "Missing LLVM generated header $omp (llvm .inc assembly incomplete)"; exit 1 }
           if (-not (Test-Path $l))   { Write-Error "Missing $l"; exit 1 }
           $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
           $incCount = (Get-ChildItem (Join-Path $Root "include\clang") -Recurse -Filter "*.inc").Count
-          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, .inc count: $incCount)  [Layer 1 cache-hit: ${{ needs.llvm-toolchain.outputs.cache_hit }}]"
+          $llvmIncCount = (Get-ChildItem (Join-Path $Root "include\llvm") -Recurse -Filter "*.inc").Count
+          Write-Host "LLVM_ROOT=$Root  (.lib count: $libCount, clang .inc: $incCount, llvm .inc: $llvmIncCount)  [Layer 1 cache-hit: ${{ needs.llvm-toolchain.outputs.cache_hit }}]"
 
       - name: Configure codex_lan_agent (Ninja + vcvars64, with Clang AST)
         shell: cmd
