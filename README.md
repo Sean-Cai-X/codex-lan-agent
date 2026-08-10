@@ -751,6 +751,81 @@ $lookup = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Bod
 # status=success, hit=true, value_json contains latest_resume_context
 ```
 
+#### 5.a fresh-chat `resume_and_execute` 续接闭环（真实对话·删除 Image.cpp 注释）
+
+以下来自真实 gemma-4-E4B 会话（会话 ID `aef8967e`，任务：删除 `Image.cpp` 中全部注释，4690 行 / 155 KB / 241 条注释，预计超过本地模型上下文窗口）。展示了"首帧探测 → 遇到长循环 → freeze → budget_run(10 步) → 新会话 resume_and_execute"的完整闭环，模型每一步严格遵循 MCP 返回的 `required_tool_arguments_json`，**没有手动构造参数**。
+
+```
+Turn 1  User:  删除 Image.cpp 中所有注释
+      Model: lan_agent_probe_text_file(file=Image.cpp, primary_intent=delete_comments)
+      MCP:   recommended_next_tool=delete_text_range_window_atomic
+             next_call_json={
+               name:lan_agent_delete_text_range_window_atomic,
+               arguments:{start_line:1, max_lines:200, scan_mode:comments, ...}
+             }
+
+Turn 2  Model: lan_agent_delete_text_range_window_atomic(按 next_call_json 原样调用)
+      MCP:   has_more=true, total_range_count_before=241 (共 241 条注释)
+             completion_guard=NON_TERMINAL_RESULT  ← 长循环闸门
+             required_tool_name=lan_agent_task_memory_freeze  ← 强制 freeze
+             required_tool_arguments_json={
+               goal_id:"trace-delete_window-20260810_102404",
+               current_goal:"continue comment cleanup until completion gate",
+               current_tool:"lan_agent_delete_text_range_window_atomic",
+               terminal_state:false, completion_claim_allowed:false,
+               next_call_json:"下一个 delete 窗口调用 (start_line:201)"
+             }
+
+Turn 3  Model: lan_agent_task_memory_freeze(按 required_tool_arguments_json 原样调用)
+      MCP:   semantic_outcome=task_memory_frozen
+             task_memory_root=.../logs/task_memory/trace-delete_window-20260810_102404
+             latest_resume_context.json, step_ledger.jsonl, slices.jsonl 已写入
+             clean_chat_close_allowed=true, conversation_close_status=handoff_ready_not_complete
+             ← 注意：conversation_close_allowed≠任务完成
+             next_call_json → lan_agent_task_memory_execute_continuation_budget(goal_id=..., max_steps=10)
+
+Turn 4  Model: lan_agent_task_memory_execute_continuation_budget(按 next_call_json)
+      MCP:   executed_step_count=10, budget_exhausted=true
+             last_verified_step=10  ← 已跑 10 次 bounded 200-line delete 窗口
+             last_tool=lan_agent_delete_text_range_window_atomic
+             last_status=needs_continue, terminal_state=false
+             budget_run_id=budget-73adc8b4aaacc6c4
+             ← 新会话续接路径：
+             new_chat_entry_tool_name=lan_agent_task_memory_resume_and_execute
+             new_chat_entry_arguments_json={
+               name:lan_agent_task_memory_resume_and_execute,
+               arguments:{goal_id:"trace-delete_window-20260810_102404", max_steps:10, execute:true}
+             }
+             conversation_close_status=handoff_ready_not_complete
+             next_chat_must_verify_fields=[
+               terminal_state, completion_claim_allowed, final_answer_allowed,
+               verification_ok, clean_chat_close_allowed, conversation_close_status,
+               new_chat_entry_arguments_json
+             ]
+
+=== 模型切换 / 重启会话（读取上面的 new_chat_entry_arguments_json 即续接，不重读旧对话）===
+
+Turn 5  Model: lan_agent_task_memory_resume_and_execute(按 new_chat_entry_arguments_json)
+      MCP:   resume_execute_mode=read_resume_context_and_execute_budget
+             inner_record_model=mcp_task_memory_execute_continuation_budget_response_v1
+             last_verified_step=20   ← 累计 20 次 delete 调用
+             budget_status=blocked, blocked (遇到跨 200-line 边界的长注释块,
+             block_reason=NEXT_FLOW_SAFETY_CLASS_NOT_READY,
+             提示需用 lan_agent_delete_next_text_range_atomic 精修单步删除)
+             terminal_state=false
+             required_tool_name=lan_agent_task_memory_resume_and_execute
+             required_tool_arguments_json=(相同参数，再次调用本工具)
+             ← 模型继续重复调用 resume_and_execute，直到 terminal_state=true
+```
+
+**关键点：**
+1. 模型**始终按 MCP 返回的 `required_tool_arguments_json` 原样调用**，不需要自己构造任何参数；
+2. `budget_run_id` / `last_verified_step` 每轮续接都会累加；
+3. `conversation_close_allowed=true` **不代表** `terminal_state=true`，只是当前会话可以安全关闭交接给下一个；
+4. `new_chat_entry_arguments_json` 指向 `lan_agent_task_memory_resume_and_execute`，新模型首调即续接，无需读取旧对话历史。
+
+---
+
 ### 案例六：RocksDB 镜像 + 一致性校验
 
 ```powershell
@@ -813,6 +888,96 @@ $acc = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $
 # safe_to_replace_source_of_truth=false
 # parity_required_for_native_reads=true
 ```
+
+### 案例八：真实对话·删除 C++ 源文件多余回车换行（单步短任务闭环）
+
+会话 ID `14ae0da8`（gemma-4-E4B，2 turns）。目标：`Image.cpp` 有多余空行和格式问题，请求"删除多余回车换行"。展示了**短任务的 completion_gate 打开流程**（1 次工具调用 → verification_ok=true → 可直接 claim 完成，无需 Task Memory）。
+
+```
+Turn 1  User:  删除 Image.cpp 中多余的回车换行
+      Model: lan_agent_format_code_file(source_file=Image.cpp, dry_run=false)
+             ← 模型从工具语义直接选定 clang-format，未做多余探测
+
+      MCP  result_envelope (精简):
+        - old_hash=866862e0d1e2dfa0         ← 文件原哈希
+        - new_hash=071113de9d943dd6         ← 格式化后哈希（不同=实际有改动）
+        - source_bytes=140563 → formatted_bytes=132938   ← 减少 7.6 KB (5.4%)
+        - would_change=true, changed=true   ← 确认发生真实改动
+        - backup_path=.../code_format/Image.cpp_.../Image.cpp.before
+        - formatter_path=VS2022 clang-format (fallback_style=LLVM, style=file)
+        - CLIPS 后处理（mcp_result_guard.clp）:
+            risk=medium → safety_class=controlled → execution_class=controlled
+            decision=allow, verification=verified
+            matched_rule=default-mcp-result-verified
+            2 CLIPS facts asserted, alarm=false
+
+        - 最终闸门（completion_gate）:
+            verification_status=verified
+            verification_ok=true
+            terminal_state=true
+            task_done=true
+            completion_claim_allowed=true
+            final_answer_allowed=true
+            outcome=PASS
+            supervision_status=closed_loop_complete
+            acceptance_status=complete
+            ai_conclusion_valid=true
+
+Turn 2  Model: "Image.cpp 已格式化，删除了多余回车换行，文件已验证。"
+              ← 模型直接输出自然语言总结（final_answer_allowed=true 放行）
+```
+
+**关键不变量：**
+1. `verification_ok=true` 是 `final_answer_allowed=true` 的前置条件；
+2. 没有 freeze / resume_context / budget，因为 1 步完成且 `terminal_state=true`；
+3. `lan_agent_format_code_file` 直接写盘 + 留备份（`backup_path`），可审计回滚；
+4. `clips_post_result_chain_clips_required=true` → 所有文件写操作都会经 CLIPS 规则引擎做安全分级，风险 medium 以下且 verification_ok=true 才放行。
+
+### 案例九：真实对话·删除 C++ 源文件全部注释（长任务多会话 Task Memory 续接）
+
+会话 ID `aef8967e`（gemma-4-E4B，29 turns，覆盖 `trace_id=trace-delete_window-20260810_102404`）。目标：4690 行 / 155 KB / 241 条注释的 `Image.cpp`，预期超过本地模型上下文。展示了**"探测 → 长循环闸门触发 → freeze → budget_run(10 步) → fresh-chat resume_and_execute（再跑 10 步）"**的完整闭环。
+
+**执行全景统计（来自对话 turn timing）：**
+
+| 阶段 | 工具名 | Turn | 说明 |
+|---|---|---|---|
+| 1 探测 | `lan_agent_probe_text_file` | T1 | 推荐使用 `delete_text_range_window_atomic`，推荐窗口 200 行 |
+| 2 首窗口 | `lan_agent_delete_text_range_window_atomic` | T2 | `has_more=true`，共 241 条注释待删；**completion_guard=NON_TERMINAL_RESULT**，闸门强制要求 freeze，禁止模型 claim / 输出自然语言 |
+| 3 冻结 | `lan_agent_task_memory_freeze` | T3 | 写 `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `rag_thread_migration/*`；`clean_chat_close_allowed=true`（**但** `conversation_close_status=handoff_ready_not_complete` ≠ 任务完成）；返回 `new_chat_entry_tool_name=lan_agent_task_memory_resume_and_execute` |
+| 4 Budget(10) | `lan_agent_task_memory_execute_continuation_budget` | T4 | 跑了 10 次 bounded delete 调用，写 `budget_runs/budget-73adc8b4aaacc6c4.json`；`last_verified_step=10`；`budget_exhausted=true` 仍 `terminal_state=false` |
+| 5 Resume+Exec | `lan_agent_task_memory_resume_and_execute` | T5 | **fresh-chat 入口**：读 `latest_resume_context` 再跑 10 步，累计 `last_verified_step=20`；写入 `budget_runs/budget-89f4c850fd0031c7.json`；遇到跨窗口边界的长注释块（`block_reason=NEXT_FLOW_SAFETY_CLASS_NOT_READY`），Budget `blocked` → 返回 `required_tool_name=self`（继续调 `resume_and_execute`）→ 预算耗尽 → T6~T29 继续调 `delete_next_text_range_atomic` / `delete_window` 直到 241 条注释全部清除 |
+| 6+ 续接 | `delete_next_text_range_atomic` + `delete_window` 交替 | T7~T29 | 边界长注释用单步精修，其余 200 行窗口用批量删除 |
+
+**Task Memory 产物（来自 MCP 返回的实际文件路径）：**
+
+```
+logs/task_memory/trace-delete_window-20260810_102404/
+├── latest_resume_context.json          ← 每轮 freeze / budget / resume_and_execute 都会刷新
+├── step_ledger.jsonl                   ← 每步追加（共 ≥20 条已验证 step 条目）
+├── slices.jsonl                        ← freeze 时写入 key slice（summary, trace_id, dedup_hash）
+├── index_manifest.json                 ← 增量索引清单
+├── memory_structure.json               ← (后续写) 结构契约 bootstrap
+├── rag_thread_migration/
+│   ├── 1_current_state.md
+│   ├── 2_key_slices.jsonl
+│   ├── 3_incremental_index_manifest.json
+│   └── 4_migration_handover.md
+├── budget_runs/
+│   ├── budget-73adc8b4aaacc6c4.json    ← Turn 4 execute_continuation_budget: 10 steps
+│   └── budget-89f4c850fd0031c7.json    ← Turn 5 resume_and_execute: 10 steps (blocked on boundary)
+├── kv_snapshot/index.jsonl             ← (后续 build_kv_snapshot)
+├── rocksdb_native/                     ← (后续 rocksdb_mirror, 需 WITH_ROCKSDB=ON)
+└── rocksdb_mirror_manifest.json
+```
+
+**关键设计语义（与代码 1:1 对齐）：**
+1. **长循环闸门（`completion_guard=NON_TERMINAL_RESULT`）**：由 `lan_agent_delete_text_range_window_atomic` 返回的 `has_more=true` 触发，把 MCP 语义模型 clamp 成 `tool_call_only`，模型不能输出自然语言结论；
+2. **freeze → budget → resume_and_execute 的分工**：
+   - `freeze`：写入文件对象层 + 返回 next call 指向 budget runner；
+   - `execute_continuation_budget`：在 MCP 内跑 N 步 allowlisted 白名单调用（默认 10，上限 64），写入 `budget_runs/*.json`；**不跨会话**；
+   - `resume_and_execute`：`fresh-chat` 单一入口，内部 = 读 resume_context + 调 budget runner，适合模型切换 / 重启后"首调即续接"；
+3. **交接 ≠ 完成**：`clean_chat_close_allowed=true` 只表示可以把当前会话关了交接给下一个；**必须** `terminal_state=true + completion_claim_allowed=true + final_answer_allowed=true + verification_ok=true` 四重齐才能 claim 任务完成；
+4. **边界阻塞（blocked 分支）**：budget runner 检测到"操作跨越当前 200-line 窗口"时主动 `blocked`，并在返回里提示模型切换到 `delete_next_text_range_atomic`（单条精修），避免损坏文件；这就是 `NEXT_FLOW_SAFETY_CLASS_NOT_READY` 的语义。
 
 ---
 
