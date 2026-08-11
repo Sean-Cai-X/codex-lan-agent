@@ -62,6 +62,69 @@ bool IsLocalAiCodeFormatIntent(const std::string & primary_intent) {
     return NormalizeLocalAiPrimaryIntent(primary_intent) == "code_format";
 }
 
+bool IsLocalAiCodeSourceFilePath(const std::string & file_path) {
+    const std::string extension = ToLowerAscii(std::filesystem::path(file_path).extension().string());
+    return extension == ".cpp"
+        || extension == ".cxx"
+        || extension == ".cc"
+        || extension == ".c"
+        || extension == ".hpp"
+        || extension == ".hh"
+        || extension == ".h"
+        || extension == ".ipp";
+}
+
+std::string BuildCommentCleanupProbeCallJson(
+    const std::string & file_path,
+    const std::string & trace_id,
+    const std::string & directory_manifest_path = std::string(),
+    int directory_current_file_index = 0,
+    int directory_total_code_file_count = 0) {
+    std::ostringstream output;
+    output << "{\"name\":\"lan_agent_probe_text_file\",\"arguments\":{\"file_path\":\""
+           << codex_lan_agent::JsonEscape(file_path)
+           << "\",\"primary_intent\":\"comment_cleanup\"";
+    if (!trace_id.empty()) {
+        output << ",\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\"";
+    }
+    if (!directory_manifest_path.empty()) {
+        output << ",\"directory_manifest_path\":\"" << codex_lan_agent::JsonEscape(directory_manifest_path) << "\""
+               << ",\"directory_current_file_index\":" << std::max(0, directory_current_file_index)
+               << ",\"directory_total_code_file_count\":" << std::max(0, directory_total_code_file_count)
+               << ",\"directory_scope_active\":true";
+    }
+    output << "}}";
+    return output.str();
+}
+
+std::string ReadCodeFilePathFromDirectoryManifest(
+    const std::string & directory_manifest_path,
+    int code_file_index) {
+    if (Trim(directory_manifest_path).empty() || code_file_index < 0) {
+        return std::string();
+    }
+    std::ifstream input(std::filesystem::path(directory_manifest_path));
+    if (!input.is_open()) {
+        return std::string();
+    }
+    std::string line;
+    int current_code_index = 0;
+    while (std::getline(input, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (!IsLocalAiCodeSourceFilePath(line)) {
+            continue;
+        }
+        if (current_code_index == code_file_index) {
+            return line;
+        }
+        ++current_code_index;
+    }
+    return std::string();
+}
+
 std::string BuildJsonStringArrayFromStrings(const std::vector<std::string> & values) {
     std::ostringstream output;
     output << "[";
@@ -2521,7 +2584,10 @@ CommandResult ProbeTextFileResult(
     const AgentConfig & config,
     const std::string & file_path,
     const std::string & primary_intent,
-    const std::string & trace_id) {
+    const std::string & trace_id,
+    const std::string & directory_manifest_path,
+    int directory_current_file_index,
+    int directory_total_code_file_count) {
     CommandResult result;
     result.ok = true;
     result.exit_code = 0;
@@ -2608,6 +2674,15 @@ CommandResult ProbeTextFileResult(
                        << codex_lan_agent::JsonEscape(file_path)
                        << "\",\"scan_mode\":\"comments\",\"start_line\":1,\"next_start_line\":1,\"max_lines\":200"
                        << ",\"primary_intent\":\"comment_cleanup\"";
+        if (!directory_manifest_path.empty()) {
+            next_call_json << ",\"directory_manifest_path\":\""
+                           << codex_lan_agent::JsonEscape(directory_manifest_path)
+                           << "\",\"directory_current_file_index\":"
+                           << std::max(0, directory_current_file_index)
+                           << ",\"directory_total_code_file_count\":"
+                           << std::max(0, directory_total_code_file_count)
+                           << ",\"directory_scope_active\":true";
+        }
         if (!trace_id.empty()) {
             next_call_json << ",\"trace_id\":\""
                            << codex_lan_agent::JsonEscape(trace_id)
@@ -2684,10 +2759,18 @@ CommandResult ProbeTextFileResult(
     result.fields["file_length_class"] = file_length_class;
     result.fields["primary_intent"] = canonical_primary_intent;
     result.fields["normalized_primary_intent"] = canonical_primary_intent;
+    if (!directory_manifest_path.empty()) {
+        result.fields["directory_scope_active"] = "true";
+        result.fields["directory_manifest_path"] = directory_manifest_path;
+        result.fields["directory_current_file_index"] = std::to_string(std::max(0, directory_current_file_index));
+        result.fields["directory_total_code_file_count"] = std::to_string(std::max(0, directory_total_code_file_count));
+        const int remaining = std::max(0, directory_total_code_file_count - std::max(0, directory_current_file_index));
+        result.fields["directory_remaining_code_file_count"] = std::to_string(remaining);
+    }
     result.fields["recommended_next_tool"] = recommended_next_tool;
     result.fields["recommended_read_max_lines"] = std::to_string(recommended_read_max_lines);
     result.fields["recommended_scan_mode"] = recommended_scan_mode;
-    result.fields["next_call_json"] = next_call_json.str();
+        result.fields["next_call_json"] = next_call_json.str();
     result.fields["result_ref"] = normalized.string();
     result.fields["evidence_ref"] = normalized.string();
     result.fields["next_tool_name"] = recommended_next_tool;
@@ -2768,11 +2851,16 @@ CommandResult TailTextFileResult(
 CommandResult ListDirectoryResult(
     const AgentConfig & config,
     const std::string & directory_path,
-    int max_entries = 200,
-    const std::string & trace_id = std::string()) {
+    int max_entries,
+    const std::string & trace_id,
+    const std::string & primary_intent) {
     CommandResult result;
     result.fields["task_type"] = "directory_list";
     result.fields["directory_path"] = directory_path;
+    const bool comment_cleanup_intent = IsLocalAiCommentCleanupIntent(primary_intent);
+    if (!primary_intent.empty()) {
+        result.fields["primary_intent"] = NormalizeLocalAiPrimaryIntent(primary_intent);
+    }
     if (!trace_id.empty()) {
         result.fields["trace_id"] = trace_id;
     }
@@ -2888,41 +2976,84 @@ CommandResult ListDirectoryResult(
         result.fields["batch_manifest_complete"] = manifest_saved ? "true" : "false";
         result.fields["batch_total_files"] = std::to_string(manifest_files.size());
         const bool can_continue_directory_batch = manifest_saved && !manifest_files.empty();
+        std::vector<std::string> code_files;
+        for (const std::string & file_path : manifest_files) {
+            if (IsLocalAiCodeSourceFilePath(file_path)) {
+                code_files.push_back(file_path);
+            }
+        }
+        const bool can_continue_comment_cleanup = comment_cleanup_intent && manifest_saved && !code_files.empty();
+        const std::string next_comment_file_path = can_continue_comment_cleanup ? code_files.front() : std::string();
         result.fields["batch_read_file_count"] = "0";
         result.fields["remaining_batch_file_count"] = can_continue_directory_batch
             ? std::to_string(manifest_files.size())
             : "0";
+        result.fields["code_file_count"] = std::to_string(code_files.size());
+        result.fields["remaining_code_file_count"] = can_continue_comment_cleanup
+            ? std::to_string(code_files.size())
+            : "0";
+        result.fields["directory_mutation_flow"] = can_continue_comment_cleanup
+            ? "comment_cleanup_probe_then_200_line_window_delete"
+            : "";
         result.fields["batch_completion"] = can_continue_directory_batch ? "incomplete" : "complete";
         result.fields["content_read_completion"] = can_continue_directory_batch ? "incomplete" : "complete";
-        result.fields["incomplete_scope"] = can_continue_directory_batch ? "remaining_file_contents" : "";
+        result.fields["incomplete_scope"] = can_continue_comment_cleanup
+            ? "remaining_code_files"
+            : (can_continue_directory_batch ? "remaining_file_contents" : "");
         result.fields["current_file_path"] = "";
         result.fields["current_file_index"] = "";
-        result.fields["next_batch_file_path"] = can_continue_directory_batch ? manifest_files.front() : "";
-        result.fields["next_batch_tool_name"] = can_continue_directory_batch ? "lan_agent_read_directory_files" : "";
-        result.fields["continue_required"] = can_continue_directory_batch ? "true" : "false";
-        result.fields["auto_continue_required"] = can_continue_directory_batch ? "true" : "false";
+        result.fields["next_batch_file_path"] = can_continue_comment_cleanup
+            ? next_comment_file_path
+            : (can_continue_directory_batch ? manifest_files.front() : "");
+        result.fields["next_batch_tool_name"] = can_continue_comment_cleanup
+            ? "lan_agent_probe_text_file"
+            : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
+        result.fields["continue_required"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "true" : "false";
+        result.fields["auto_continue_required"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "true" : "false";
         result.fields["user_confirmation_required"] = "false";
-        result.fields["analysis_allowed"] = can_continue_directory_batch ? "false" : "true";
-        result.fields["analysis_blocked_reason"] = can_continue_directory_batch ? "directory_batch_read_incomplete" : "";
-        result.fields["task_completion"] = can_continue_directory_batch ? "incomplete" : "complete";
-        result.fields["partial_read_policy"] = can_continue_directory_batch
+        result.fields["analysis_allowed"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "false" : "true";
+        result.fields["analysis_blocked_reason"] = can_continue_comment_cleanup
+            ? "directory_comment_cleanup_incomplete"
+            : (can_continue_directory_batch ? "directory_batch_read_incomplete" : "");
+        result.fields["task_completion"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "incomplete" : "complete";
+        result.fields["partial_read_policy"] = can_continue_comment_cleanup
+            ? "directory listing is complete; probe one code file, then delete comments with 200-line windows; do not read all file bodies"
+            : (can_continue_directory_batch
             ? "directory listing is complete; continue with lan_agent_read_directory_files until batch_completion=complete"
-            : "directory listing is complete; no implicit file read continuation is emitted";
-        result.fields["stop_condition"] = can_continue_directory_batch
+            : "directory listing is complete; no implicit file read continuation is emitted");
+        result.fields["stop_condition"] = can_continue_comment_cleanup
+            ? "all code files probed and each delete window reaches has_more=false"
+            : (can_continue_directory_batch
             ? "batch_completion=complete"
-            : "directory_listing_complete=true";
-        result.fields["result"] = can_continue_directory_batch ? "directory_list_manifest_ready" : "directory_list_complete";
-        result.fields["outcome_hint"] = can_continue_directory_batch ? "PARTIAL" : "PASS";
-        result.fields["next_action"] = can_continue_directory_batch
+            : "directory_listing_complete=true");
+        result.fields["result"] = can_continue_comment_cleanup
+            ? "directory_comment_cleanup_manifest_ready"
+            : (can_continue_directory_batch ? "directory_list_manifest_ready" : "directory_list_complete");
+        result.fields["outcome_hint"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "PARTIAL" : "PASS";
+        result.fields["next_action"] = can_continue_comment_cleanup
+            ? "tool_call_only: probe next_batch_file_path, then run lan_agent_delete_text_range_window_atomic with max_lines=200 until has_more=false"
+            : (can_continue_directory_batch
             ? "directory listing is complete; continue reading files from the generated manifest before any conclusion"
-            : "directory listing is complete";
-        result.fields["next_tool_name"] = can_continue_directory_batch ? "lan_agent_read_directory_files" : "";
-        result.fields["next_file_path"] = can_continue_directory_batch ? manifest_files.front() : "";
+            : "directory listing is complete");
+        result.fields["next_tool_name"] = can_continue_comment_cleanup
+            ? "lan_agent_probe_text_file"
+            : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
+        result.fields["next_file_path"] = can_continue_comment_cleanup
+            ? next_comment_file_path
+            : (can_continue_directory_batch ? manifest_files.front() : "");
         result.fields["next_start_line"] = can_continue_directory_batch ? "1" : "";
-        result.fields["next_max_lines"] = can_continue_directory_batch ? "500" : "";
-        result.fields["truncated"] = can_continue_directory_batch ? "true" : "false";
-        result.fields["next_call_json"] = can_continue_directory_batch
-            ? BuildDirectoryReadContinuationCallJson(
+        result.fields["next_max_lines"] = can_continue_comment_cleanup
+            ? "200"
+            : (can_continue_directory_batch ? "500" : "");
+        result.fields["truncated"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "true" : "false";
+        result.fields["next_call_json"] = can_continue_comment_cleanup
+            ? BuildCommentCleanupProbeCallJson(
+                next_comment_file_path,
+                trace_id,
+                manifest_path,
+                0,
+                static_cast<int>(code_files.size()))
+            : (can_continue_directory_batch ? BuildDirectoryReadContinuationCallJson(
                 normalized.string(),
                 static_cast<int>(manifest_files.size()),
                 500,
@@ -2930,9 +3061,10 @@ CommandResult ListDirectoryResult(
                 2500,
                 0,
                 1,
-                trace_id)
-            : "";
-        result.fields["required_tool_name"] = can_continue_directory_batch ? "lan_agent_read_directory_files" : "";
+                trace_id) : "");
+        result.fields["required_tool_name"] = can_continue_comment_cleanup
+            ? "lan_agent_probe_text_file"
+            : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
         result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
         return result;
     }
@@ -3009,41 +3141,84 @@ CommandResult ListDirectoryResult(
     result.fields["batch_manifest_complete"] = manifest_saved ? "true" : "false";
     result.fields["batch_total_files"] = std::to_string(manifest_files.size());
     const bool can_continue_directory_batch = manifest_saved && !manifest_files.empty();
+    std::vector<std::string> code_files;
+    for (const std::string & file_path : manifest_files) {
+        if (IsLocalAiCodeSourceFilePath(file_path)) {
+            code_files.push_back(file_path);
+        }
+    }
+    const bool can_continue_comment_cleanup = comment_cleanup_intent && manifest_saved && !code_files.empty();
+    const std::string next_comment_file_path = can_continue_comment_cleanup ? code_files.front() : std::string();
     result.fields["batch_read_file_count"] = "0";
     result.fields["remaining_batch_file_count"] = can_continue_directory_batch
         ? std::to_string(manifest_files.size())
         : "0";
+    result.fields["code_file_count"] = std::to_string(code_files.size());
+    result.fields["remaining_code_file_count"] = can_continue_comment_cleanup
+        ? std::to_string(code_files.size())
+        : "0";
+    result.fields["directory_mutation_flow"] = can_continue_comment_cleanup
+        ? "comment_cleanup_probe_then_200_line_window_delete"
+        : "";
     result.fields["batch_completion"] = can_continue_directory_batch ? "incomplete" : "complete";
     result.fields["content_read_completion"] = can_continue_directory_batch ? "incomplete" : "complete";
-    result.fields["incomplete_scope"] = can_continue_directory_batch ? "remaining_file_contents" : "";
+    result.fields["incomplete_scope"] = can_continue_comment_cleanup
+        ? "remaining_code_files"
+        : (can_continue_directory_batch ? "remaining_file_contents" : "");
     result.fields["current_file_path"] = "";
     result.fields["current_file_index"] = "";
-    result.fields["next_batch_file_path"] = can_continue_directory_batch ? manifest_files.front() : "";
-    result.fields["next_batch_tool_name"] = can_continue_directory_batch ? "lan_agent_read_directory_files" : "";
-    result.fields["continue_required"] = can_continue_directory_batch ? "true" : "false";
-    result.fields["auto_continue_required"] = can_continue_directory_batch ? "true" : "false";
+    result.fields["next_batch_file_path"] = can_continue_comment_cleanup
+        ? next_comment_file_path
+        : (can_continue_directory_batch ? manifest_files.front() : "");
+    result.fields["next_batch_tool_name"] = can_continue_comment_cleanup
+        ? "lan_agent_probe_text_file"
+        : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
+    result.fields["continue_required"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "true" : "false";
+    result.fields["auto_continue_required"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "true" : "false";
     result.fields["user_confirmation_required"] = "false";
-    result.fields["analysis_allowed"] = can_continue_directory_batch ? "false" : "true";
-    result.fields["analysis_blocked_reason"] = can_continue_directory_batch ? "directory_batch_read_incomplete" : "";
-    result.fields["task_completion"] = can_continue_directory_batch ? "incomplete" : "complete";
-    result.fields["partial_read_policy"] = can_continue_directory_batch
+    result.fields["analysis_allowed"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "false" : "true";
+    result.fields["analysis_blocked_reason"] = can_continue_comment_cleanup
+        ? "directory_comment_cleanup_incomplete"
+        : (can_continue_directory_batch ? "directory_batch_read_incomplete" : "");
+    result.fields["task_completion"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "incomplete" : "complete";
+    result.fields["partial_read_policy"] = can_continue_comment_cleanup
+        ? "directory listing is complete; probe one code file, then delete comments with 200-line windows; do not read all file bodies"
+        : (can_continue_directory_batch
         ? "directory listing is complete; continue with lan_agent_read_directory_files until batch_completion=complete"
-        : "directory listing is complete; no implicit file read continuation is emitted";
-    result.fields["stop_condition"] = can_continue_directory_batch
+        : "directory listing is complete; no implicit file read continuation is emitted");
+    result.fields["stop_condition"] = can_continue_comment_cleanup
+        ? "all code files probed and each delete window reaches has_more=false"
+        : (can_continue_directory_batch
         ? "batch_completion=complete"
-        : "directory_listing_complete=true";
-    result.fields["result"] = can_continue_directory_batch ? "directory_list_manifest_ready" : "directory_list_complete";
-    result.fields["outcome_hint"] = can_continue_directory_batch ? "PARTIAL" : "PASS";
-    result.fields["next_action"] = can_continue_directory_batch
+        : "directory_listing_complete=true");
+    result.fields["result"] = can_continue_comment_cleanup
+        ? "directory_comment_cleanup_manifest_ready"
+        : (can_continue_directory_batch ? "directory_list_manifest_ready" : "directory_list_complete");
+    result.fields["outcome_hint"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "PARTIAL" : "PASS";
+    result.fields["next_action"] = can_continue_comment_cleanup
+        ? "tool_call_only: probe next_batch_file_path, then run lan_agent_delete_text_range_window_atomic with max_lines=200 until has_more=false"
+        : (can_continue_directory_batch
         ? "directory listing is complete; continue reading files from the generated manifest before any conclusion"
-        : "directory listing is complete";
-    result.fields["next_tool_name"] = can_continue_directory_batch ? "lan_agent_read_directory_files" : "";
-    result.fields["next_file_path"] = can_continue_directory_batch ? manifest_files.front() : "";
+        : "directory listing is complete");
+    result.fields["next_tool_name"] = can_continue_comment_cleanup
+        ? "lan_agent_probe_text_file"
+        : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
+    result.fields["next_file_path"] = can_continue_comment_cleanup
+        ? next_comment_file_path
+        : (can_continue_directory_batch ? manifest_files.front() : "");
     result.fields["next_start_line"] = can_continue_directory_batch ? "1" : "";
-    result.fields["next_max_lines"] = can_continue_directory_batch ? "500" : "";
-    result.fields["truncated"] = can_continue_directory_batch ? "true" : "false";
-    result.fields["next_call_json"] = can_continue_directory_batch
-        ? BuildDirectoryReadContinuationCallJson(
+    result.fields["next_max_lines"] = can_continue_comment_cleanup
+        ? "200"
+        : (can_continue_directory_batch ? "500" : "");
+    result.fields["truncated"] = (can_continue_comment_cleanup || can_continue_directory_batch) ? "true" : "false";
+    result.fields["next_call_json"] = can_continue_comment_cleanup
+        ? BuildCommentCleanupProbeCallJson(
+            next_comment_file_path,
+            trace_id,
+            manifest_path,
+            0,
+            static_cast<int>(code_files.size()))
+        : (can_continue_directory_batch ? BuildDirectoryReadContinuationCallJson(
             normalized.string(),
             static_cast<int>(manifest_files.size()),
             500,
@@ -3051,9 +3226,10 @@ CommandResult ListDirectoryResult(
             2500,
             0,
             1,
-            trace_id)
-        : "";
-    result.fields["required_tool_name"] = can_continue_directory_batch ? "lan_agent_read_directory_files" : "";
+            trace_id) : "");
+    result.fields["required_tool_name"] = can_continue_comment_cleanup
+        ? "lan_agent_probe_text_file"
+        : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
     result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
     return result;
 }
@@ -3984,7 +4160,10 @@ CommandResult DeleteTextRangeWindowAtomicResult(
     int max_lines = 200,
     const std::string & primary_intent = std::string(),
     const std::string & trace_id = std::string(),
-    const std::string & probe_ref = std::string()) {
+    const std::string & probe_ref = std::string(),
+    const std::string & directory_manifest_path = std::string(),
+    int directory_current_file_index = 0,
+    int directory_total_code_file_count = 0) {
     CommandResult result;
     result.fields["file_path"] = file_path;
     result.fields["primary_intent"] = primary_intent;
@@ -4102,26 +4281,64 @@ CommandResult DeleteTextRangeWindowAtomicResult(
     result.fields["batch_mutation_allowed"] = "bounded_window_only";
     result.fields["server_side_optimized_step"] = "true";
     result.fields["window_batch_scope"] = "single_file_bounded_line_window";
+    if (!directory_manifest_path.empty()) {
+        result.fields["directory_scope_active"] = "true";
+        result.fields["directory_manifest_path"] = directory_manifest_path;
+        result.fields["directory_current_file_index"] = std::to_string(std::max(0, directory_current_file_index));
+        result.fields["directory_total_code_file_count"] = std::to_string(std::max(0, directory_total_code_file_count));
+    }
+    const bool directory_scope_active = !directory_manifest_path.empty();
+    const int next_directory_file_index = std::max(0, directory_current_file_index) + 1;
+    const int directory_remaining_after_current = directory_scope_active
+        ? std::max(0, std::max(0, directory_total_code_file_count) - next_directory_file_index)
+        : 0;
+    const std::string next_directory_file_path =
+        directory_remaining_after_current > 0
+            ? ReadCodeFilePathFromDirectoryManifest(directory_manifest_path, next_directory_file_index)
+            : std::string();
+    const std::string directory_next_probe_call_json =
+        !next_directory_file_path.empty()
+            ? BuildCommentCleanupProbeCallJson(
+                next_directory_file_path,
+                trace_id,
+                directory_manifest_path,
+                next_directory_file_index,
+                directory_total_code_file_count)
+            : std::string();
 
     if (ranges.empty()) {
+        const bool directory_has_next_file = !directory_next_probe_call_json.empty();
         result.ok = true;
         result.exit_code = 0;
-        result.fields["status"] = "success";
+        result.fields["status"] = directory_has_next_file ? "needs_continue" : "success";
         result.fields["result"] = "no_text_range_remaining";
-        result.fields["summary"] = "no matching text range remains";
+        result.fields["summary"] = directory_has_next_file
+            ? "no matching text range remains in the current file; directory cleanup must continue with the next code file"
+            : "no matching text range remains";
         result.fields["write_applied"] = "false";
         result.fields["write_verified"] = "true";
         result.fields["disk_write_completed"] = "false";
-        result.fields["task_completion"] = "complete";
-        result.fields["continue_required"] = "false";
+        result.fields["task_completion"] = directory_has_next_file ? "current_file_complete" : "complete";
+        result.fields["continue_required"] = directory_has_next_file ? "true" : "false";
         result.fields["auto_continue_required"] = "false";
-        result.fields["has_more"] = "false";
-        result.fields["terminal_state"] = "true";
-        result.fields["task_done"] = "true";
-        result.fields["completion_claim_allowed"] = "true";
-        result.fields["must_continue_until"] = "";
+        result.fields["has_more"] = directory_has_next_file ? "true" : "false";
+        result.fields["terminal_state"] = directory_has_next_file ? "false" : "true";
+        result.fields["task_done"] = directory_has_next_file ? "false" : "true";
+        result.fields["completion_claim_allowed"] = directory_has_next_file ? "false" : "true";
+        result.fields["must_continue_until"] = directory_has_next_file ? "directory_scope_complete" : "";
         result.fields["next_start_line"] = std::to_string(bounded_start_line);
-        result.fields["next_action"] = "stop; no matching comment range remains";
+        result.fields["next_action"] = directory_has_next_file
+            ? "tool_call_only: current file has no remaining comments; probe the next directory code file"
+            : "stop; no matching comment range remains";
+        if (directory_scope_active) {
+            result.fields["directory_next_file_index"] = directory_has_next_file ? std::to_string(next_directory_file_index) : "";
+            result.fields["directory_remaining_code_file_count"] = std::to_string(directory_remaining_after_current);
+            result.fields["directory_scope_incomplete"] = directory_has_next_file ? "true" : "false";
+            result.fields["directory_next_probe_call_json"] = directory_next_probe_call_json;
+        }
+        result.fields["next_call_json"] = directory_next_probe_call_json;
+        result.fields["required_tool_name"] = directory_has_next_file ? "lan_agent_probe_text_file" : "";
+        result.fields["required_tool_arguments_json"] = directory_next_probe_call_json;
         return result;
     }
 

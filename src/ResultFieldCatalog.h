@@ -103,7 +103,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "mcp_gateway_route",
             "mcp gateway route returned",
-            "ok,exit_code,tool_name,status,result,error,summary,next_action,mcp_route_mode,mcp_route_entry_tool,tool_use_decision,current_tool_chain_node,chain_state,tool_surface_policy,visible_tool_count,visible_tool_name,internal_execution_performed,routed_tool_name,route_target,source_file,dry_run,would_change,changed,format_apply_required,dry_run_only,required_next_action_type,required_tool_name,required_tool_arguments_json,continue_required,auto_continue_required,semantic_model_clamp,completion_guard,task_memory_freeze_recovery,task_memory_freeze_recovered_from_short_call,goal_id,trace_id,terminal_state,completion_claim_allowed,final_answer_allowed,verification_ok,clean_chat_close_allowed,conversation_close_status,chat_context_reset_required,chat_context_reset_requested,chat_context_reset_acknowledged,host_chat_history_mutable_by_mcp,old_context_dropped,mcp_continuation_ready,new_chat_entry_tool_name,new_chat_entry_arguments_json,local_ai_mcp_guidance_version,local_ai_required_entry,local_ai_guidance_json,local_ai_context_bootstrap_json,result_ref,evidence_ref,provider_id,capability_id",
+            "ok,exit_code,tool_name,status,result,error,summary,next_action,mcp_route_mode,mcp_route_entry_tool,tool_use_decision,current_tool_chain_node,chain_state,tool_surface_policy,visible_tool_count,visible_tool_name,internal_execution_performed,routed_tool_name,routed_tool_surface,route_target,primary_intent,directory_mutation_flow,directory_scope_active,directory_manifest_path,directory_current_file_index,directory_next_file_index,directory_total_code_file_count,directory_remaining_code_file_count,directory_scope_incomplete,directory_next_probe_call_json,remote_endpoint,remote_prefix,remote_tool_count,remote_tools_csv,local_proxy_tools_csv,bridge_mode,local_proxy_tool_name,remote_tool_name,remote_status_code,remote_status,remote_result,remote_summary,remote_error,remote_has_more,remote_next_call_json,remote_required_tool_name,remote_required_tool_arguments_json,source_file,dry_run,would_change,changed,format_apply_required,dry_run_only,directory_path,normalized_path,total_entries,file_count,code_file_count,remaining_code_file_count,directory_count,entry_labels_json,file_paths_json,file_names_json,directory_listing_complete,known_file_list_complete,batch_manifest_complete,batch_manifest_path,batch_total_files,batch_read_file_count,remaining_batch_file_count,batch_completion,content_read_completion,incomplete_scope,next_batch_file_path,next_tool_name,next_file_path,next_max_lines,analysis_allowed,analysis_blocked_reason,required_next_action_type,required_tool_name,required_tool_arguments_json,continue_required,auto_continue_required,semantic_model_clamp,assistant_response_allowed,completion_guard,task_memory_freeze_recovery,task_memory_freeze_recovered_from_short_call,goal_id,trace_id,terminal_state,completion_claim_allowed,final_answer_allowed,verification_ok,clean_chat_close_allowed,conversation_close_status,chat_context_reset_required,chat_context_reset_requested,chat_context_reset_acknowledged,host_chat_history_mutable_by_mcp,old_context_dropped,mcp_continuation_ready,new_chat_entry_tool_name,new_chat_entry_arguments_json,local_ai_mcp_guidance_version,local_ai_required_entry,local_ai_guidance_json,local_ai_context_bootstrap_json,result_ref,evidence_ref,provider_id,capability_id",
             "public"
         },
         {
@@ -160,6 +160,14 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "mcp_overview",
             "mcp overview returned",
             "ok,exit_code,status,mcp_endpoint,mcp_transport,tool_count,tool_names_json,semantic_action_count,profile_count,tool_config_exists,tool_config_mode,local_chat_ready,local_ai_mcp_guidance_version,local_ai_required_entry,local_ai_common_file_operation_policy,local_ai_context_policy,local_ai_comment_cleanup_policy,local_ai_code_format_policy,local_ai_long_loop_policy,local_ai_completion_gate,local_ai_conversation_close_policy,local_ai_guidance_json,local_ai_context_bootstrap_json,browser_section_id,browser_section_title,browser_http_get_path,browser_route_hint,browser_status,browser_primary_count,browser_payload_field,browser_card_json,result,summary,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_remote_mcp_overview",
+            "codex-lan-agent",
+            "remote_mcp_bridge",
+            "remote MCP bridge overview returned",
+            "ok,exit_code,status,result,error,summary,bridge_mode,remote_endpoint,remote_prefix,remote_tool_count,remote_tools_csv,local_proxy_tools_csv,provider_id,capability_id",
             "public"
         },
         {
@@ -387,6 +395,30 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "public"
         },
         {
+            "lan_agent_mcp_flow_visualize",
+            "codex-lan-agent",
+            "mcp_flow_visualize",
+            "MCP flow graph generated",
+            "ok,exit_code,status,result,input_jsonl,out_dir,event_count,tool_call_count,tool_result_count,violation_count,completion_state,current_node,next_expected_node,flow_events_jsonl_path,flow_graph_dot_path,flow_graph_mermaid_path,flow_state_json_path,flow_state_graph_dot_path,flow_state_graph_mermaid_path,flow_state_dashboard_html_path,flow_report_md_path,violations_md_path,result_ref,script_stdout_ref,stderr_ref,summary,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_mcp_flow_analyze",
+            "codex-lan-agent",
+            "mcp_flow_analyze",
+            "MCP flow analysis report generated",
+            "ok,exit_code,status,result,input_jsonl,rule_root,out_dir,conclusion,event_count,tool_call_count,tool_result_count,violation_count,completion_state,current_node,next_expected_node,acceptance_summary_json_path,index_md_path,rules_report_md_path,rules_fact_graph_dot_path,flow_report_md_path,flow_graph_dot_path,flow_graph_mermaid_path,flow_state_json_path,flow_state_graph_dot_path,flow_state_graph_mermaid_path,flow_state_dashboard_html_path,violations_md_path,result_ref,script_stdout_ref,stderr_ref,summary,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_mcp_flow_export",
+            "codex-lan-agent",
+            "mcp_flow_export",
+            "MCP flow HTML report exported",
+            "ok,exit_code,status,result,input_jsonl,rule_root,out_dir,conclusion,event_count,tool_call_count,tool_result_count,violation_count,completion_state,current_node,next_expected_node,html_report_path,artifact_bundle_dir,index_md_path,flow_report_md_path,flow_graph_dot_path,flow_graph_mermaid_path,flow_state_json_path,flow_state_graph_dot_path,flow_state_graph_mermaid_path,flow_state_dashboard_html_path,violations_md_path,result_ref,script_stdout_ref,stderr_ref,summary,error,provider_id,capability_id",
+            "public"
+        },
+        {
             "lan_agent_task_memory_freeze",
             "codex-lan-agent",
             "task_memory_write",
@@ -407,7 +439,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "task_memory_write",
             "task memory continuation budget returned",
-            "ok,exit_code,status,record_model,goal_id,trace_id,budget_run_id,budget_status,execution_mode,dry_run,execute_requested,execution_deferred,max_steps,planned_step_count,executed_step_count,budget_exhausted,last_verified_step,last_tool,last_status,last_result_ref,last_summary,last_verification_ok,resume_context_path,budget_plan_path,step_ledger_path,completion_claim_allowed,terminal_state,task_done,continue_required,auto_continue_required,assistant_response_allowed,final_answer_allowed,verification_ok,must_continue_until,clean_chat_close_allowed,conversation_close_allowed,conversation_close_status,chat_context_reset_required,chat_context_reset_requested,chat_context_reset_acknowledged,host_chat_history_mutable_by_mcp,old_context_dropped,mcp_continuation_ready,handoff_state,handoff_completion_claim,next_chat_status_check_required,next_chat_status_check_tool_name,next_chat_status_check_arguments_json,next_chat_must_verify_fields_json,new_chat_entry_tool_name,new_chat_entry_arguments_json,new_chat_resume_instruction,budget_requires_frozen_resume_context,next_call_json,interaction_continuation_mode,internal_next_call_hidden,required_tool_name,required_tool_arguments_json,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
+            "ok,exit_code,status,record_model,goal_id,trace_id,budget_run_id,budget_status,execution_mode,dry_run,execute_requested,execution_deferred,max_steps,planned_step_count,executed_step_count,budget_exhausted,last_verified_step,last_tool,last_status,last_result_ref,last_summary,last_verification_ok,directory_scope_active,directory_manifest_path,directory_current_file_index,directory_next_file_index,directory_total_code_file_count,directory_remaining_code_file_count,directory_scope_incomplete,directory_next_probe_call_json,resume_context_path,budget_plan_path,step_ledger_path,completion_claim_allowed,terminal_state,task_done,continue_required,auto_continue_required,assistant_response_allowed,final_answer_allowed,verification_ok,must_continue_until,clean_chat_close_allowed,conversation_close_allowed,conversation_close_status,chat_context_reset_required,chat_context_reset_requested,chat_context_reset_acknowledged,host_chat_history_mutable_by_mcp,old_context_dropped,mcp_continuation_ready,handoff_state,handoff_completion_claim,next_chat_status_check_required,next_chat_status_check_tool_name,next_chat_status_check_arguments_json,next_chat_must_verify_fields_json,new_chat_entry_tool_name,new_chat_entry_arguments_json,new_chat_resume_instruction,budget_requires_frozen_resume_context,next_call_json,interaction_continuation_mode,internal_next_call_hidden,required_tool_name,required_tool_arguments_json,semantic_outcome,next_action,result_ref,evidence_ref,error,provider_id,capability_id",
             "public"
         },
         {
@@ -503,7 +535,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "file_probe",
             "text file probe returned",
-            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,file_path,current_file_path,normalized_path,primary_intent,normalized_primary_intent,file_bytes,total_bytes,total_lines,line_count,returned_lines,remaining_lines,probe_mode,probe_complete,probe_ref,probe_ready,analysis_allowed,file_length_class,content_payload_format,content_payload_scope,content_payload_boundary_safe,structured_body_read_mode,structured_body_helper_bypassed,pagination_basis,recommended_next_tool,recommended_read_max_lines,recommended_scan_mode,next_call_json,next_tool_name,next_action,task_completion,continue_required,auto_continue_required,read_complete,file_complete,has_more,result_ref,evidence_ref,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,file_path,current_file_path,normalized_path,primary_intent,normalized_primary_intent,directory_scope_active,directory_manifest_path,directory_current_file_index,directory_next_file_index,directory_total_code_file_count,directory_remaining_code_file_count,directory_scope_incomplete,directory_next_probe_call_json,file_bytes,total_bytes,total_lines,line_count,returned_lines,remaining_lines,probe_mode,probe_complete,probe_ref,probe_ready,analysis_allowed,file_length_class,content_payload_format,content_payload_scope,content_payload_boundary_safe,structured_body_read_mode,structured_body_helper_bypassed,pagination_basis,recommended_next_tool,recommended_read_max_lines,recommended_scan_mode,next_call_json,next_tool_name,next_action,task_completion,continue_required,auto_continue_required,read_complete,file_complete,has_more,result_ref,evidence_ref,provider_id,capability_id",
             "public"
         },
         {
@@ -551,7 +583,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "file_write",
             "bounded text range window delete returned",
-            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,file_path,normalized_path,primary_intent,scan_mode,probe_ref,probe_ready,start_line,window_start_line,window_end_line,max_lines,max_lines_per_call,effective_window_policy,total_lines_before,total_lines_after,total_range_count_before,total_range_count_after,window_range_count_before,boundary_range_count,deleted_range_count,deleted_text_bytes,has_range_in_current_window_after,has_more,next_start_line,write_applied,write_verified,disk_write_completed,verification_status,verification_ok,task_completion,continue_required,terminal_state,task_done,completion_claim_allowed,completion_guard,window_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,window_batch_scope,server_side_optimized_step,result_ref,evidence_ref,semantic_model_clamp,supervision_status,goal_status,assistant_response_allowed,final_answer_allowed,required_next_action_type,required_tool_name,required_tool_arguments_json,task_execution_in_mcp_required,forced_task_memory_execution,long_loop_budget_recommended,long_loop_freeze_tool_name,long_loop_budget_tool_name,long_loop_budget_precondition,long_loop_budget_policy,clips_continuation_required,clips_post_result_decision,clips_post_result_verification,clips_post_result_reason_code,trace_id,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,error,error_code,error_message,failure_mode,next_action,file_path,normalized_path,primary_intent,scan_mode,probe_ref,probe_ready,directory_scope_active,directory_manifest_path,directory_current_file_index,directory_next_file_index,directory_total_code_file_count,directory_remaining_code_file_count,directory_scope_incomplete,directory_next_probe_call_json,start_line,window_start_line,window_end_line,max_lines,max_lines_per_call,effective_window_policy,total_lines_before,total_lines_after,total_range_count_before,total_range_count_after,window_range_count_before,boundary_range_count,deleted_range_count,deleted_text_bytes,has_range_in_current_window_after,has_more,next_start_line,write_applied,write_verified,disk_write_completed,verification_status,verification_ok,task_completion,continue_required,terminal_state,task_done,completion_claim_allowed,completion_guard,window_step_required,operation_granularity,max_items_per_call,batch_mutation_allowed,window_batch_scope,server_side_optimized_step,result_ref,evidence_ref,semantic_model_clamp,supervision_status,goal_status,assistant_response_allowed,final_answer_allowed,required_next_action_type,required_tool_name,required_tool_arguments_json,task_execution_in_mcp_required,forced_task_memory_execution,long_loop_budget_recommended,long_loop_freeze_tool_name,long_loop_budget_tool_name,long_loop_budget_precondition,long_loop_budget_policy,clips_continuation_required,clips_post_result_decision,clips_post_result_verification,clips_post_result_reason_code,trace_id,provider_id,capability_id",
             "public"
         },
         {

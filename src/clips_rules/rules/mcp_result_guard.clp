@@ -173,6 +173,137 @@
     (route_target ?tool)
     (matched_rule "non-terminal-result-forbids-final-answer"))))
 
+(defrule directory-list-result-requires-declared-continuation
+  (declare (salience 52))
+  (mcp_tool_result (tool_name "lan_agent_list_directory")
+                   (analysis_allowed "false")
+                   (batch_completion "incomplete"))
+  =>
+  (assert (mcp_flow_observation
+    (flow_id "directory_comment_cleanup_bounded_window_v1")
+    (phase "post_result")
+    (tool_name "lan_agent_list_directory")
+    (status "needs_continue")
+    (expected_next_tool "required_tool_arguments_json")
+    (terminal_allowed "false")
+    (completion_allowed "false")
+    (reason_code "directory_manifest_not_terminal")
+    (matched_rule "directory-list-result-requires-declared-continuation")))
+  (assert (mcp_flow_expectation
+    (flow_id "directory_comment_cleanup_bounded_window_v1")
+    (current_tool "lan_agent_list_directory")
+    (expected_next_tool "required_tool_arguments_json")
+    (continuation_required "true")
+    (manual_content_processing_allowed "false")
+    (reason_code "directory_manifest_must_continue_by_required_tool_arguments")))
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target "lan_agent_list_directory")
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "directory_manifest_not_terminal")
+    (next_action "tool_call_only: directory listing is an intermediate manifest; call required_tool_arguments_json exactly. Do not summarize, do not read file bodies manually, and do not claim completion.")
+    (route_target "lan_agent_list_directory")
+    (matched_rule "directory-list-result-requires-declared-continuation"))))
+
+(defrule directory-read-result-requires-declared-continuation
+  (declare (salience 51))
+  (mcp_tool_result (tool_name "lan_agent_read_directory_files")
+                   (analysis_allowed "false")
+                   (batch_completion "incomplete"))
+  =>
+  (assert (mcp_flow_observation
+    (flow_id "directory_comment_cleanup_bounded_window_v1")
+    (phase "post_result")
+    (tool_name "lan_agent_read_directory_files")
+    (status "needs_continue")
+    (expected_next_tool "required_tool_arguments_json")
+    (terminal_allowed "false")
+    (completion_allowed "false")
+    (reason_code "directory_content_batch_not_terminal")
+    (matched_rule "directory-read-result-requires-declared-continuation")))
+  (assert (mcp_flow_expectation
+    (flow_id "directory_comment_cleanup_bounded_window_v1")
+    (current_tool "lan_agent_read_directory_files")
+    (expected_next_tool "required_tool_arguments_json")
+    (continuation_required "true")
+    (manual_content_processing_allowed "false")
+    (reason_code "directory_content_batch_must_continue_by_required_tool_arguments")))
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target "lan_agent_read_directory_files")
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "directory_content_batch_not_terminal")
+    (next_action "tool_call_only: file content batch is not a completion state; call required_tool_arguments_json exactly or freeze/resume the task. Manual editing in chat is forbidden for this flow.")
+    (route_target "lan_agent_read_directory_files")
+    (matched_rule "directory-read-result-requires-declared-continuation"))))
+
+(defrule directory-scope-next-file-requires-probe
+  (declare (salience 56))
+  (mcp_tool_result (tool_name ?tool)
+                   (directory_scope_active "true")
+                   (directory_scope_incomplete "true")
+                   (directory_next_probe_call_json ?next&:(neq ?next "")))
+  =>
+  (assert (mcp_flow_observation
+    (flow_id "directory_comment_cleanup_bounded_window_v1")
+    (phase "post_result")
+    (tool_name ?tool)
+    (status "needs_continue")
+    (expected_next_tool "lan_agent_probe_text_file")
+    (terminal_allowed "false")
+    (completion_allowed "false")
+    (reason_code "directory_scope_next_file_required")
+    (matched_rule "directory-scope-next-file-requires-probe")))
+  (assert (mcp_flow_expectation
+    (flow_id "directory_comment_cleanup_bounded_window_v1")
+    (current_tool ?tool)
+    (expected_next_tool "lan_agent_probe_text_file")
+    (continuation_required "true")
+    (manual_content_processing_allowed "false")
+    (reason_code "directory_scope_next_file_required")))
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "directory_scope_next_file_required")
+    (next_action "tool_call_only: directory cleanup still has unprocessed files; call directory_next_probe_call_json for the next file before any completion claim")
+    (route_target "lan_agent_probe_text_file")
+    (matched_rule "directory-scope-next-file-requires-probe"))))
+
+(defrule directory-scope-remaining-files-forbid-terminal
+  (declare (salience 55))
+  (mcp_tool_result (tool_name ?tool)
+                   (directory_scope_active "true")
+                   (terminal_state "true")
+                   (directory_remaining_code_file_count ?remaining&:(and (neq ?remaining "") (neq ?remaining "0"))))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "directory_scope_remaining_files_forbid_terminal")
+    (next_action "tool_call_only: directory-scope operation cannot be terminal while remaining files are recorded")
+    (route_target "lan_agent_probe_text_file")
+    (matched_rule "directory-scope-remaining-files-forbid-terminal"))))
+
+(defrule declared-next-call-json-requires-continuation
+  (declare (salience 43))
+  (mcp_tool_result (tool_name ?tool)
+                   (next_call_json ?next&:(neq ?next "")))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "declared_next_call_requires_continuation")
+    (next_action "tool_call_only: result declared next_call_json; execute that continuation before any completion claim")
+    (matched_rule "declared-next-call-json-requires-continuation"))))
+
 (defrule final-answer-disallowed-by-result
   (declare (salience 46))
   (mcp_tool_result (tool_name ?tool)

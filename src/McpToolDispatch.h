@@ -3,6 +3,8 @@
 #include "CmmToolResults.h"
 #include "ClangAstTool.h"
 
+#include <filesystem>
+
 CommandResult BuildBuildTargetPreflightResult(
     const std::string & build_dir,
     const std::string & target,
@@ -164,7 +166,10 @@ CommandResult DeleteTextRangeWindowAtomicResult(
     int max_lines,
     const std::string & primary_intent,
     const std::string & trace_id,
-    const std::string & probe_ref);
+    const std::string & probe_ref,
+    const std::string & directory_manifest_path,
+    int directory_current_file_index,
+    int directory_total_code_file_count);
 CommandResult PrepareEditWindowsResult(
     const AgentConfig & config,
     const std::string & file_path,
@@ -361,7 +366,10 @@ CommandResult ProbeTextFileResult(
     const AgentConfig & config,
     const std::string & file_path,
     const std::string & primary_intent = std::string(),
-    const std::string & trace_id = std::string());
+    const std::string & trace_id = std::string(),
+    const std::string & directory_manifest_path = std::string(),
+    int directory_current_file_index = 0,
+    int directory_total_code_file_count = 0);
 CommandResult ReadTextFileResult(
     const AgentConfig & config,
     const std::string & file_path,
@@ -378,7 +386,8 @@ CommandResult ListDirectoryResult(
     const AgentConfig & config,
     const std::string & directory_path,
     int max_entries,
-    const std::string & trace_id);
+    const std::string & trace_id,
+    const std::string & primary_intent = std::string());
 CommandResult ReadDirectoryFilesResult(
     const AgentConfig & config,
     const std::string & directory_path,
@@ -401,7 +410,14 @@ std::string ExtractMcpRouteWindowsPathFromText(const std::string & text) {
         std::size_t end = i + 3;
         while (end < text.size()) {
             const unsigned char ch = static_cast<unsigned char>(text[end]);
-            if (ch >= 128 || std::iscntrl(ch) || ch == '"' || ch == '\'' || ch == '<' || ch == '>' || ch == '|') {
+            if (ch >= 128
+                || std::iscntrl(ch)
+                || ch == '?'
+                || ch == '"'
+                || ch == '\''
+                || ch == '<'
+                || ch == '>'
+                || ch == '|') {
                 break;
             }
             if (std::isspace(ch)) {
@@ -506,6 +522,26 @@ std::string InferMcpRoutePrimaryIntent(
     return normalized;
 }
 
+bool McpRouteRequestMentionsDirectoryListing(const std::string & request_text) {
+    const std::string lowered = ToLowerAscii(request_text);
+    return lowered.find("list") != std::string::npos
+        || lowered.find("directory") != std::string::npos
+        || lowered.find("folder") != std::string::npos
+        || lowered.find("all files") != std::string::npos
+        || request_text.find("列表") != std::string::npos
+        || request_text.find("目录") != std::string::npos
+        || request_text.find("文件夹") != std::string::npos
+        || request_text.find("所有文件") != std::string::npos;
+}
+
+bool McpRoutePathIsDirectory(const std::string & file_path) {
+    if (Trim(file_path).empty()) {
+        return false;
+    }
+    std::error_code ec;
+    return std::filesystem::is_directory(std::filesystem::path(file_path), ec) && !ec;
+}
+
 std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     const std::string request_text = params.GetString("request_text");
     const std::string file_path = FirstNonEmpty(
@@ -570,14 +606,21 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["current_tool_chain_node"] = "route_decision";
                 const std::string inferred_intent =
                     NormalizeMcpPrimaryIntentForClips(route_params.GetString("primary_intent"));
+                const std::string routed_file_path = route_params.GetString("file_path");
+                const bool route_is_directory =
+                    McpRoutePathIsDirectory(routed_file_path)
+                    || McpRouteRequestMentionsDirectoryListing(route_params.GetString("request_text"));
                 const std::string route_target = FirstNonEmpty(
+                    route_is_directory ? std::string("lan_agent_list_directory") : std::string(),
                     GetFieldOrDefault(result, "route_target", ""),
                     route_params.GetString("route_hint"),
-                    route_params.GetString("file_path").empty()
+                    routed_file_path.empty()
                         ? std::string()
-                        : (inferred_intent == "code_format"
-                            ? std::string("lan_agent_format_code_file")
-                            : std::string("lan_agent_probe_text_file")),
+                        : (route_is_directory
+                            ? std::string("lan_agent_list_directory")
+                            : (inferred_intent == "code_format"
+                                ? std::string("lan_agent_format_code_file")
+                                : std::string("lan_agent_probe_text_file"))),
                     "");
                 if (!route_target.empty()) {
                     const std::string next_call_json = BuildPreGuardRouteCallJson(route_target, route_params);
@@ -596,6 +639,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     result.fields["continue_required"] = "true";
                     result.fields["terminal_state"] = "false";
                     result.fields["completion_claim_allowed"] = "false";
+                    result.fields["assistant_response_allowed"] = "false";
                     result.fields["final_answer_allowed"] = "false";
                     result.fields["verification_ok"] = "false";
                     result.fields["semantic_model_clamp"] = "tool_call_only";
@@ -650,6 +694,35 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             const auto & registry = BuildMcpToolHandlerRegistry();
             const auto tool_it = registry.find(target_tool_name);
             if (tool_it == registry.end()) {
+                std::string arguments_json = params.GetString("arguments_json");
+                if (arguments_json.empty()) {
+                    arguments_json = ExtractJsonObjectRaw(params.body(), "arguments");
+                }
+                if (arguments_json.empty()) {
+                    arguments_json = ExtractJsonObjectRaw(params.body(), "params");
+                }
+                if (arguments_json.empty()) {
+                    arguments_json = "{}";
+                }
+                JsonRequestView routed_params(arguments_json);
+                CommandResult remote_result;
+                if (::codex_lan_agent::remote_mcp_bridge::TryHandleRemoteMcpTool(
+                        config,
+                        target_tool_name,
+                        routed_params,
+                        &remote_result)) {
+                    LanResultBuilder(&remote_result).Finalize(config, target_tool_name);
+                    remote_result.fields["mcp_route_mode"] = "call";
+                    remote_result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
+                    remote_result.fields["routed_tool_name"] = target_tool_name;
+                    remote_result.fields["routed_tool_surface"] = "remote_mcp_internal_proxy_hidden_from_tools_list";
+                    remote_result.fields["internal_execution_performed"] = "true";
+                    remote_result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                    remote_result.fields["tool_use_decision"] = remote_result.ok ? "used_remote_tool" : "remote_tool_failed";
+                    remote_result.fields["current_tool_chain_node"] = target_tool_name;
+                    return remote_result;
+                }
+
                 CommandResult result;
                 result.ok = false;
                 result.exit_code = 404;
@@ -691,6 +764,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["continue_required"] = "true";
                 result.fields["terminal_state"] = "false";
                 result.fields["completion_claim_allowed"] = "false";
+                result.fields["assistant_response_allowed"] = "false";
                 result.fields["final_answer_allowed"] = "false";
                 result.fields["verification_ok"] = "false";
                 result.fields["semantic_model_clamp"] = "tool_call_only";
@@ -700,7 +774,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     result.fields["next_call_json"] = GetFieldOrDefault(result, "required_tool_arguments_json", "");
                 }
                 result.fields["next_action"] =
-                    "tool_call_only: call required_tool_arguments_json through lan_agent_mcp_route mode=call; do not claim completion yet.";
+                    "tool_call_only: call required_tool_arguments_json through lan_agent_mcp_route mode=call; do not write waiting/progress text and do not claim completion yet.";
             } else if (GetFieldOrDefault(result, "final_answer_allowed", "") == "true"
                 && GetFieldOrDefault(result, "verification_ok", "") == "true") {
                 result.fields["chain_state"] = "terminal";
@@ -739,6 +813,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         }},
         {"lan_agent_mcp_overview", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildMcpOverviewResult(config);
+        }},
+        {"lan_agent_remote_mcp_overview", [](const AgentConfig & config, const JsonRequestView &) {
+            return ::codex_lan_agent::remote_mcp_bridge::BuildRemoteMcpOverviewResult(config);
         }},
         {"lan_agent_rag_overview", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildRagOverviewResult(config);
@@ -850,11 +927,16 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 std::max(1000, params.GetInt("timeout_ms", 15000)));
         }},
         {"lan_agent_task_memory_freeze", [](const AgentConfig & config, const JsonRequestView & params) {
+            const std::string freeze_goal_id =
+                ::codex_lan_agent::TaskMemoryFirstNonEmpty(
+                    params.GetString("goal_id"),
+                    params.GetString("current_goal_id"),
+                    params.GetString("task_goal_id"));
             if (Trim(params.GetString("next_call_json")).empty()
                 && Trim(params.GetString("next_tool_name")).empty()) {
                 const std::string recovered_arguments =
                     ::codex_lan_agent::LookupTaskMemoryPendingFreezeArguments(
-                        params.GetString("goal_id"),
+                        freeze_goal_id,
                         params.GetString("trace_id"));
                 if (!Trim(recovered_arguments).empty()) {
                     JsonRequestView recovered_params(recovered_arguments);
@@ -1152,6 +1234,26 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_clips_chain_template", [](const AgentConfig & config, const JsonRequestView & params) {
             return BuildClipsChainTemplateResult(config, params);
         }},
+        {"lan_agent_mcp_flow_visualize", [](const AgentConfig & config, const JsonRequestView & params) {
+            return codex_lan_agent::BuildMcpFlowVisualizeResult(
+                config,
+                params.GetString("input_jsonl", params.GetString("jsonl_path")),
+                params.GetString("out_dir", params.GetString("output_dir")));
+        }},
+        {"lan_agent_mcp_flow_analyze", [](const AgentConfig & config, const JsonRequestView & params) {
+            return codex_lan_agent::BuildMcpFlowAnalyzeResult(
+                config,
+                params.GetString("input_jsonl", params.GetString("jsonl_path")),
+                params.GetString("rule_root"),
+                params.GetString("out_root", params.GetString("out_dir", params.GetString("output_dir"))));
+        }},
+        {"lan_agent_mcp_flow_export", [](const AgentConfig & config, const JsonRequestView & params) {
+            return codex_lan_agent::BuildMcpFlowExportResult(
+                config,
+                params.GetString("input_jsonl", params.GetString("jsonl_path")),
+                params.GetString("rule_root"),
+                params.GetString("out_root", params.GetString("out_dir", params.GetString("output_dir"))));
+        }},
         {"lan_agent_scan_text_ranges", [](const AgentConfig & config, const JsonRequestView & params) {
             return ScanTextRangesResult(
                 config,
@@ -1188,7 +1290,10 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 std::min(200, std::max(1, params.GetInt("max_lines", params.GetInt("next_max_lines", 200)))),
                 params.GetString("primary_intent", params.GetString("next_primary_intent", "comment_cleanup")),
                 params.GetString("trace_id"),
-                probe_ref);
+                probe_ref,
+                params.GetString("directory_manifest_path"),
+                params.GetInt("directory_current_file_index", 0),
+                params.GetInt("directory_total_code_file_count", 0));
         }},
         {"lan_agent_prepare_edit_windows", [](const AgentConfig & config, const JsonRequestView & params) {
             return PrepareEditWindowsResult(
@@ -1208,7 +1313,10 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 config,
                 params.GetString("file_path"),
                 params.GetString("primary_intent"),
-                params.GetString("trace_id"));
+                params.GetString("trace_id"),
+                params.GetString("directory_manifest_path"),
+                params.GetInt("directory_current_file_index", 0),
+                params.GetInt("directory_total_code_file_count", 0));
         }},
         {"lan_agent_read_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
             const long long raw_start_byte_offset =
@@ -1235,7 +1343,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 config,
                 params.GetString("directory_path"),
                 std::max(1, params.GetInt("max_entries", 200)),
-                params.GetString("trace_id"));
+                params.GetString("trace_id"),
+                params.GetString("primary_intent"));
         }},
         {"lan_agent_read_directory_files", [](const AgentConfig & config, const JsonRequestView & params) {
             const long long raw_start_byte_offset =
@@ -1570,6 +1679,12 @@ bool TryHandleRegisteredMcpTool(
     const auto & handlers = BuildMcpToolHandlerRegistry();
     const auto it = handlers.find(tool_name);
     if (it == handlers.end()) {
+        if (::codex_lan_agent::remote_mcp_bridge::TryHandleRemoteMcpTool(config, tool_name, params, result)) {
+            if (result != nullptr) {
+                LanResultBuilder(result).Finalize(config, tool_name);
+            }
+            return true;
+        }
         return false;
     }
     if (result != nullptr) {

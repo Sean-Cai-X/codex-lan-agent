@@ -818,6 +818,42 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "none"
         },
         {
+            "mcp_flow_visualize",
+            "Generate MCP flow artifacts from a llama.app/Codex JSONL conversation: raw event graph plus fixed flow-state projection, report, dashboard, and violations. This is an observability tool, not a workflow dispatcher.",
+            "lan_agent_mcp_flow_visualize",
+            "{\"input_jsonl\":\"required path to llama.app/Codex conversation jsonl\",\"out_dir\":\"optional output directory\"}",
+            "{\"flow_state_json_path\":\"non_empty\",\"flow_state_dashboard_html_path\":\"non_empty\",\"completion_state\":\"accepted|needs_continue|blocked_by_violation|failed|not_complete\",\"violation_count\":\"integer\"}",
+            "{\"tool\":\"lan_agent_mcp_flow_analyze\",\"reason\":\"run full rule + flow analysis when violations need diagnosis\"}",
+            "[\"input_jsonl\",\"out_dir\",\"flow_events_jsonl_path\",\"flow_graph_dot_path\",\"flow_graph_mermaid_path\",\"flow_state_json_path\",\"flow_state_graph_dot_path\",\"flow_state_graph_mermaid_path\",\"flow_state_dashboard_html_path\",\"flow_report_md_path\",\"violations_md_path\",\"event_count\",\"tool_call_count\",\"tool_result_count\",\"violation_count\",\"completion_state\",\"current_node\",\"next_expected_node\",\"result_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "mcp_flow_analyze",
+            "Analyze an MCP JSONL conversation together with CLIPS rules and produce statistics, rule graph artifacts, raw event graph artifacts, fixed flow-state artifacts, and violation reports.",
+            "lan_agent_mcp_flow_analyze",
+            "{\"input_jsonl\":\"required path to llama.app/Codex conversation jsonl\",\"rule_root\":\"optional CLIPS rule root default src/clips_rules\",\"out_root\":\"optional output directory\"}",
+            "{\"conclusion\":\"MCP_OBSERVABILITY_ACCEPTED|MCP_OBSERVABILITY_REPORT_READY_WITH_VIOLATIONS|MCP_OBSERVABILITY_INCOMPLETE\",\"completion_state\":\"accepted|needs_continue|blocked_by_violation|failed|not_complete\",\"flow_state_dashboard_html_path\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_mcp_flow_export\",\"reason\":\"export analysis bundle as HTML for human review\"}",
+            "[\"input_jsonl\",\"rule_root\",\"out_dir\",\"conclusion\",\"index_md_path\",\"acceptance_summary_json_path\",\"rules_report_md_path\",\"rules_fact_graph_dot_path\",\"flow_report_md_path\",\"flow_graph_dot_path\",\"flow_graph_mermaid_path\",\"flow_state_json_path\",\"flow_state_graph_dot_path\",\"flow_state_graph_mermaid_path\",\"flow_state_dashboard_html_path\",\"violations_md_path\",\"event_count\",\"tool_call_count\",\"tool_result_count\",\"violation_count\",\"completion_state\",\"current_node\",\"next_expected_node\",\"result_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "mcp_flow_export",
+            "Export MCP flow analysis artifacts as a local HTML report bundle for human review.",
+            "lan_agent_mcp_flow_export",
+            "{\"input_jsonl\":\"required path to llama.app/Codex conversation jsonl\",\"rule_root\":\"optional CLIPS rule root default src/clips_rules\",\"out_root\":\"optional output directory\"}",
+            "{\"html_report_path\":\"non_empty\",\"artifact_bundle_dir\":\"non_empty\",\"flow_state_dashboard_html_path\":\"non_empty\",\"violation_count\":\"integer\"}",
+            "{\"tool\":\"lan_agent_mcp_flow_analyze\",\"reason\":\"inspect source reports if HTML export is insufficient\"}",
+            "[\"input_jsonl\",\"rule_root\",\"out_dir\",\"html_report_path\",\"artifact_bundle_dir\",\"index_md_path\",\"flow_report_md_path\",\"flow_graph_dot_path\",\"flow_graph_mermaid_path\",\"flow_state_json_path\",\"flow_state_graph_dot_path\",\"flow_state_graph_mermaid_path\",\"flow_state_dashboard_html_path\",\"violations_md_path\",\"conclusion\",\"completion_state\",\"current_node\",\"next_expected_node\",\"violation_count\",\"result_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
             "inspect_rag_index_status",
             "Read upstream RAG bridge status through codex-lan-agent and explicitly surface whether clips_meta is supported or absent.",
             "lan_agent_rag_index_status",

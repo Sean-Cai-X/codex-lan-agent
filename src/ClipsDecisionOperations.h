@@ -208,6 +208,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot task_completion (default ""))
               (slot has_more (default "false"))
               (slot next_start_line (default ""))
+              (slot next_call_json (default ""))
               (slot continue_required (default "false"))
               (slot auto_continue_required (default "false"))
               (slot analysis_allowed (default "true"))
@@ -216,6 +217,14 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot next_batch_file_path (default ""))
               (slot known_file_list_complete (default ""))
               (slot directory_listing_complete (default ""))
+              (slot directory_scope_active (default "false"))
+              (slot directory_manifest_path (default ""))
+              (slot directory_current_file_index (default "0"))
+              (slot directory_next_file_index (default ""))
+              (slot directory_total_code_file_count (default "0"))
+              (slot directory_remaining_code_file_count (default "0"))
+              (slot directory_scope_incomplete (default "false"))
+              (slot directory_next_probe_call_json (default ""))
               (slot content_read_completion (default ""))
               (slot incomplete_scope (default ""))
               (slot terminal_state (default ""))
@@ -717,6 +726,51 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (next_action "tool_call_only: result is non-terminal; continue with next_call_json or move the continuation into task_memory budget runner before any completion claim")
                       (route_target ?tool)
                       (matched_rule "non-terminal-result-forbids-final-answer")))))",
+            R"((defrule directory-scope-next-file-requires-probe
+                  (declare (salience 56))
+                  (mcp_tool_result (tool_name ?tool)
+                                   (directory_scope_active "true")
+                                   (directory_scope_incomplete "true")
+                                   (directory_next_probe_call_json ?next&:(neq ?next "")))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "directory_scope_next_file_required")
+                      (next_action "tool_call_only: directory cleanup still has unprocessed files; call directory_next_probe_call_json for the next file before any completion claim")
+                      (route_target "lan_agent_probe_text_file")
+                      (matched_rule "directory-scope-next-file-requires-probe")))))",
+            R"((defrule directory-scope-remaining-files-forbid-terminal
+                  (declare (salience 55))
+                  (mcp_tool_result (tool_name ?tool)
+                                   (directory_scope_active "true")
+                                   (terminal_state "true")
+                                   (directory_remaining_code_file_count ?remaining&:(and (neq ?remaining "") (neq ?remaining "0"))))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "directory_scope_remaining_files_forbid_terminal")
+                      (next_action "tool_call_only: directory-scope operation cannot be terminal while remaining files are recorded")
+                      (route_target "lan_agent_probe_text_file")
+                      (matched_rule "directory-scope-remaining-files-forbid-terminal")))))",
+            R"((defrule declared-next-call-json-requires-continuation
+                  (declare (salience 43))
+                  (mcp_tool_result (tool_name ?tool)
+                                   (next_call_json ?next&:(neq ?next "")))
+                  =>
+                  (assert (clips_decision
+                      (domain "mcp_result_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "declared_next_call_requires_continuation")
+                      (next_action "tool_call_only: result declared next_call_json; execute that continuation before any completion claim")
+                      (matched_rule "declared-next-call-json-requires-continuation")))))",
             R"((defrule final-answer-disallowed-by-result
                   (declare (salience 46))
                   (mcp_tool_result (tool_name ?tool)
@@ -1637,6 +1691,7 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("task_completion", GetFieldOrDefault(result, "task_completion", "")) + " "
         + ClipsStringSlot("has_more", GetFieldOrDefault(result, "has_more", "false")) + " "
         + ClipsStringSlot("next_start_line", GetFieldOrDefault(result, "next_start_line", "")) + " "
+        + ClipsStringSlot("next_call_json", GetFieldOrDefault(result, "next_call_json", "")) + " "
         + ClipsStringSlot("continue_required", GetFieldOrDefault(result, "continue_required", "false")) + " "
         + ClipsStringSlot("auto_continue_required", GetFieldOrDefault(result, "auto_continue_required", "false")) + " "
         + ClipsStringSlot("analysis_allowed", GetFieldOrDefault(result, "analysis_allowed", "true")) + " "
@@ -1645,6 +1700,14 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("next_batch_file_path", GetFieldOrDefault(result, "next_batch_file_path", "")) + " "
         + ClipsStringSlot("known_file_list_complete", GetFieldOrDefault(result, "known_file_list_complete", "")) + " "
         + ClipsStringSlot("directory_listing_complete", GetFieldOrDefault(result, "directory_listing_complete", "")) + " "
+        + ClipsStringSlot("directory_scope_active", GetFieldOrDefault(result, "directory_scope_active", "false")) + " "
+        + ClipsStringSlot("directory_manifest_path", GetFieldOrDefault(result, "directory_manifest_path", "")) + " "
+        + ClipsStringSlot("directory_current_file_index", GetFieldOrDefault(result, "directory_current_file_index", "0")) + " "
+        + ClipsStringSlot("directory_next_file_index", GetFieldOrDefault(result, "directory_next_file_index", "")) + " "
+        + ClipsStringSlot("directory_total_code_file_count", GetFieldOrDefault(result, "directory_total_code_file_count", "0")) + " "
+        + ClipsStringSlot("directory_remaining_code_file_count", GetFieldOrDefault(result, "directory_remaining_code_file_count", "0")) + " "
+        + ClipsStringSlot("directory_scope_incomplete", GetFieldOrDefault(result, "directory_scope_incomplete", "false")) + " "
+        + ClipsStringSlot("directory_next_probe_call_json", GetFieldOrDefault(result, "directory_next_probe_call_json", "")) + " "
         + ClipsStringSlot("content_read_completion", GetFieldOrDefault(result, "content_read_completion", "")) + " "
         + ClipsStringSlot("incomplete_scope", GetFieldOrDefault(result, "incomplete_scope", "")) + " "
         + ClipsStringSlot("terminal_state", GetFieldOrDefault(result, "terminal_state", "")) + " "
@@ -1899,6 +1962,17 @@ bool ToolRequiresClipsResultGuard(const std::string & tool_name) {
     return true;
 }
 
+std::string ClipsParamBoolString(
+    const JsonRequestView & params,
+    const std::string & key,
+    const std::string & default_value) {
+    const std::string text_value = params.GetString(key);
+    if (!text_value.empty()) {
+        return text_value;
+    }
+    return params.GetBool(key, default_value == "true") ? "true" : "false";
+}
+
 CommandResult BuildClipsDecisionResult(
     const AgentConfig & config,
     const JsonRequestView & params) {
@@ -1926,18 +2000,28 @@ CommandResult BuildClipsDecisionResult(
     seed_result.fields["summary"] = params.GetString("summary");
     seed_result.fields["assistant_text"] = params.GetString("assistant_text");
     seed_result.fields["error"] = params.GetString("error");
-    seed_result.fields["ai_conclusion_valid"] = params.GetString("ai_conclusion_valid", "true");
+    seed_result.fields["ai_conclusion_valid"] = ClipsParamBoolString(params, "ai_conclusion_valid", "true");
     seed_result.fields["task_completion"] = params.GetString("task_completion");
-    seed_result.fields["has_more"] = params.GetString("has_more", "false");
+    seed_result.fields["has_more"] = ClipsParamBoolString(params, "has_more", "false");
     seed_result.fields["next_start_line"] = params.GetString("next_start_line");
-    seed_result.fields["continue_required"] = params.GetString("continue_required", "false");
-    seed_result.fields["auto_continue_required"] = params.GetString("auto_continue_required", "false");
-    seed_result.fields["analysis_allowed"] = params.GetString("analysis_allowed", "true");
+    seed_result.fields["next_call_json"] = params.GetString("next_call_json");
+    seed_result.fields["continue_required"] = ClipsParamBoolString(params, "continue_required", "false");
+    seed_result.fields["auto_continue_required"] = ClipsParamBoolString(params, "auto_continue_required", "false");
+    seed_result.fields["analysis_allowed"] = ClipsParamBoolString(params, "analysis_allowed", "true");
     seed_result.fields["batch_completion"] = params.GetString("batch_completion");
     seed_result.fields["remaining_batch_file_count"] = params.GetString("remaining_batch_file_count", "0");
     seed_result.fields["next_batch_file_path"] = params.GetString("next_batch_file_path");
     seed_result.fields["known_file_list_complete"] = params.GetString("known_file_list_complete");
     seed_result.fields["directory_listing_complete"] = params.GetString("directory_listing_complete");
+    seed_result.fields["directory_scope_active"] = ClipsParamBoolString(params, "directory_scope_active", "false");
+    seed_result.fields["directory_manifest_path"] = params.GetString("directory_manifest_path");
+    seed_result.fields["directory_current_file_index"] = params.GetString("directory_current_file_index", "0");
+    seed_result.fields["directory_next_file_index"] = params.GetString("directory_next_file_index");
+    seed_result.fields["directory_total_code_file_count"] = params.GetString("directory_total_code_file_count", "0");
+    seed_result.fields["directory_remaining_code_file_count"] =
+        params.GetString("directory_remaining_code_file_count", "0");
+    seed_result.fields["directory_scope_incomplete"] = ClipsParamBoolString(params, "directory_scope_incomplete", "false");
+    seed_result.fields["directory_next_probe_call_json"] = params.GetString("directory_next_probe_call_json");
     seed_result.fields["content_read_completion"] = params.GetString("content_read_completion");
     seed_result.fields["incomplete_scope"] = params.GetString("incomplete_scope");
     seed_result.fields["terminal_state"] = params.GetString("terminal_state");
@@ -2116,6 +2200,20 @@ std::string BuildPreGuardRouteCallJson(
     AppendJsonStringField(&arguments_json, &first_field, "primary_intent", primary_intent);
     AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
     AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+
+    if (route_target == "lan_agent_list_directory") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(&arguments_json, &first_field, "directory_path", file_path);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"max_entries\":200";
+        first_field = false;
+        AppendJsonStringField(&arguments_json, &first_field, "primary_intent", primary_intent);
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+    }
 
     if (route_target == "lan_agent_format_code_file") {
         arguments_json = "{";
@@ -2495,12 +2593,20 @@ void ApplyClipsResultGuard(
         result->fields["not_verified_reason"].clear();
     }
     if (decision.decision == "route" || pending_text_range_delete) {
-        const std::string required_arguments = GetFieldOrDefault(*result, "next_call_json", "");
+        const std::string directory_rule_next_call =
+            (decision.reason_code == "directory_scope_next_file_required"
+                || decision.reason_code == "directory_scope_remaining_files_forbid_terminal")
+                ? GetFieldOrDefault(*result, "directory_next_probe_call_json", "")
+                : std::string();
+        const std::string required_arguments = FirstNonEmpty(
+            GetFieldOrDefault(*result, "next_call_json", ""),
+            directory_rule_next_call,
+            "");
         const std::string existing_required_tool = GetFieldOrDefault(*result, "required_tool_name", "");
         const std::string required_tool = FirstNonEmpty(
             tool_name == "lan_agent_mcp_route" ? existing_required_tool : std::string(),
-            decision.route_target,
             ExtractJsonString(required_arguments, "name"),
+            decision.route_target,
             GetFieldOrDefault(*result, "next_tool_name", ""),
             tool_name);
         result->fields["semantic_model_clamp"] = "tool_call_only";
@@ -2509,6 +2615,7 @@ void ApplyClipsResultGuard(
         result->fields["required_next_action_type"] = "mcp_tool_call";
         result->fields["required_tool_name"] = required_tool;
         result->fields["required_tool_arguments_json"] = required_arguments;
+        result->fields["next_call_json"] = required_arguments;
         result->fields["route_target"] = required_tool;
         result->fields["clips_continuation_required"] = "true";
         result->fields["clips_continuation_policy"] =
@@ -2525,6 +2632,7 @@ void ApplyClipsResultGuard(
         result->fields["goal_status"] = "not_complete";
         result->fields["terminal_state"] = "false";
         result->fields["task_done"] = "false";
+        result->fields["continue_required"] = "true";
         result->fields["completion_claim_allowed"] = "false";
         result->fields["must_continue_until"] = "has_more=false";
         result->fields["completion_guard"] =
@@ -2551,6 +2659,17 @@ void ApplyClipsResultGuard(
         }
     }
     result->fields["status"] = ResolveResultEnvelopeStatus(*result);
+    const bool pending_rule_continuation =
+        (decision.decision == "route" || pending_text_range_delete)
+        && !GetFieldOrDefault(*result, "required_tool_arguments_json", "").empty()
+        && GetFieldOrDefault(*result, "error", "").empty();
+    if (pending_rule_continuation) {
+        result->ok = true;
+        result->exit_code = 0;
+        result->fields["ok"] = "true";
+        result->fields["status"] = "needs_continue";
+        result->fields["failure_mode"] = "none";
+    }
     if (GetFieldOrDefault(*result, "error_message", "").empty()) {
         result->fields["error_message"] = GetFieldOrDefault(*result, "error", "");
     }

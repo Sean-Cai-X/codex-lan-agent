@@ -204,6 +204,10 @@ inline std::string TaskMemoryNormalizeNextCallJson(std::string value) {
         TaskMemoryNormalizeEscapedJsonKey(&value, "trace_id");
         TaskMemoryNormalizeEscapedJsonKey(&value, "probe_ref");
         TaskMemoryNormalizeEscapedJsonKey(&value, "probe_ready");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "directory_manifest_path");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "directory_current_file_index");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "directory_total_code_file_count");
+        TaskMemoryNormalizeEscapedJsonKey(&value, "directory_scope_active");
     }
     return value;
 }
@@ -256,6 +260,13 @@ inline std::string BuildTaskMemoryFlatContinuationJson(const JsonRequestView & p
     }
     if (!trace_id.empty()) {
         output << ",\"trace_id\":\"" << JsonEscape(trace_id) << "\"";
+    }
+    const std::string directory_manifest_path = params.GetString("directory_manifest_path");
+    if (!directory_manifest_path.empty()) {
+        output << ",\"directory_manifest_path\":\"" << JsonEscape(directory_manifest_path) << "\""
+               << ",\"directory_current_file_index\":" << std::max(0, params.GetInt("directory_current_file_index", 0))
+               << ",\"directory_total_code_file_count\":" << std::max(0, params.GetInt("directory_total_code_file_count", 0))
+               << ",\"directory_scope_active\":true";
     }
     if (!probe_ref.empty()) {
         output << ",\"probe_ref\":\"" << JsonEscape(probe_ref) << "\"";
@@ -518,6 +529,17 @@ inline std::string BuildResumeContextJson(
         << "  \"new_chat_entry_tool_name\":\"" << (continuation_available ? "lan_agent_task_memory_resume_and_execute" : "") << "\",\n"
         << "  \"new_chat_entry_arguments_json\":\"" << JsonEscape(continuation_available ? BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, resume_max_steps) : "") << "\",\n"
         << "  \"current_tool\":\"" << JsonEscape(params.GetString("current_tool")) << "\",\n"
+        << "  \"current_file\":\"" << JsonEscape(params.GetString("current_file")) << "\",\n"
+        << "  \"directory_scope_active\":" << (params.GetBool("directory_scope_active", false) ? "true" : "false") << ",\n"
+        << "  \"directory_manifest_path\":\"" << JsonEscape(params.GetString("directory_manifest_path")) << "\",\n"
+        << "  \"directory_current_file_index\":" << std::max(0, params.GetInt("directory_current_file_index", 0)) << ",\n"
+        << "  \"directory_next_file_index\":\"" << JsonEscape(params.GetString("directory_next_file_index")) << "\",\n"
+        << "  \"directory_total_code_file_count\":" << std::max(0, params.GetInt("directory_total_code_file_count", 0)) << ",\n"
+        << "  \"directory_remaining_code_file_count\":" << std::max(0, params.GetInt("directory_remaining_code_file_count", 0)) << ",\n"
+        << "  \"directory_scope_incomplete\":" << (params.GetBool("directory_scope_incomplete", false) ? "true" : "false") << ",\n"
+        << "  \"directory_next_probe_call_json\":\"" << JsonEscape(TaskMemoryParamStringOrRaw(params, "directory_next_probe_call_json")) << "\",\n"
+        << "  \"clips_post_result_matched_rule\":\"" << JsonEscape(params.GetString("clips_post_result_matched_rule")) << "\",\n"
+        << "  \"clips_post_result_reason_code\":\"" << JsonEscape(params.GetString("clips_post_result_reason_code")) << "\",\n"
         << "  \"next_call_json\":\"" << JsonEscape(next_call_json) << "\",\n"
         << "  \"compact_summary\":\"" << JsonEscape(params.GetString("compact_summary")) << "\",\n"
         << "  \"last_verified_step\":" << last_verified_step << ",\n"
@@ -781,12 +803,17 @@ inline CommandResult BuildTaskMemoryFreezeResult(
     const AgentConfig & config,
     const JsonRequestView & params) {
     CommandResult result;
-    const std::string goal_id = params.GetString("goal_id");
+    const std::string goal_id = TaskMemoryFirstNonEmpty(
+        params.GetString("goal_id"),
+        params.GetString("current_goal_id"),
+        params.GetString("task_goal_id"));
     if (goal_id.empty()) {
         result.ok = false;
         result.exit_code = 400;
         result.fields["error"] = "goal_id is required";
-        result.fields["next_action"] = "provide goal_id before freezing task memory";
+        result.fields["accepted_goal_id_aliases"] = "goal_id,current_goal_id,task_goal_id";
+        result.fields["next_action"] =
+            "provide goal_id before freezing task memory, or pass current_goal_id as a compatible alias";
         return result;
     }
 
@@ -1020,8 +1047,15 @@ inline CommandResult BuildTaskMemoryAppendStepResult(
         << JsonStringField("summary", params.GetString("summary"))
         << JsonStringField("result_ref", params.GetString("result_ref"))
         << JsonStringField("evidence_ref", params.GetString("evidence_ref"))
+        << JsonStringField("clips_post_result_matched_rule", params.GetString("clips_post_result_matched_rule"))
+        << JsonStringField("clips_post_result_reason_code", params.GetString("clips_post_result_reason_code"))
         << JsonStringField("next_call_json", append_next_call_json)
         << "\"step_index\":" << step_index << ","
+        << "\"directory_scope_active\":" << (params.GetBool("directory_scope_active", false) ? "true" : "false") << ","
+        << "\"directory_scope_incomplete\":" << (params.GetBool("directory_scope_incomplete", false) ? "true" : "false") << ","
+        << "\"directory_current_file_index\":" << std::max(0, params.GetInt("directory_current_file_index", 0)) << ","
+        << "\"directory_next_file_index\":\"" << JsonEscape(params.GetString("directory_next_file_index")) << "\","
+        << "\"directory_remaining_code_file_count\":" << std::max(0, params.GetInt("directory_remaining_code_file_count", 0)) << ","
         << "\"has_more\":" << (params.GetBool("has_more", false) ? "true" : "false") << ","
         << "\"terminal_state\":" << (params.GetBool("terminal_state", false) ? "true" : "false") << ","
         << "\"completion_claim_allowed\":" << (params.GetBool("completion_claim_allowed", false) && params.GetBool("terminal_state", false) ? "true" : "false")

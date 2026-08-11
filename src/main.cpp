@@ -12,6 +12,8 @@
 #include "HttpClient.h"
 #include "ProcessRunner.h"
 #include "comm.h"
+#include "McpFlowDashboardOperations.h"
+#include "RemoteMcpBridgeOperations.h"
 #include "types.h"
 
 #include <algorithm>
@@ -50,6 +52,7 @@
 #include "ClangAstParser.h"
 #include "ClangAstTool.h"
 #include "CodeFormatOperations.h"
+#include "McpFlowObservabilityOperations.h"
 #include "SemanticGridOperations.h"
 
 bool ReadWholeFile(
@@ -875,12 +878,34 @@ bool IsSafeClipsContinuationAction(
         && GetFieldOrDefault(result, "primary_intent", "") == "code_format") {
         return true;
     }
+    if (required_tool == "lan_agent_format_code_file"
+        && safety_class == "CONTROLLED_CODE_FORMAT"
+        && GetFieldOrDefault(result, "result", "") == "format_dry_run_requires_apply"
+        && GetFieldOrDefault(result, "dry_run", "") == "true"
+        && GetFieldOrDefault(result, "would_change", "") == "true"
+        && GetFieldOrDefault(result, "format_apply_required", "") == "true"
+        && GetFieldOrDefault(result, "continue_required", "") == "true") {
+        return true;
+    }
     if ((required_tool == "lan_agent_delete_text_range_window_atomic"
             || required_tool == "lan_agent_delete_next_text_range_atomic")
         && GetFieldOrDefault(result, "write_verified", "") == "true"
         && GetFieldOrDefault(result, "disk_write_completed", "") == "true"
         && GetFieldOrDefault(result, "window_batch_scope", "") != "multi_file") {
         return true;
+    }
+    if (required_tool == "lan_agent_delete_text_range_window_atomic"
+        && safety_class == "BOUNDED_FILE_WRITE"
+        && GetFieldOrDefault(result, "result", "") == "probe_complete"
+        && GetFieldOrDefault(result, "probe_ready", "") == "true") {
+        const std::string next_action_json = FirstNonEmpty(
+            GetFieldOrDefault(result, "required_tool_arguments_json", ""),
+            GetFieldOrDefault(result, "next_call_json", ""),
+            "");
+        return next_action_json.find("\"scan_mode\":\"comments\"") != std::string::npos
+            && next_action_json.find("\"probe_ready\":true") != std::string::npos
+            && next_action_json.find("\"max_lines\":200") != std::string::npos
+            && next_action_json.find("\"file_path\"") != std::string::npos;
     }
     if (required_tool == "lan_agent_delete_text_range_window_atomic"
         && safety_class == "BOUNDED_FILE_WRITE"
@@ -1256,7 +1281,10 @@ CommandResult ExecuteReadOnlyMcpToolForClipsContinuation(
             config,
             ExtractJsonString(request_body, "file_path"),
             ExtractJsonString(request_body, "primary_intent"),
-            ExtractJsonString(request_body, "trace_id"));
+            ExtractJsonString(request_body, "trace_id"),
+            ExtractJsonString(request_body, "directory_manifest_path"),
+            std::max(0, std::atoi(ExtractJsonRawValue(request_body, "directory_current_file_index").c_str())),
+            std::max(0, std::atoi(ExtractJsonRawValue(request_body, "directory_total_code_file_count").c_str())));
     }
 
     if (tool_name == "lan_agent_read_text_file") {
@@ -1623,6 +1651,11 @@ void ApplySupervisionEnvelope(CommandResult * result) {
                     "\"current_goal\":\"continue bounded comment cleanup until completion gate allows final answer\","
                     "\"current_tool\":\"" + codex_lan_agent::JsonEscape(required_tool) + "\","
                     "\"current_file\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "file_path", "")) + "\","
+                    "\"directory_scope_active\":" + (GetFieldOrDefault(*result, "directory_scope_active", "") == "true" ? "true" : "false") + ","
+                    "\"directory_manifest_path\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "directory_manifest_path", "")) + "\","
+                    "\"directory_current_file_index\":" + FirstNonEmpty(GetFieldOrDefault(*result, "directory_current_file_index", ""), "0", "0") + ","
+                    "\"directory_total_code_file_count\":" + FirstNonEmpty(GetFieldOrDefault(*result, "directory_total_code_file_count", ""), "0", "0") + ","
+                    "\"directory_remaining_code_file_count\":" + FirstNonEmpty(GetFieldOrDefault(*result, "directory_remaining_code_file_count", ""), "0", "0") + ","
                     "\"last_status\":\"" + codex_lan_agent::JsonEscape(freeze_status) + "\","
                     "\"last_has_more\":\"" + codex_lan_agent::JsonEscape(GetFieldOrDefault(*result, "has_more", "")) + "\","
                     "\"terminal_state\":false,"
@@ -1748,7 +1781,8 @@ std::string ExtractJsonObjectRawForTaskMemoryRunner(
 }
 
 bool IsTaskMemoryBudgetExecutableTool(const std::string & tool_name) {
-    return tool_name == "lan_agent_delete_text_range_window_atomic"
+    return tool_name == "lan_agent_probe_text_file"
+        || tool_name == "lan_agent_delete_text_range_window_atomic"
         || tool_name == "lan_agent_delete_next_text_range_atomic";
 }
 
@@ -1797,6 +1831,17 @@ std::string BuildTaskMemoryRunnerAppendParamsJson(
         << "\"result_ref\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "result_ref")) << "\","
         << "\"evidence_ref\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "evidence_ref")) << "\","
         << "\"next_call_json\":\"" << codex_lan_agent::JsonEscape(next_call_json) << "\","
+        << "\"current_file\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "file_path")) << "\","
+        << "\"directory_scope_active\":" << (TaskMemoryRunnerBoolField(step_result, "directory_scope_active", false) ? "true" : "false") << ","
+        << "\"directory_manifest_path\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "directory_manifest_path")) << "\","
+        << "\"directory_current_file_index\":" << std::max(0, std::atoi(TaskMemoryRunnerField(step_result, "directory_current_file_index", "0").c_str())) << ","
+        << "\"directory_next_file_index\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "directory_next_file_index")) << "\","
+        << "\"directory_total_code_file_count\":" << std::max(0, std::atoi(TaskMemoryRunnerField(step_result, "directory_total_code_file_count", "0").c_str())) << ","
+        << "\"directory_remaining_code_file_count\":" << std::max(0, std::atoi(TaskMemoryRunnerField(step_result, "directory_remaining_code_file_count", "0").c_str())) << ","
+        << "\"directory_scope_incomplete\":" << (TaskMemoryRunnerBoolField(step_result, "directory_scope_incomplete", false) ? "true" : "false") << ","
+        << "\"directory_next_probe_call_json\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "directory_next_probe_call_json")) << "\","
+        << "\"clips_post_result_matched_rule\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "clips_post_result_matched_rule")) << "\","
+        << "\"clips_post_result_reason_code\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "clips_post_result_reason_code")) << "\","
         << "\"has_more\":" << (has_more ? "true" : "false") << ","
         << "\"terminal_state\":" << (terminal_state ? "true" : "false") << ","
         << "\"completion_claim_allowed\":" << (completion_claim_allowed ? "true" : "false") << ","
@@ -1804,6 +1849,109 @@ std::string BuildTaskMemoryRunnerAppendParamsJson(
         << "\"remaining_work\":\"" << codex_lan_agent::JsonEscape(remaining_work) << "\""
         << "}";
     return output.str();
+}
+
+std::string BuildDirectoryCommentCleanupProbeCallForBudget(
+    const std::string & manifest_path,
+    int next_file_index,
+    int total_code_file_count,
+    const std::string & trace_id) {
+    if (Trim(manifest_path).empty() || next_file_index < 0) {
+        return std::string();
+    }
+    std::ifstream input{std::filesystem::path(manifest_path)};
+    if (!input.is_open()) {
+        return std::string();
+    }
+    std::string line;
+    std::vector<std::string> code_files;
+    while (std::getline(input, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (IsLocalAiCodeSourceFilePath(line)) {
+            code_files.push_back(line);
+        }
+    }
+    if (next_file_index >= static_cast<int>(code_files.size())) {
+        return std::string();
+    }
+    const int bounded_total = total_code_file_count > 0
+        ? total_code_file_count
+        : static_cast<int>(code_files.size());
+    std::ostringstream output;
+    output << "{\"name\":\"lan_agent_probe_text_file\",\"arguments\":{"
+           << "\"file_path\":\"" << codex_lan_agent::JsonEscape(code_files[static_cast<std::size_t>(next_file_index)]) << "\","
+           << "\"primary_intent\":\"comment_cleanup\","
+           << "\"directory_manifest_path\":\"" << codex_lan_agent::JsonEscape(manifest_path) << "\","
+           << "\"directory_current_file_index\":" << next_file_index << ","
+           << "\"directory_total_code_file_count\":" << bounded_total << ","
+           << "\"directory_scope_active\":true";
+    if (!trace_id.empty()) {
+        output << ",\"trace_id\":\"" << codex_lan_agent::JsonEscape(trace_id) << "\"";
+    }
+    output << "}}";
+    return output.str();
+}
+
+void AttachDirectoryCommentCleanupContinuationFactsForBudget(
+    const std::string & resume_context,
+    const std::string & trace_id,
+    CommandResult * step_result) {
+    if (step_result == nullptr) {
+        return;
+    }
+    const bool directory_scope_active =
+        codex_lan_agent::TaskMemoryExtractBoolField(resume_context, "directory_scope_active", false)
+        || TaskMemoryRunnerBoolField(*step_result, "directory_scope_active", false);
+    if (!directory_scope_active) {
+        return;
+    }
+    const std::string directory_manifest_path = FirstNonEmpty(
+        ExtractJsonString(resume_context, "directory_manifest_path"),
+        TaskMemoryRunnerField(*step_result, "directory_manifest_path"),
+        "");
+    const int directory_total_code_file_count = std::max(
+        codex_lan_agent::TaskMemoryExtractIntField(resume_context, "directory_total_code_file_count", 0),
+        std::atoi(TaskMemoryRunnerField(*step_result, "directory_total_code_file_count", "0").c_str()));
+    const int current_directory_file_index = std::max(
+        codex_lan_agent::TaskMemoryExtractIntField(resume_context, "directory_current_file_index", 0),
+        std::atoi(TaskMemoryRunnerField(*step_result, "directory_current_file_index", "0").c_str()));
+
+    step_result->fields["directory_scope_active"] = "true";
+    step_result->fields["directory_manifest_path"] = directory_manifest_path;
+    step_result->fields["directory_current_file_index"] = std::to_string(std::max(0, current_directory_file_index));
+    step_result->fields["directory_total_code_file_count"] = std::to_string(std::max(0, directory_total_code_file_count));
+
+    const bool same_file_continuation =
+        TaskMemoryRunnerBoolField(*step_result, "has_more", false)
+        || TaskMemoryRunnerBoolField(*step_result, "continue_required", false)
+        || TaskMemoryRunnerField(*step_result, "status") == "needs_continue";
+    const bool step_claims_terminal = TaskMemoryRunnerBoolField(*step_result, "terminal_state", true);
+    if (same_file_continuation || !step_claims_terminal) {
+        step_result->fields["directory_scope_incomplete"] = "false";
+        return;
+    }
+
+    const int next_directory_file_index = current_directory_file_index + 1;
+    const std::string directory_next_call_json = BuildDirectoryCommentCleanupProbeCallForBudget(
+        directory_manifest_path,
+        next_directory_file_index,
+        directory_total_code_file_count,
+        trace_id);
+    if (directory_next_call_json.empty()) {
+        step_result->fields["directory_scope_incomplete"] = "false";
+        step_result->fields["directory_remaining_code_file_count"] = "0";
+        return;
+    }
+
+    step_result->fields["directory_scope_incomplete"] = "true";
+    step_result->fields["directory_current_file_index"] = std::to_string(next_directory_file_index);
+    step_result->fields["directory_next_file_index"] = std::to_string(next_directory_file_index);
+    step_result->fields["directory_remaining_code_file_count"] =
+        std::to_string(std::max(0, directory_total_code_file_count - next_directory_file_index));
+    step_result->fields["directory_next_probe_call_json"] = directory_next_call_json;
 }
 
 CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
@@ -1917,6 +2065,7 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         ApplyRequestRuleFields(tool_name, step_params, &step_result);
         LanResultBuilder(&step_result).Finalize(config, tool_name);
         ApplyAiConclusionValidityGuards(&step_result);
+        AttachDirectoryCommentCleanupContinuationFactsForBudget(resume_context, trace_id, &step_result);
         ApplyClipsResultGuard(config, tool_name, &step_result);
         ApplySupervisionEnvelope(&step_result);
         AppendMcpTraceAuditEvent(config, tool_name, step_result);
@@ -1927,16 +2076,16 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         last_tool = tool_name;
         last_step_result = step_result;
 
-        const bool has_more = TaskMemoryRunnerBoolField(step_result, "has_more", false)
+        bool has_more = TaskMemoryRunnerBoolField(step_result, "has_more", false)
             || TaskMemoryRunnerBoolField(step_result, "continue_required", false)
             || TaskMemoryRunnerField(step_result, "semantic_model_clamp") == "tool_call_only";
         std::string next_call_json = NormalizeTaskMemoryRunnerNextCallJson(FirstNonEmpty(
             TaskMemoryRunnerField(step_result, "next_call_json"),
             TaskMemoryRunnerField(step_result, "required_tool_arguments_json"),
             std::string()));
-        const bool step_terminal = !has_more
+        bool step_terminal = !has_more
             && TaskMemoryRunnerBoolField(step_result, "terminal_state", true);
-        const bool step_completion_claim_allowed = step_terminal
+        bool step_completion_claim_allowed = step_terminal
             && TaskMemoryRunnerBoolField(step_result, "completion_claim_allowed", true);
 
         const std::string step_id = "budget-step-" + std::to_string(last_verified_step);
@@ -1970,6 +2119,14 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
             << "\"step_index\":" << last_verified_step << ","
             << "\"tool_name\":\"" << codex_lan_agent::JsonEscape(tool_name) << "\","
             << "\"status\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "status")) << "\","
+            << "\"clips_post_result_matched_rule\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "clips_post_result_matched_rule")) << "\","
+            << "\"clips_post_result_reason_code\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "clips_post_result_reason_code")) << "\","
+            << "\"required_tool_name\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "required_tool_name")) << "\","
+            << "\"directory_scope_active\":" << (TaskMemoryRunnerBoolField(step_result, "directory_scope_active", false) ? "true" : "false") << ","
+            << "\"directory_scope_incomplete\":" << (TaskMemoryRunnerBoolField(step_result, "directory_scope_incomplete", false) ? "true" : "false") << ","
+            << "\"directory_current_file_index\":" << std::max(0, std::atoi(TaskMemoryRunnerField(step_result, "directory_current_file_index", "0").c_str())) << ","
+            << "\"directory_next_file_index\":\"" << codex_lan_agent::JsonEscape(TaskMemoryRunnerField(step_result, "directory_next_file_index")) << "\","
+            << "\"directory_remaining_code_file_count\":" << std::max(0, std::atoi(TaskMemoryRunnerField(step_result, "directory_remaining_code_file_count", "0").c_str())) << ","
             << "\"has_more\":" << (has_more ? "true" : "false") << ","
             << "\"terminal_state\":" << (step_terminal ? "true" : "false") << ","
             << "\"completion_claim_allowed\":" << (step_completion_claim_allowed ? "true" : "false") << ","
@@ -1999,6 +2156,11 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         if (!terminal_state && Trim(current_call_json).empty()) {
             blocked = true;
             block_reason = "continuation still pending but next_call_json is empty";
+            break;
+        }
+        if (!terminal_state
+            && !Trim(current_call_json).empty()
+            && !IsTaskMemoryBudgetExecutableTool(ExtractJsonString(current_call_json, "name"))) {
             break;
         }
     }
@@ -2081,6 +2243,26 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         TaskMemoryRunnerField(last_step_result, "result"),
         "");
     result.fields["last_verification_ok"] = TaskMemoryRunnerField(last_step_result, "verification_ok");
+    result.fields["directory_scope_active"] =
+        codex_lan_agent::TaskMemoryExtractBoolField(resume_context, "directory_scope_active", false) ? "true" : "false";
+    result.fields["directory_manifest_path"] =
+        ExtractJsonString(resume_context, "directory_manifest_path");
+    result.fields["directory_current_file_index"] =
+        std::to_string(codex_lan_agent::TaskMemoryExtractIntField(resume_context, "directory_current_file_index", 0));
+    result.fields["directory_next_file_index"] =
+        ExtractJsonString(resume_context, "directory_next_file_index");
+    result.fields["directory_total_code_file_count"] =
+        std::to_string(codex_lan_agent::TaskMemoryExtractIntField(resume_context, "directory_total_code_file_count", 0));
+    result.fields["directory_remaining_code_file_count"] =
+        std::to_string(codex_lan_agent::TaskMemoryExtractIntField(resume_context, "directory_remaining_code_file_count", 0));
+    result.fields["directory_scope_incomplete"] =
+        codex_lan_agent::TaskMemoryExtractBoolField(resume_context, "directory_scope_incomplete", false) ? "true" : "false";
+    result.fields["directory_next_probe_call_json"] =
+        ExtractJsonString(resume_context, "directory_next_probe_call_json");
+    result.fields["clips_post_result_matched_rule"] =
+        ExtractJsonString(resume_context, "clips_post_result_matched_rule");
+    result.fields["clips_post_result_reason_code"] =
+        ExtractJsonString(resume_context, "clips_post_result_reason_code");
     result.fields["resume_context_path"] = resume_path.string();
     result.fields["budget_plan_path"] = budget_path.string();
     result.fields["step_ledger_path"] = (root / "step_ledger.jsonl").string();
@@ -2115,14 +2297,21 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         result.fields["error"] = block_reason;
     }
     if (continue_required) {
-        const std::string resume_call_json =
-            codex_lan_agent::BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, max_steps);
+        const std::string next_tool_name = ExtractJsonString(current_call_json, "name");
+        const bool budget_can_continue = IsTaskMemoryBudgetExecutableTool(next_tool_name);
+        const std::string resume_call_json = budget_can_continue
+            ? codex_lan_agent::BuildTaskMemoryResumeAndExecuteCallJson(goal_id, trace_id, max_steps)
+            : current_call_json;
         result.fields["semantic_model_clamp"] = "tool_call_only";
-        result.fields["required_tool_name"] = "lan_agent_task_memory_resume_and_execute";
+        result.fields["required_tool_name"] = budget_can_continue
+            ? "lan_agent_task_memory_resume_and_execute"
+            : next_tool_name;
         result.fields["required_tool_arguments_json"] = resume_call_json;
         result.fields["next_call_json"] = resume_call_json;
-        result.fields["interaction_continuation_mode"] = "resume_and_execute_only";
-        result.fields["internal_next_call_hidden"] = "true";
+        result.fields["interaction_continuation_mode"] = budget_can_continue
+            ? "resume_and_execute_only"
+            : "explicit_next_tool_from_task_memory";
+        result.fields["internal_next_call_hidden"] = budget_can_continue ? "true" : "false";
     } else {
         result.fields["next_call_json"] = "";
     }
@@ -5140,7 +5329,10 @@ bool HandleMcpRoute(
                 config,
                 ExtractJsonString(request.body, "file_path"),
                 ExtractJsonString(request.body, "primary_intent"),
-                effective_trace_id);
+                effective_trace_id,
+                ExtractJsonString(request.body, "directory_manifest_path"),
+                std::max(0, std::atoi(ExtractJsonRawValue(request.body, "directory_current_file_index").c_str())),
+                std::max(0, std::atoi(ExtractJsonRawValue(request.body, "directory_total_code_file_count").c_str())));
         } else if (tool_name == "lan_agent_read_text_file") {
             const std::string effective_trace_id =
                 ResolveEffectiveTraceIdForToolCall(tool_name, request.body);
@@ -5427,6 +5619,10 @@ bool HandleBinaryHttpRoute(
     const AgentConfig & config,
     const HttpRequest & request,
     HttpResponseSpec * response) {
+    if (::codex_lan_agent::mcp_flow_dashboard::HandleFlowObservationRoutes(config, request, response)) {
+        return true;
+    }
+
     if (codex_gateway_audit_ui::HandleGatewayAuditBinaryRoute(config, request, response)) {
         return true;
     }
