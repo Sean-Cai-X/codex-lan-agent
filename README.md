@@ -21,6 +21,7 @@
 13. [Clang 分析工具 vs CMM 工具功能对比](#13-clang-分析工具-vs-cmm-工具功能对比)
 14. [常见问题排查](#14-常见问题排查)
 15. [项目演进分析报告（8月9日 → 8月11日）](#15-项目演进分析报告8月9日--8月11日)
+16. [CLIPS 规则体系详解](#16-clips-规则体系详解)
 
 ---
 
@@ -167,6 +168,35 @@ $response.result.tools.Count  # 应输出工具总数
 ---
 
 ## 4. 工具清单与参数
+### 4.0 完整工具清单概览（135 个）
+
+`McpProtocolOperations.h` 的 `BuildMcpToolsListResponse` 共注册 **135 个** MCP 工具。默认模式（`UseFullMcpToolSurface()=false`）下 `tools/list` 只返回 `lan_agent_mcp_route` 单一网关入口；设置环境变量 `CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full/all/legacy/153` 后暴露全部 135 个工具。按功能类别分布如下：
+
+| 类别 | 工具数 | 代表工具 | 说明 |
+|---|---|---|---|
+| 网关路由 | 1 | `lan_agent_mcp_route` | 默认唯一可见入口（overview/route/call） |
+| Overview/Discovery | 12 | `lan_agent_mcp_overview` / `lan_agent_runtime_overview` / `lan_agent_rag_overview` / `lan_agent_patch_overview` / `lan_agent_remote_session_semantic_catalog` | 能力发现与运行时概览 |
+| Profile/CLI/Case 执行 | 4 | `lan_agent_run_cli_profile` / `lan_agent_run_case` / `lan_agent_enqueue_case` | CLI profile 与 case 编排 |
+| 本地模型/RAG/会话 | 14 | `lan_agent_run_local_chat` / `lan_agent_run_rag_flow` / `lan_agent_ventriloquist_reply` / `lan_agent_remote_session_new_turn` / `lan_agent_allocate_remote_chat_session` / `lan_agent_build_semantic_execution_card` / `lan_agent_enqueue_local_chat` | llama.cpp 远程会话与 RAG 集成 |
+| OptFile 配置 | 3 | `lan_agent_optfile_read` / `lan_agent_optfile_write_preview` / `lan_agent_optfile_apply_write` | 配置文件读写 |
+| Dialog Slice | 2 | `lan_agent_record_dialog_slice` / `lan_agent_analyze_dialog_slices` | 对话切片入库与分析 |
+| Semantic Action | 1 | `lan_agent_execute_semantic_action` | 语义动作解析与执行 |
+| Basic/Task 运维 | 5 | `lan_agent_basic_comm_smoke` / `lan_agent_get_task` / `lan_agent_task_log` / `lan_agent_snapshot_diff` | 任务查询与 smoke |
+| 构建/测试 | 8 | `lan_agent_configure_project` / `lan_agent_build_target` / `lan_agent_run_ctest_target` / `lan_agent_preflight_build_target` / `lan_agent_discover_ctest_tests` | CMake/CTest 执行与预检 |
+| CLIPS 决策 | 4 | `lan_agent_clips_decide` / `lan_agent_clips_chain_template` / `lan_agent_rag_clips_meta` / `lan_agent_rag_clips_run` | 规则引擎调用（详见第 16 节） |
+| RAG Storage/Review | 3 | `lan_agent_rag_storage_lookup` / `lan_agent_rag_review_observe` / `lan_agent_rag_storage_page` | RAG 存储查询与审查 |
+| Remote Events/Logs | 4 | `lan_agent_discover_logs` / `lan_agent_tail_control_events` / `lan_agent_list_recent_remote_events` / `lan_agent_query_remote_task_result_refs` | 远程事件与日志 |
+| 文件编辑（安全受控） | 11 | `lan_agent_preview_patch` / `lan_agent_apply_single_file_patch` / `lan_agent_apply_diff_patch` / `lan_agent_write_text_file` / `lan_agent_format_code_file` / `lan_agent_revert_single_file_patch` / `lan_agent_verify_single_file_patch` / `lan_agent_get_patch_audit_trail` / `lan_agent_get_supervision_status` | patch 审计链 + 格式化 |
+| CxParser/Clang Indexer | 4 | `lan_agent_run_clang_indexer` / `lan_agent_list_cxparser_flows` / `lan_agent_validate_cxparser_flow` / `lan_agent_run_cxparser_flow` | cxparser 流编排 |
+| Task Memory | 14 | `lan_agent_task_memory_freeze` / `lan_agent_task_memory_resume_and_execute` / `lan_agent_task_memory_new_chat_round_selftest` / `lan_agent_task_memory_rocksdb_mirror` / `lan_agent_task_memory_migration_acceptance` | 长任务记忆（详见 4.3） |
+| File Access | 17 | `lan_agent_probe_text_file` / `lan_agent_read_text_file` / `lan_agent_tail_text_file` / `lan_agent_list_directory` / `lan_agent_read_directory_files` / `lan_agent_scan_text_ranges` / `lan_agent_delete_text_range_window_atomic` / `lan_agent_prepare_edit_windows` | 文件读取/扫描/原子编辑 |
+| Profile Catalog | 1 | `lan_agent_profile_catalog` | profile 目录 |
+| CMM 桥接 | 12 | `lan_agent_cmm_index_repository` / `lan_agent_cmm_search_code` / `lan_agent_cmm_query_graph` / `lan_agent_cmm_trace_path` / `lan_agent_cmm_get_architecture` / `lan_agent_cmm_delete_project` | codebase-memory-mcp 桥接（详见 4.11） |
+| Semantic Grid | 6 | `lan_agent_semantic_grid_ingest_text` / `lan_agent_semantic_grid_build` / `lan_agent_semantic_grid_query` / `lan_agent_semantic_grid_context_bundle` | 长文本语义网格（详见 4.2/第 8 节） |
+| Clang AST/CFG/CallGraph/DFG/Slice | 9 | `lan_agent_run_clang_ast_parser` / `lan_agent_build_cfg` / `lan_agent_build_call_graph` / `lan_agent_build_dfg` / `lan_agent_build_program_slice` + 5 个 `query_*_artifact` | Clang 代码分析（详见 4.1） |
+| **合计** | **135** | | |
+
+> **维护约定**：新增或删除工具时，必须同步更新本表工具数与本节合计。工具命名统一前缀 `lan_agent_`，完整工具名清单可通过 `tools/list`（完整模式）或 Python 脚本扫描 `McpProtocolOperations.h` 中的 `"name":"lan_agent_*"` 获得。
 
 ### 4.1 代码分析工具（核心 10 个）
 
@@ -195,7 +225,7 @@ $response.result.tools.Count  # 应输出工具总数
 | `lan_agent_semantic_grid_context_bundle` | 根据任务意图生成 LLM 上下文 bundle | `artifact_summary_path` |
 | `lan_agent_semantic_grid_incremental_update` | 多轮增量追加，支持 content_hash 去重 | `artifact_summary_path`, `source_text` |
 
-### 4.3 Task Memory 工具（13 个）
+### 4.3 Task Memory 工具（14 个）
 
 Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上下文中的"任务进度/下一步调用/已验证步骤/关键切片"外移到文件对象层，使全新模型只需读取 `latest_resume_context.json` 即可续接。
 
@@ -1663,7 +1693,7 @@ powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan
 | `lan_agent_query_dfg_artifact` | 可用 | `artifact_parser_status=success` |
 | `lan_agent_build_program_slice` | 可用 | `slice_precision=ast_statement_def_use_cfg_callgraph_v1` |
 | `lan_agent_query_program_slice_artifact` | 可用 | artifact + source_lines 二次查询成功 |
-| `lan_agent_task_memory_*` (12 工具) | 可用 | freeze/resume/budget/kv/rocksdb/parity/manifest/acceptance 全链通过 |
+| `lan_agent_task_memory_*` (14 工具) | 可用 | freeze/resume/budget/kv/rocksdb/parity/manifest/acceptance/resume_and_execute/selftest 全链通过 |
 
 ### 11.3 核心断言结果（Clang 分析工具）
 
@@ -1952,7 +1982,7 @@ cmake --build AIbuild
 
 | 维度 | 8月9日状态 | 8月11日状态 | 变化性质 |
 |---|---|---|---|
-| MCP 工具表面 | 30+ 扁平工具列表 | 单网关路由 + 100+ 隐藏内部工具 | **架构重构** |
+| MCP 工具表面 | 135 扁平工具列表 | 单网关路由 + 134 个隐藏内部工具 | **架构重构** |
 | Task Memory | 12 工具，多步手动编排 | 14 工具，新增一键续接入口 | **能力增强** |
 | CLIPS 专家系统 | 隐藏层，源码存在但未暴露 | 正式 MCP 工具，可调用决策 | **从暗到明** |
 | 执行能力 | 只读代码分析 | 可执行构建/测试/文件编辑/格式化 | **边界扩展** |
@@ -1978,9 +2008,9 @@ cmake --build AIbuild
 
 #### 15.2.2 设计意图
 
-这是从"模型自由选择 30+ 工具"到"网关决策 + 受控执行"的关键转变：
+这是从"模型自由选择 135 个工具"到"网关决策 + 受控执行"的关键转变：
 
-- **降低模型认知负担**：模型只看到一个工具，不需要理解 100+ 工具的 schema
+- **降低模型认知负担**：模型只看到一个工具，不需要理解 134 个内部工具的 schema
 - **强制决策层**：所有工具调用必须经过路由决策，可插入 CLIPS 规则校验
 - **隐藏内部复杂度**：内部工具链对模型不可见，只暴露决策结果
 - **完成声明门禁**：`terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` 四个字段控制模型能否宣布任务完成
@@ -2036,7 +2066,7 @@ cmake --build AIbuild
 | `lan_agent_rag_clips_meta` | 调用上游 `/rag/clips/meta`，返回 fact_bundle + serialized_assertions |
 | `lan_agent_rag_clips_run` | 调用上游 `/rag/clips/run`，返回 request_id/trace_id/query_id + 存储引用 |
 
-**意义**：CLIPS 不再是"预留接口"，而是已经成为**工具调用决策的规则引擎**——在文件操作、长循环、构建、测试、结果验收之前，先经过 CLIPS 规则校验。
+**意义**：CLIPS 不再是"预留接口"，而是已经成为**工具调用决策的规则引擎**——在文件操作、长循环、构建、测试、结果验收之前，先经过 CLIPS 规则校验。CLIPS 规则体系的完整说明（目录结构、fact 模板、5 个规则域、49 条 defrule、salience 优先级模型、扩展指南）详见 [第 16 节](#16-clips-规则体系详解)。
 
 ### 15.5 执行能力边界扩展
 
@@ -2132,7 +2162,7 @@ Layer 2 · codex_lan_agent 业务构建（增量编译）
 | 设计原则 | research-mcp | codex-lan-agent（更新后） |
 |---|---|---|
 | 协议层 | MCP over HTTP/stdio | MCP over Streamable HTTP + 网关路由 |
-| 分层架构 | L1/L2/L3 三层观测 | 网关路由 + 100+ 内部工具 + CLIPS 决策层 |
+| 分层架构 | L1/L2/L3 三层观测 | 网关路由 + 134 个内部工具 + CLIPS 决策层 |
 | 缓存/持久化 | SQLite 统一缓存层 | 文件对象层 + RocksDB 镜像 + parity check |
 | 源真分离 | 多源融合 + 降级链 | 文件源真 + RocksDB 镜像 + parity check |
 | 实体/关系 | Entity Mapper + 关系图谱 | Semantic Grid + dialog_slice + task_memory |
@@ -2157,11 +2187,11 @@ Layer 2 · codex_lan_agent 业务构建（增量编译）
 
 #### 15.9.2 新增隐忧
 
-1. **工具数量爆炸**：完整模式下 100+ 工具，维护成本急剧上升
+1. **工具数量爆炸**：完整模式下 135 个工具，维护成本急剧上升
 2. **网关路由黑盒**：默认模式下模型只看到一个工具，调试难度增加
-3. **CLIPS 规则未开源**：`clips_rules/` 目录存在但规则内容未在 README 中说明
+3. **CLIPS 规则已文档化**：`clips_rules/` 目录的 8 个 `.clp` 文件、5 个规则域、49 条 defrule 已在第 16 节详述（原"未开源"问题已解决）
 4. **执行安全边界**：新增文件编辑/构建/测试能力，但安全约束分散在各工具描述中，缺乏统一的权限模型
-5. **README 滞后风险**：工具表需要持续同步实际注册的工具数量与命名
+5. **README 同步机制**：已通过 4.0 节"完整工具清单概览（135 个）"校准工具表与 `McpProtocolOperations.h` 实际注册一致；新增/删除工具时必须同步更新 4.0 节合计（原"滞后风险"已缓解）
 
 ### 15.10 结论
 
@@ -2171,7 +2201,7 @@ Layer 2 · codex_lan_agent 业务构建（增量编译）
 
 核心标志：
 
-- **工具表面收敛**：30+ 扁平 → 单网关路由，模型认知负担降低
+- **工具表面收敛**：135 扁平 → 单网关路由，模型认知负担降低
 - **执行闭环形成**：分析 → 决策（CLIPS）→ 执行（构建/测试/编辑）→ 验证 → 记忆（Task Memory）
 - **长任务自动化**：`resume_and_execute` 一键续接，模型无需理解内部链路
 - **工程化成熟**：两层缓存 CI，纯网络构建，Release 可直接下载使用
@@ -2181,3 +2211,187 @@ Layer 2 · codex_lan_agent 业务构建（增量编译）
 1. **`resume_and_execute`**：把 Task Memory 从"多步手动编排"简化为"一键自动续接"，这是长任务记忆从概念验证到实用化的关键一步
 2. **网关路由模式**：单入口 + 隐藏内部工具 + CLIPS 决策校验，这是 AI Agent 工具调用从"模型自由选择"到"受控决策执行"的架构范式转变
 3. **两层缓存 CI**：LLVM 工具链与业务构建解耦，业务源码变化不触发 LLVM 重编译，Release 构建时间从 ~2 小时降到 ~分钟级
+
+
+---
+
+## 16. CLIPS 规则体系详解
+
+CLIPS 专家系统是 codex-lan-agent 的**工具调用决策层**——所有 MCP 工具调用（在完整工具表面模式下）都会经过 CLIPS 规则引擎做 pre-call allow/block/route 决策和 post-result 验证，确保模型不会绕过安全约束声明任务完成。规则源码全部位于 [src/clips_rules/](src/clips_rules/)，共 8 个 `.clp` 文件、5 个规则域、49 条 `defrule`、8 个 `deftemplate`。
+
+### 16.1 目录结构
+
+```
+src/clips_rules/
+├── templates/
+│   ├── mcp_fact_templates.clp      ← 核心 fact 模板（5 个 deftemplate）
+│   └── cmm_fact_templates.clp      ← CMM 扩展 fact 模板（3 个 deftemplate）
+├── rules/
+│   ├── mcp_tool_guard.clp          ← MCP pre-call allow/block/route（13 条 defrule）
+│   ├── mcp_result_guard.clp        ← MCP post-result 验证（16 条 defrule）
+│   ├── cmm_init_guard.clp          ← CMM 初始化与搜索工作流守卫（15 条 defrule）
+│   ├── cxparser_preflight_guard.clp ← cxparser 驱动的 build/test 预检（2 条 defrule）
+│   └── slice_ingest_guard.clp      ← slice 入库质量/去重（3 条 defrule）
+├── graphs/
+│   ├── cmm_init_flow.clp           ← CMM 状态机图（7 条状态转移 defrule）
+│   └── mcp_guard_flow.clp          ← 预留：slice-node 与 guard 图映射（待实现）
+└── profiles/
+    └── default_guard_profile.clp   ← 预留：guard profile 选择（待实现）
+```
+
+### 16.2 Fact 模板（deftemplate）
+
+CLIPS 规则基于事实匹配（pattern matching）触发。核心 fact 模板定义在 [templates/mcp_fact_templates.clp](src/clips_rules/templates/mcp_fact_templates.clp)：
+
+| deftemplate | 用途 | 关键 slot |
+|---|---|---|
+| `mcp_tool_request` | 工具调用请求 fact（pre-call 阶段断言） | `tool_name` / `primary_intent` / `file_path` / `probe_ready` / `explicit_user_intent` / `single_step_required` / `max_items_per_call` / `requires_revert_plan` |
+| `mcp_tool_result` | 工具返回结果 fact（post-result 阶段断言） | `tool_name` / `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `has_more` / `continue_required` / `analysis_allowed` / `batch_completion` / `result_hash` / `schema_version` / `ai_conclusion_valid` / `result_ref` / `evidence_ref` |
+| `mcp_tool_chain` | 工具链上下文 fact | `chain_phase`（pre_call / post_result）/ `request_type`（file_mutation / analysis_review / generic_mcp_tool）/ `risk` / `safety_class` / `execution_class` |
+| `slice_ingest_fact` | 切片入库 fact | `dedup_status` / `canonical_slice_id` / `dup_of` |
+| `cxparser_fact` | cxparser 状态 fact | `parse_status` / `symbol_status` / `target_status` / `preflight_status` |
+| `clips_decision` | **决策输出 fact**（所有规则最终 assert 此模板） | `domain` / `target` / `decision`（allow / block / route）/ `verification`（verified / not_verified）/ `reason_code` / `next_action` / `route_target` / `matched_rule` |
+
+CMM 扩展 fact（[templates/cmm_fact_templates.clp](src/clips_rules/templates/cmm_fact_templates.clp)）：`cmm_project_state` / `cmm_search_request` / `cmm_workflow_stage`。
+
+### 16.3 规则域 1：`mcp_tool_guard`（pre-call allow/block/route）
+
+源码：[rules/mcp_tool_guard.clp](src/clips_rules/rules/mcp_tool_guard.clp)，13 条 defrule。在工具调用**执行前**断言 `mcp_tool_request` fact，规则按 salience 优先级匹配，输出 `clips_decision`。
+
+#### 关键 block 规则（禁止执行）
+
+| 规则 | salience | 触发条件 | reason_code |
+|---|---|---|---|
+| `block-single-file-patch-apply-without-explicit-intent` | 89 | apply/revert patch 时 `explicit_user_intent=false` | `missing_patch_intent` |
+| `block-stepwise-file-tool-multi-item-request` | 88 | `single_step_required=true` 但 `max_items_per_call≠1` | `multi_item_file_step_not_allowed` |
+| `block-broad-file-mutation-for-stepwise-editing-intent` | 88 | write/patch 工具 + `primary_intent=comment_cleanup/text_cleaning/localized_edit/...` | `bulk_file_mutation_not_allowed_for_stepwise_edit` |
+| `block-multi-file-patch-in-phase1` | 87 | patch 工具 `file_count≠1` | `multi_file_patch_not_allowed_phase1` |
+| `block-single-file-patch-without-revert-plan` | 86 | apply/revert patch `revert_plan_ready=false` | `missing_patch_revert_plan` |
+| `block-high-risk-write-without-path` | 85 | `file_mutation` 链 + `file_path=""` | `missing_file_path` |
+
+#### 关键 route 规则（路由到更合适的工具）
+
+| 规则 | salience | 触发条件 | route_target |
+|---|---|---|---|
+| `route-code-format-cleanup-to-clang-format` | 85 | 任意文件工具 + `primary_intent=code_format` | `lan_agent_format_code_file` |
+| `route-file-text-operations-to-probe-first` | 84 | 文件操作 + `probe_required=true` + `probe_ready=false` | `lan_agent_probe_text_file` |
+| `route-read-text-file-to-window-delete-for-comment-cleanup` | 84 | `read_text_file` + `primary_intent=comment_cleanup/remove_comments/删除注释/...` | `lan_agent_delete_text_range_window_atomic` |
+| `route-comment-cleanup-scaffold-to-window-delete` | 83 | `scan_text_ranges`/`prepare_edit_windows` + 注释清理意图 | `lan_agent_delete_text_range_window_atomic` |
+| `route-read-text-file-to-range-scan-for-editing-intent` | 82 | `read_text_file` + `primary_intent=text_cleaning/localized_edit/source_edit_planning` | `lan_agent_scan_text_ranges` |
+
+#### 默认规则
+
+| 规则 | salience | 行为 |
+|---|---|---|
+| `allow-single-file-patch-preview` | 80 | preview patch（不写盘）直接 allow |
+| `default-mcp-tool-allow` | -100 | 无其他规则匹配时默认 allow + verified |
+
+### 16.4 规则域 2：`mcp_result_guard`（post-result 验证）
+
+源码：[rules/mcp_result_guard.clp](src/clips_rules/rules/mcp_result_guard.clp)，16 条 defrule。在工具返回结果后断言 `mcp_tool_result` fact，验证结果完整性、禁止虚假完成声明。
+
+#### 完成声明门禁（核心安全约束）
+
+| 规则 | salience | 触发条件 | 行为 |
+|---|---|---|---|
+| `text-range-delete-result-still-pending-by-has-more` | 49 | delete 工具 `has_more=true` | route（继续删除），`verification=not_verified` |
+| `text-range-delete-result-still-pending-by-continuation` | 48 | delete 工具 `continue_required=true` | route（继续删除） |
+| `directory-batch-read-still-pending` | 48 | `analysis_allowed=false` + `batch_completion=incomplete` | route（继续批读链） |
+| `non-terminal-result-forbids-final-answer` | 47 | `terminal_state=false` + `completion_claim_allowed=false` | route，禁止 final answer |
+| `final-answer-disallowed-by-result` | 46 | `final_answer_allowed=false` | route，禁止 final answer |
+
+> **关键不变量**：模型只有在 `terminal_state=true` + `completion_claim_allowed=true` + `final_answer_allowed=true` + `verification_ok=true` **四重齐**时才能声明任务完成。CLIPS 规则在 post-result 阶段强制这四个字段一致。
+
+#### 结果完整性验证
+
+| 规则 | salience | 触发条件 | reason_code |
+|---|---|---|---|
+| `invalid-direct-answer-json-fragment` | 50 | local_chat/ventriloquist `direct_answer="{"` | `bad_direct_answer_fragment` |
+| `invalid-direct-answer-empty` | 45 | `direct_answer=""` | `empty_direct_answer` |
+| `invalid-direct-answer-label-token` | 44 | `direct_answer="direct_answer"`（标签泄漏） | `bad_direct_answer_label_token` |
+| `analysis-only-chat-claimed-execution-without-evidence` | 41 | `ai_conclusion_valid=false` + `result_ref/evidence_ref/task_id` 全空 | `analysis_only_execution_claim_without_evidence` |
+| `execution-task-result-missing-traceable-ref` | 39 | execute 类 + `task_id/result_ref/evidence_ref/log_path` 全空 | `execution_result_missing_traceable_ref` |
+| `audited-write-result-missing-proof` | 38 | file_mutation + 审计字段全空 | `write_result_missing_audit_ref` |
+| `invalid-result-missing-hash` | 35 | `result_hash=""` | `result_hash_missing` |
+| `invalid-result-missing-schema` | 34 | `schema_version=""` | `schema_version_missing` |
+| `incomplete-read-result-requires-continuation` | 33 | read/list/run_cxparser `task_completion=incomplete` | `read_chain_incomplete` |
+| `invalid-ai-conclusion-flag` | 40 | `ai_conclusion_valid=false` | `ai_conclusion_invalid` |
+| `default-mcp-result-verified` | -100 | 默认 allow + verified |
+
+### 16.5 规则域 3：`cmm_init_guard`（CMM 工作流守卫）
+
+源码：[rules/cmm_init_guard.clp](src/clips_rules/rules/cmm_init_guard.clp)，15 条 defrule。强制 CMM 工具的"先索引再搜索"工作流。
+
+#### 核心约束
+
+- **`block-cmm-search-before-ensure-indexed`**（salience 95）：未索引项目禁止 search/query/trace/get_architecture，route 到 `lan_agent_cmm_index_status`
+- **`route-cmm-ensure-indexed-as-first-step`**（salience 93）：`probe_ready=false` 时强制先 `index_status`
+- **`block-cmm-search-without-project-parameter`**（salience 94）：未解析 `normalized_project` 禁止 `search_code`
+- **`allow-cmm-search-on-verified-project`**（salience 85）：已索引项目放行搜索
+- **`handle-cmm-project-not-found-error`**（salience 75）：错误结果 route 到 `list_projects` + `index_repository`
+- **`block-cmm-delete-project-without-intent`**（salience 88）：删除项目索引需显式 `primary_intent=reindex_preparation`
+
+#### CMM 状态机（[graphs/cmm_init_flow.clp](src/clips_rules/graphs/cmm_init_flow.clp)）
+
+```
+init → validate → (indexed?) → ready → search → analyze
+                ↓ (not indexed)               ↓ (error)
+              index → validate              error → init (retry)
+```
+
+7 条状态转移 defrule 定义 `cmm_state_machine` 的状态转换，每个状态有 `required_tool` / `guard_condition` / `action`。
+
+### 16.6 规则域 4：`cxparser_preflight_guard`（build/test 预检）
+
+源码：[rules/cxparser_preflight_guard.clp](src/clips_rules/rules/cxparser_preflight_guard.clp)，2 条 defrule。
+
+- **`block-build-without-preflight`**（salience 70）：`build_target`/`run_ctest_target` 在 `preflight_status=missing/false/blocked` 时 block，要求先调 `preflight_build_target`/`preflight_run_ctest_target` 拿到 `preflight_ref`
+- **`default-preflight-allow`**（salience -100）：默认放行
+
+### 16.7 规则域 5：`slice_ingest_guard`（slice 入库去重）
+
+源码：[rules/slice_ingest_guard.clp](src/clips_rules/rules/slice_ingest_guard.clp)，3 条 defrule。
+
+- **`duplicate-slice-route-canonical`**（salience 60）：`dedup_status=duplicate` + 有 `canonical_slice_id` → route 到 canonical slice 合并
+- **`duplicate-slice-block-status`**（salience 55）：`dedup_status=duplicate` 但无 canonical → block
+- **`default-slice-ingest-allow`**（salience -100）：默认放行
+
+### 16.8 CLIPS 工具与规则的关系
+
+CLIPS 规则通过 4 个 MCP 工具对外暴露（见 4.x 节）：
+
+| MCP 工具 | 调用时机 | 使用的规则域 |
+|---|---|---|
+| `lan_agent_clips_decide` | 任意工具调用前/后 | 全部 5 个规则域（按 `domain` 字段路由） |
+| `lan_agent_clips_chain_template` | 获取工具链模板 | `mcp_tool_chain` fact 模板 |
+| `lan_agent_rag_clips_meta` | 上游 RAG 元信息查询 | 上游 `/rag/clips/meta`（非本地规则） |
+| `lan_agent_rag_clips_run` | 上游 RAG 规则执行 | 上游 `/rag/clips/run`（非本地规则） |
+
+### 16.9 规则优先级模型
+
+CLIPS 使用 salience（整数，越大越优先）控制规则触发顺序。当前规则域的 salience 分布：
+
+```
+salience 95 ─ cmm_init_guard 核心block
+salience 89-85 ─ mcp_tool_guard block/route 主力规则
+salience 84-80 ─ mcp_tool_guard route 次要规则
+salience 70 ─ cxparser_preflight_guard block
+salience 60-55 ─ slice_ingest_guard 去重
+salience 50-33 ─ mcp_result_guard 完整性验证
+salience -100 ─ 所有域的 default-allow 兜底
+```
+
+> **设计原则**：block 规则 salience > route 规则 > default-allow。同一 fact 可被多条规则匹配，但 salience 最高的先触发；`default-*-allow`（salience -100）作为兜底，确保无规则匹配时默认放行（fail-open）。
+
+### 16.10 扩展与维护
+
+新增 CLIPS 规则的步骤：
+
+1. 在对应规则域 `.clp` 文件中添加 `defrule`，命名格式 `<action>-<target>-<condition>`
+2. 设置 salience：block 规则 85-95，route 规则 80-84，验证规则 33-50，default -100
+3. 规则体必须 `assert` 一个 `clips_decision` fact，包含 `domain` / `target` / `decision` / `verification` / `reason_code` / `next_action` / `matched_rule` 字段
+4. 如需新的 fact slot，在 [templates/mcp_fact_templates.clp](src/clips_rules/templates/mcp_fact_templates.clp) 的对应 `deftemplate` 中添加 slot（默认值 `"false"` 或 `""`）
+5. C++ 侧在 `McpToolDispatch.h` 或 `ClipsDecisionOperations.h` 中断言 fact 时填充新 slot
+6. 更新本节文档的规则表
+
+> **规则文件加载**：CLIPS 规则文件在 MCP 服务启动时由 C++ 侧批量加载（`BuildClipsDecisionResult` 等函数），规则文件路径相对于 `src/clips_rules/`。修改 `.clp` 文件后需重新编译（规则嵌入二进制）或重启服务（若从磁盘加载）。
