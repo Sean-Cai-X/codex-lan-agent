@@ -20,6 +20,7 @@
 12. [CMM 工具清单](#12-cmm-工具清单)
 13. [Clang 分析工具 vs CMM 工具功能对比](#13-clang-分析工具-vs-cmm-工具功能对比)
 14. [常见问题排查](#14-常见问题排查)
+15. [项目演进分析报告（8月9日 → 8月11日）](#15-项目演进分析报告8月9日--8月11日)
 
 ---
 
@@ -1937,3 +1938,246 @@ cmake --build AIbuild
 2. 重新执行 `rocksdb_mirror` 同步到 RocksDB。
 3. 再次 `rocksdb_parity_check`，应返回 `parity_status=pass`。
 4. **切勿**通过修改源真来"迁就"镜像 —— `safe_to_replace_source_of_truth` 必须保持 `false`。
+
+
+---
+
+## 15. 项目演进分析报告（8月9日 → 8月11日）
+
+> 本节为 2026-08-09 → 2026-08-11 期间 4 个提交的对比分析快照，记录项目从"代码分析 MCP 工具链"演变为"AI Agent 本地操作系统"的架构级变化，供后续维护与架构决策参考。
+
+### 15.1 核心变化总览
+
+两天内 4 个提交，但**架构层面发生了根本性演进**——从"代码分析 MCP 工具链"演变为**完整的 AI Agent 执行平台**。
+
+| 维度 | 8月9日状态 | 8月11日状态 | 变化性质 |
+|---|---|---|---|
+| MCP 工具表面 | 30+ 扁平工具列表 | 单网关路由 + 100+ 隐藏内部工具 | **架构重构** |
+| Task Memory | 12 工具，多步手动编排 | 14 工具，新增一键续接入口 | **能力增强** |
+| CLIPS 专家系统 | 隐藏层，源码存在但未暴露 | 正式 MCP 工具，可调用决策 | **从暗到明** |
+| 执行能力 | 只读代码分析 | 可执行构建/测试/文件编辑/格式化 | **边界扩展** |
+| CI/CD | 无公开流水线 | 两层缓存全自动 Release 流水线 | **工程化落地** |
+| 文档 | 工具参数说明 | 新增真实使用对话案例 | **可用性提升** |
+
+### 15.2 架构级变化：MCP 网关路由模式
+
+#### 15.2.1 默认只暴露一个工具
+
+`McpProtocolOperations.h` 中新增了 `UseFullMcpToolSurface()` 控制逻辑：
+
+```cpp
+// 默认返回 false，只暴露 lan_agent_mcp_route
+// 需要环境变量 CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full/all/legacy/153 才暴露全部工具
+```
+
+**默认工具**：`lan_agent_mcp_route`——单聊天入口网关，支持三种模式：
+
+- `mode=overview`：返回指导信息
+- `mode=route`：返回 `tool_use_decision` / `current_tool_chain_node` / `required_tool_name` / `required_tool_arguments_json`
+- `mode=call`：执行一个内部 MCP 工具，完整内部目录对模型隐藏
+
+#### 15.2.2 设计意图
+
+这是从"模型自由选择 30+ 工具"到"网关决策 + 受控执行"的关键转变：
+
+- **降低模型认知负担**：模型只看到一个工具，不需要理解 100+ 工具的 schema
+- **强制决策层**：所有工具调用必须经过路由决策，可插入 CLIPS 规则校验
+- **隐藏内部复杂度**：内部工具链对模型不可见，只暴露决策结果
+- **完成声明门禁**：`terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` 四个字段控制模型能否宣布任务完成
+
+### 15.3 Task Memory 新增工具
+
+#### 15.3.1 `lan_agent_task_memory_resume_and_execute`（第 13 工具）
+
+**本次更新最有价值的新增**。
+
+```
+新对话一键入口：
+  读取 latest_resume_context → 执行 bounded continuation budget → 刷新 task memory
+  → 返回 terminal verification fields 或 next action
+```
+
+关键设计：
+
+- 默认 `dry_run=false` / `execute=true`（与其他工具默认 `dry_run=true` 相反）
+- 不需要模型手动编排 freeze → budget → kv → mirror 链路
+- 全新模型只需传 `goal_id` 即可续接已归档任务
+- 直接替代"重新读取旧对话历史"的传统做法
+
+#### 15.3.2 `lan_agent_task_memory_new_chat_round_selftest`（第 14 工具）
+
+自测工具，验证 MCP-owned continuation semantics：
+
+- 创建 MCP round manifest
+- freeze 一个微型归档续接
+- 通过 `resume_and_execute` 使用 goal_id-only 入口语义恢复
+- 执行 bounded step
+- 验证 `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok`
+- **不依赖旧模型上下文**，`chat_context_reset_acknowledged` 保持 false 直到客户端确认
+
+#### 15.3.3 Task Memory 演进路径
+
+```
+8月9日：freeze → resume → budget → kv_snapshot → rocksdb_mirror → parity → manifest → acceptance
+         （8 步手动编排，模型需要理解每一步）
+
+8月11日：resume_and_execute(goal_id) → 一键完成上述链路
+         （模型只需知道 goal_id，内部链路由 MCP 服务端自动执行）
+```
+
+### 15.4 CLIPS 专家系统正式暴露
+
+上次分析中 CLIPS 是"隐藏的第五层"——源码存在但 README 未提及。现已正式暴露为 MCP 工具：
+
+| 工具 | 功能 |
+|---|---|
+| `lan_agent_clips_decide` | 基于规则的决策逻辑，输入 MCP request/result facts，返回 allow/block/route + verified/not_verified + 最终答案约束 |
+| `lan_agent_clips_chain_template` | 返回标准 CLIPS `mcp_tool_chain` 模板，每个工具共享规则驱动的 pre-call/post-result 链 |
+| `lan_agent_rag_clips_meta` | 调用上游 `/rag/clips/meta`，返回 fact_bundle + serialized_assertions |
+| `lan_agent_rag_clips_run` | 调用上游 `/rag/clips/run`，返回 request_id/trace_id/query_id + 存储引用 |
+
+**意义**：CLIPS 不再是"预留接口"，而是已经成为**工具调用决策的规则引擎**——在文件操作、长循环、构建、测试、结果验收之前，先经过 CLIPS 规则校验。
+
+### 15.5 执行能力边界扩展
+
+#### 15.5.1 从只读分析到可执行操作
+
+新增完整的执行工具链。
+
+**构建/测试**：
+
+- `lan_agent_configure_project`：CMake 配置
+- `lan_agent_build_target`：构建目标（需 preflight_ref）
+- `lan_agent_run_ctest_target`：运行 CTest
+- `lan_agent_preflight_build_target` / `preflight_run_ctest_target`：预检契约
+- `lan_agent_discover_ctest_tests`：CTest 发现
+- `lan_agent_prepare_build_dir` / `check_build_dir`
+
+**文件编辑（安全受控）**：
+
+- `lan_agent_write_text_file`：创建/覆盖/追加文本文件
+- `lan_agent_preview_patch`：高风险单文件替换预览（不写盘）
+- `lan_agent_apply_single_file_patch` / `apply_diff_patch`：应用补丁
+- `lan_agent_verify_single_file_patch`：验证补丁结果（hash + 包含/排除文本检查）
+- `lan_agent_revert_single_file_patch`：回滚补丁
+- `lan_agent_format_code_file`：clang-format 格式化（支持 dry_run）
+- `lan_agent_ensure_directory`：目录创建
+
+**编辑安全约束**：
+
+- 明确禁止用 patch 工具做注释清理/文本清理
+- 必须用 `scan_text_ranges(max_ranges_per_call=1)` → `prepare_edit_windows(max_windows_per_call=1)` → 一次原子编辑
+- 完整审计链：preview → apply → verify → revert，每个 patch_id 可追溯
+
+#### 15.5.2 本地模型/RAG 集成
+
+- `lan_agent_run_local_chat` / `enqueue_local_chat`：项目范围代码分析
+- `lan_agent_run_rag_flow` / `enqueue_rag_flow`：RAG 生成请求
+- `lan_agent_ventriloquist_reply`：受控本地 AI 代理回复，归一化为 direct_answer/evidence/next_action/confidence
+- `lan_agent_remote_session_new_turn` / `append_turn`：llama.cpp 远程会话管理
+- `llama.observer_smoke`：观察 CODEX → local MCP → local llama.cpp 链路
+
+### 15.6 CI/CD 工程化落地
+
+#### 15.6.1 两层缓存架构
+
+```
+Layer 1 · LLVM/Clang 18.1.8 toolchain（缓存持久化）
+  ├─ 从官方源码 llvmorg-18.1.8 构建
+  ├─ 静态库，X86 target only，关闭 tests/examples/benchmarks/docs/tools
+  ├─ 缓存 key: llvm-18.1.8-static-flat-msvc-ninja-v3
+  ├─ 仅当 LLVM 版本/源码/编译标志变化时重建
+  └─ save-always: 即使后续步骤失败也保存缓存
+
+Layer 2 · codex_lan_agent 业务构建（增量编译）
+  ├─ 恢复缓存的 flat LLVM_ROOT {include, lib}
+  ├─ 业务源码变化只编译 codex_lan_agent，不触发 LLVM 重编译
+  ├─ 默认启用 CODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
+  └─ 默认启用 CODEX_LAN_AGENT_WITH_ROCKSDB=ON
+```
+
+#### 15.6.2 新增 RocksDB 11.0.4 静态构建
+
+- 缓存 key：`rocksdb-11.0.4-static-msvc-md-v1`
+- 从官方 release tarball 构建，关闭所有可选压缩依赖（snappy/lz4/zlib/zstd/bzip2/tbb）
+- `/MD` CRT 匹配，静态库
+- Release 构建默认启用 RocksDB，`task_memory_rocksdb_mirror/lookup/parity_check` 工具可用
+
+#### 15.6.3 纯网络构建策略
+
+- **不 vendor 任何第三方库**：LLVM 和 RocksDB 都从网络下载构建
+- Release ZIP 只包含 `codex_lan_agent.exe` + config + README，无 `.lib`/`.dll`
+- `.gitignore` 白名单：只允许 `CMakeLists.txt` / `src/**` / `.github/workflows/**`
+- 禁止 `*.exe *.dll *.lib *.obj *.o *.a` / 图片 / 归档 / `third_party/` / `vendor/`
+
+### 15.7 语义动作调度层
+
+新增完整的语义动作抽象层，把自然语言意图映射到工具调用：
+
+| 工具 | 功能 |
+|---|---|
+| `semantic_action_map` | 标准语义动作快捷方式表 |
+| `semantic_action_resolve` | 自然语言 → 语义动作（不执行） |
+| `semantic_action_validate` | 验证参数和副作用风险（不执行） |
+| `semantic_action_prepare` | resolve + validate 一次性预检 |
+| `semantic_action_tool_call` | 生成非执行的 MCP tools/call JSON 模板 |
+| `lan_agent_execute_semantic_action` | 解析并立即执行真实工具，返回 task_id/result_ref/evidence_ref |
+
+配合 `intent_dispatch_prepare`——消费结构化模型意图输出，自动准备下一个 MCP 工具调用，支持 legacy fallback。
+
+### 15.8 与 research-mcp 体系的契合度更新
+
+上次分析指出两个项目"高度契合"，现在契合度进一步提升：
+
+| 设计原则 | research-mcp | codex-lan-agent（更新后） |
+|---|---|---|
+| 协议层 | MCP over HTTP/stdio | MCP over Streamable HTTP + 网关路由 |
+| 分层架构 | L1/L2/L3 三层观测 | 网关路由 + 100+ 内部工具 + CLIPS 决策层 |
+| 缓存/持久化 | SQLite 统一缓存层 | 文件对象层 + RocksDB 镜像 + parity check |
+| 源真分离 | 多源融合 + 降级链 | 文件源真 + RocksDB 镜像 + parity check |
+| 实体/关系 | Entity Mapper + 关系图谱 | Semantic Grid + dialog_slice + task_memory |
+| CI/CD | GitHub Actions 云端编译 | 两层缓存全自动 Release 流水线 |
+| 决策层 | （尚未实现） | CLIPS 专家系统正式暴露 |
+| 执行能力 | 只读信息获取 | 只读分析 + 可执行构建/测试/编辑 |
+
+**潜在整合方向**：
+
+1. `resume_and_execute` 模式可以直接复用到 research-mcp 的长任务续接
+2. CLIPS 决策层可以统一两个项目的工具调用决策
+3. 网关路由模式（单入口 + 隐藏内部工具）可以作为 research-mcp 的演进方向
+4. 两层缓存 CI 架构可以直接复用到 research-mcp 的 Release 流水线
+
+### 15.9 技术债务
+
+#### 15.9.1 已有问题持续存在
+
+- 硬编码路径：`TaskMemoryOperations.h` 中仍有 `D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/...`
+- Windows 优先：WinHTTP + MSVC + WebView2
+- DFG 性能瓶颈：复杂文件 180-300s
+
+#### 15.9.2 新增隐忧
+
+1. **工具数量爆炸**：完整模式下 100+ 工具，维护成本急剧上升
+2. **网关路由黑盒**：默认模式下模型只看到一个工具，调试难度增加
+3. **CLIPS 规则未开源**：`clips_rules/` 目录存在但规则内容未在 README 中说明
+4. **执行安全边界**：新增文件编辑/构建/测试能力，但安全约束分散在各工具描述中，缺乏统一的权限模型
+5. **README 滞后风险**：工具表需要持续同步实际注册的工具数量与命名
+
+### 15.10 结论
+
+#### 15.10.1 演进判断
+
+`codex-lan-agent` 正在从**"代码理解基础设施"**快速演变为**"AI Agent 本地操作系统"**。
+
+核心标志：
+
+- **工具表面收敛**：30+ 扁平 → 单网关路由，模型认知负担降低
+- **执行闭环形成**：分析 → 决策（CLIPS）→ 执行（构建/测试/编辑）→ 验证 → 记忆（Task Memory）
+- **长任务自动化**：`resume_and_execute` 一键续接，模型无需理解内部链路
+- **工程化成熟**：两层缓存 CI，纯网络构建，Release 可直接下载使用
+
+#### 15.10.2 最有价值的三个变化
+
+1. **`resume_and_execute`**：把 Task Memory 从"多步手动编排"简化为"一键自动续接"，这是长任务记忆从概念验证到实用化的关键一步
+2. **网关路由模式**：单入口 + 隐藏内部工具 + CLIPS 决策校验，这是 AI Agent 工具调用从"模型自由选择"到"受控决策执行"的架构范式转变
+3. **两层缓存 CI**：LLVM 工具链与业务构建解耦，业务源码变化不触发 LLVM 重编译，Release 构建时间从 ~2 小时降到 ~分钟级
