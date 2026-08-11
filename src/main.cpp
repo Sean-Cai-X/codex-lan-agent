@@ -1845,6 +1845,7 @@ std::string BuildTaskMemoryRunnerAppendParamsJson(
         << "\"has_more\":" << (has_more ? "true" : "false") << ","
         << "\"terminal_state\":" << (terminal_state ? "true" : "false") << ","
         << "\"completion_claim_allowed\":" << (completion_claim_allowed ? "true" : "false") << ","
+        << "\"verification_ok\":" << (TaskMemoryRunnerBoolField(step_result, "verification_ok", false) ? "true" : "false") << ","
         << "\"compact_summary\":\"" << codex_lan_agent::JsonEscape(summary) << "\","
         << "\"remaining_work\":\"" << codex_lan_agent::JsonEscape(remaining_work) << "\""
         << "}";
@@ -1957,8 +1958,10 @@ void AttachDirectoryCommentCleanupContinuationFactsForBudget(
 CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
     const AgentConfig & config,
     const JsonRequestView & params) {
-    const bool dry_run = params.GetBool("dry_run", true);
     const bool execute = params.GetBool("execute", false);
+    const bool dry_run = execute && Trim(params.GetRawJson("dry_run")).empty() && Trim(params.GetString("dry_run")).empty()
+        ? false
+        : params.GetBool("dry_run", true);
     if (!execute || dry_run) {
         return codex_lan_agent::BuildTaskMemoryExecuteContinuationBudgetResult(config, params);
     }

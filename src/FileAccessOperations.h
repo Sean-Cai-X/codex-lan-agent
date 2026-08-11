@@ -103,7 +103,8 @@ std::string ReadCodeFilePathFromDirectoryManifest(
     if (Trim(directory_manifest_path).empty() || code_file_index < 0) {
         return std::string();
     }
-    std::ifstream input(std::filesystem::path(directory_manifest_path));
+    std::ifstream input;
+    input.open(std::filesystem::path(directory_manifest_path), std::ios::in);
     if (!input.is_open()) {
         return std::string();
     }
@@ -4376,27 +4377,34 @@ CommandResult DeleteTextRangeWindowAtomicResult(
     if (window_ranges.empty()) {
         const int next_start_line = bounded_start_line + bounded_max_lines;
         const bool has_more_windows = next_start_line <= total_lines;
+        const bool directory_has_next_file =
+            !has_more_windows && !directory_next_probe_call_json.empty();
+        const bool needs_continue = has_more_windows || directory_has_next_file;
         result.ok = true;
         result.exit_code = 0;
-        result.fields["status"] = has_more_windows ? "needs_continue" : "success";
+        result.fields["status"] = needs_continue ? "needs_continue" : "success";
         result.fields["result"] = "no_text_range_in_window";
         result.fields["summary"] = has_more_windows
             ? "no matching text range in the current bounded window; task is not complete and must continue"
+            : directory_has_next_file
+            ? "no matching text range in the current file tail; directory cleanup must continue with the next code file"
             : "no matching text range in the current bounded window; reached the end of the file window scan";
         result.fields["write_applied"] = "false";
         result.fields["write_verified"] = "true";
         result.fields["disk_write_completed"] = "false";
-        result.fields["task_completion"] = has_more_windows ? "window_complete" : "complete";
-        result.fields["continue_required"] = has_more_windows ? "true" : "false";
+        result.fields["task_completion"] = has_more_windows ? "window_complete" : (directory_has_next_file ? "current_file_complete" : "complete");
+        result.fields["continue_required"] = needs_continue ? "true" : "false";
         result.fields["auto_continue_required"] = "false";
-        result.fields["has_more"] = has_more_windows ? "true" : "false";
-        result.fields["terminal_state"] = has_more_windows ? "false" : "true";
-        result.fields["task_done"] = has_more_windows ? "false" : "true";
-        result.fields["completion_claim_allowed"] = has_more_windows ? "false" : "true";
-        result.fields["must_continue_until"] = has_more_windows ? "has_more=false" : "";
+        result.fields["has_more"] = needs_continue ? "true" : "false";
+        result.fields["terminal_state"] = needs_continue ? "false" : "true";
+        result.fields["task_done"] = needs_continue ? "false" : "true";
+        result.fields["completion_claim_allowed"] = needs_continue ? "false" : "true";
+        result.fields["must_continue_until"] = has_more_windows ? "has_more=false" : (directory_has_next_file ? "directory_scope_complete" : "");
         result.fields["next_start_line"] = std::to_string(next_start_line);
         result.fields["next_action"] = has_more_windows
             ? "call lan_agent_delete_text_range_window_atomic again with next_start_line"
+            : directory_has_next_file
+            ? "tool_call_only: current file scan reached the end; probe the next directory code file"
             : "stop; reached the end of the file window scan";
         result.fields["next_call_json"] = has_more_windows
             ? BuildDeleteTextRangeWindowCallJson(
@@ -4407,7 +4415,17 @@ CommandResult DeleteTextRangeWindowAtomicResult(
                 primary_intent,
                 trace_id,
                 probe_ref)
-            : "";
+            : directory_next_probe_call_json;
+        if (directory_scope_active) {
+            result.fields["directory_next_file_index"] = directory_has_next_file ? std::to_string(next_directory_file_index) : "";
+            result.fields["directory_remaining_code_file_count"] = std::to_string(directory_remaining_after_current);
+            result.fields["directory_scope_incomplete"] = directory_has_next_file ? "true" : "false";
+            result.fields["directory_next_probe_call_json"] = directory_next_probe_call_json;
+        }
+        result.fields["required_tool_name"] = has_more_windows
+            ? "lan_agent_delete_text_range_window_atomic"
+            : (directory_has_next_file ? "lan_agent_probe_text_file" : "");
+        result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
         return result;
     }
 
@@ -4495,6 +4513,9 @@ CommandResult DeleteTextRangeWindowAtomicResult(
         next_start_line = earliest_remaining_start_line;
     }
     const bool has_more = !after_ranges.empty();
+    const bool directory_has_next_file_after_write =
+        !has_more && !directory_next_probe_call_json.empty();
+    const bool has_more_or_directory = has_more || directory_has_next_file_after_write;
 
     const std::string result_path = BuildTextRangeWindowDeletePath(config, trace_id, normalized.string());
     std::filesystem::create_directories(BuildTextRangeDeleteRoot(config));
@@ -4521,10 +4542,12 @@ CommandResult DeleteTextRangeWindowAtomicResult(
 
     result.ok = true;
     result.exit_code = 0;
-    result.fields["status"] = has_more ? "needs_continue" : "success";
+    result.fields["status"] = has_more_or_directory ? "needs_continue" : "success";
     result.fields["result"] = "delete_text_range_window_atomic_applied";
     result.fields["summary"] = has_more
         ? "deleted text ranges in one bounded line window and verified by readback; task is not complete and must continue"
+        : directory_has_next_file_after_write
+        ? "deleted text ranges in one bounded line window and verified by readback; current file is clean and directory cleanup must continue"
         : "deleted text ranges in one bounded line window and verified by readback; no matching text range remains";
     result.fields["deleted_range_count"] = std::to_string(window_ranges.size());
     result.fields["deleted_ranges_json"] = BuildDeletedRangeSummaryJsonArray(window_ranges);
@@ -4535,7 +4558,7 @@ CommandResult DeleteTextRangeWindowAtomicResult(
     result.fields["total_lines_after"] = std::to_string(total_lines_after);
     result.fields["total_range_count_after"] = std::to_string(after_ranges.size());
     result.fields["has_range_in_current_window_after"] = has_range_in_current_window_after ? "true" : "false";
-    result.fields["has_more"] = has_more ? "true" : "false";
+    result.fields["has_more"] = has_more_or_directory ? "true" : "false";
     result.fields["next_start_line"] = std::to_string(next_start_line);
     result.fields["write_applied"] = "true";
     result.fields["write_verified"] = verified_content == working_content ? "true" : "false";
@@ -4543,15 +4566,17 @@ CommandResult DeleteTextRangeWindowAtomicResult(
     result.fields["final_write_tool"] = "mcp_direct_text_range_window_delete";
     result.fields["verification_status"] = verified_content == working_content ? "verified" : "not_verified";
     result.fields["verification_ok"] = verified_content == working_content ? "true" : "false";
-    result.fields["task_completion"] = has_more ? "window_applied" : "complete";
-    result.fields["continue_required"] = has_more ? "true" : "false";
+    result.fields["task_completion"] = has_more ? "window_applied" : (directory_has_next_file_after_write ? "current_file_complete" : "complete");
+    result.fields["continue_required"] = has_more_or_directory ? "true" : "false";
     result.fields["auto_continue_required"] = "false";
-    result.fields["terminal_state"] = has_more ? "false" : "true";
-    result.fields["task_done"] = has_more ? "false" : "true";
-    result.fields["completion_claim_allowed"] = has_more ? "false" : "true";
-    result.fields["must_continue_until"] = has_more ? "has_more=false" : "";
+    result.fields["terminal_state"] = has_more_or_directory ? "false" : "true";
+    result.fields["task_done"] = has_more_or_directory ? "false" : "true";
+    result.fields["completion_claim_allowed"] = has_more_or_directory ? "false" : "true";
+    result.fields["must_continue_until"] = has_more ? "has_more=false" : (directory_has_next_file_after_write ? "directory_scope_complete" : "");
     result.fields["next_action"] = has_more
         ? "call lan_agent_delete_text_range_window_atomic again with next_start_line"
+        : directory_has_next_file_after_write
+        ? "tool_call_only: current file has no remaining comments; probe the next directory code file"
         : "stop; no matching comment range remains";
     result.fields["next_call_json"] = has_more
         ? BuildDeleteTextRangeWindowCallJson(
@@ -4562,7 +4587,17 @@ CommandResult DeleteTextRangeWindowAtomicResult(
             primary_intent,
             trace_id,
             probe_ref)
-        : "";
+        : directory_next_probe_call_json;
+    if (directory_scope_active) {
+        result.fields["directory_next_file_index"] = directory_has_next_file_after_write ? std::to_string(next_directory_file_index) : "";
+        result.fields["directory_remaining_code_file_count"] = std::to_string(directory_remaining_after_current);
+        result.fields["directory_scope_incomplete"] = directory_has_next_file_after_write ? "true" : "false";
+        result.fields["directory_next_probe_call_json"] = directory_next_probe_call_json;
+    }
+    result.fields["required_tool_name"] = has_more
+        ? "lan_agent_delete_text_range_window_atomic"
+        : (directory_has_next_file_after_write ? "lan_agent_probe_text_file" : "");
+    result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
     result.fields["result_ref"] = result_path;
     result.fields["evidence_ref"] = result_path;
     result.fields["content_payload_format"] = "json";
