@@ -854,6 +854,54 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "none"
         },
         {
+            "mcp_boundary_explore",
+            "Automatically explore CLIPS MCP guard boundary cases without mutating project files. Produces regression cases, summary, rule candidates, and a synthetic observer violation smoke.",
+            "lan_agent_mcp_boundary_explore",
+            "{\"out_dir\":\"optional output directory\",\"include_synthetic_flow\":\"optional bool default true\"}",
+            "{\"accepted\":\"true|false\",\"case_count\":\"integer\",\"fail_count\":\"integer\",\"boundary_summary_json_path\":\"non_empty\",\"rule_candidates_md_path\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_mcp_guard_regression_acceptance\",\"reason\":\"run full guard regression acceptance after boundary exploration\"}",
+            "[\"out_dir\",\"case_count\",\"pass_count\",\"fail_count\",\"accepted\",\"conclusion\",\"boundary_cases_jsonl_path\",\"boundary_summary_json_path\",\"rule_candidates_md_path\",\"synthetic_flow_violation_count\",\"synthetic_flow_state_dashboard_html_path\",\"result_ref\",\"evidence_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "mcp_flow_conformance_check",
+            "Check an MCP JSONL conversation against the fixed flow observer/template and report conformance plus violation artifacts. Analysis-only.",
+            "lan_agent_mcp_flow_conformance_check",
+            "{\"input_jsonl\":\"required path to llama.app/Codex conversation jsonl\",\"out_dir\":\"optional output directory\"}",
+            "{\"conformance_pass\":\"true|false\",\"violation_count\":\"integer\",\"flow_state_dashboard_html_path\":\"non_empty\"}",
+            "{\"tool\":\"lan_agent_mcp_flow_export\",\"reason\":\"export a human-readable HTML report when conformance fails\"}",
+            "[\"input_jsonl\",\"out_dir\",\"conformance_pass\",\"conclusion\",\"event_count\",\"tool_call_count\",\"tool_result_count\",\"violation_count\",\"completion_state\",\"current_node\",\"next_expected_node\",\"flow_events_jsonl_path\",\"flow_state_json_path\",\"flow_state_dashboard_html_path\",\"violations_md_path\",\"result_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "mcp_guard_regression_acceptance",
+            "Run the MCP guard regression suite: CLIPS boundary exploration plus optional JSONL flow conformance. This is the standard acceptance gate before solidifying a guard/flow rule family.",
+            "lan_agent_mcp_guard_regression_acceptance",
+            "{\"input_jsonl\":\"optional path to conversation jsonl\",\"out_dir\":\"optional output directory\"}",
+            "{\"accepted\":\"true|false\",\"conclusion\":\"MCP_GUARD_REGRESSION_ACCEPTED|MCP_GUARD_REGRESSION_HAS_GAPS\",\"boundary_fail_count\":\"integer\"}",
+            "{\"tool\":\"lan_agent_mcp_boundary_explore\",\"reason\":\"inspect boundary case details if acceptance has gaps\"}",
+            "[\"out_dir\",\"accepted\",\"conclusion\",\"boundary_case_count\",\"boundary_pass_count\",\"boundary_fail_count\",\"synthetic_flow_violation_count\",\"flow_conformance_pass\",\"flow_violation_count\",\"flow_state_dashboard_html_path\",\"boundary_summary_json_path\",\"boundary_cases_jsonl_path\",\"rule_candidates_md_path\",\"result_ref\",\"evidence_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
+            "flow_task_list",
+            "Generate the human-visible task list for a fixed MCP flow before executing the next tool step.",
+            "lan_agent_flow_task_list",
+            "{\"flow_id\":\"directory_comment_cleanup_bounded_window_v1\",\"goal_id\":\"optional string\",\"trace_id\":\"optional string\",\"directory_path\":\"required for directory cleanup\",\"current_task_id\":\"optional T1..T6\"}",
+            "{\"flow_task_list_path\":\"non_empty\",\"flow_task_list_md_path\":\"non_empty\",\"current_task_id\":\"T1..T6\",\"flow_task_count\":\"integer\"}",
+            "{\"tool\":\"lan_agent_mcp_route\",\"reason\":\"after reviewing the task list, route or execute the Ready task through the MCP gateway\"}",
+            "[\"flow_id\",\"goal_id\",\"trace_id\",\"current_task_id\",\"flow_task_count\",\"flow_task_list_path\",\"flow_task_list_md_path\",\"result_ref\",\"evidence_ref\",\"summary\"]",
+            "low",
+            "true",
+            "none"
+        },
+        {
             "inspect_rag_index_status",
             "Read upstream RAG bridge status through codex-lan-agent and explicitly surface whether clips_meta is supported or absent.",
             "lan_agent_rag_index_status",

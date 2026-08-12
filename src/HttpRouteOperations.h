@@ -11,6 +11,7 @@ CommandResult BuildCompatToolRouteResult(
         ApplyRequestRuleFields(tool_name, params, &result);
         LanResultBuilder(&result).Finalize(config, tool_name);
         ApplySupervisionEnvelope(&result);
+        PersistMcpPendingContinuation(config, tool_name, result);
         AppendMcpTraceAuditEvent(config, tool_name, result);
         AppendMcpSupervisionAlarmEvent(config, tool_name, result);
         return result;
@@ -23,6 +24,7 @@ CommandResult BuildCompatToolRouteResult(
         ApplyClipsResultGuard(config, tool_name, &result);
         ApplyClipsSemanticTraceContinuation(config, &result);
         ApplySupervisionEnvelope(&result);
+        PersistMcpPendingContinuation(config, tool_name, result);
         AppendMcpTraceAuditEvent(config, tool_name, result);
         AppendMcpSupervisionAlarmEvent(config, tool_name, result);
         return result;
@@ -60,6 +62,7 @@ CommandResult BuildCompatToolRouteResult(
     ApplyClipsResultGuard(config, tool_name, &result);
     ApplyClipsSemanticTraceContinuation(config, &result);
     ApplySupervisionEnvelope(&result);
+    PersistMcpPendingContinuation(config, tool_name, result);
     AppendMcpTraceAuditEvent(config, tool_name, result);
     AppendMcpSupervisionAlarmEvent(config, tool_name, result);
     return result;

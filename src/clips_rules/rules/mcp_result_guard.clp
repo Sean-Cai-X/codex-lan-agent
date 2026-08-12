@@ -173,6 +173,38 @@
     (route_target ?tool)
     (matched_rule "non-terminal-result-forbids-final-answer"))))
 
+(defrule flow-task-list-required-forbids-final-answer
+  (declare (salience 54))
+  (mcp_tool_result (tool_name ?tool)
+                   (flow_task_list_required "true")
+                   (flow_current_task_id ?current&:(neq ?current "T6"))
+                   (completion_claim_allowed "false"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "flow_task_list_not_terminal")
+    (next_action "tool_call_only: fixed flow task list is not at T6; execute the declared required_tool_arguments_json before any completion claim")
+    (route_target ?tool)
+    (matched_rule "flow-task-list-required-forbids-final-answer"))))
+
+(defrule route-result-without-resolved-tool-forbids-final-answer
+  (declare (salience 53))
+  (mcp_tool_result (tool_name "lan_agent_mcp_route")
+                   (tool_use_decision "no_tool_resolved"))
+  =>
+  (assert (clips_decision
+    (domain "mcp_result_guard")
+    (target "lan_agent_mcp_route")
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "route_no_tool_resolved_not_terminal")
+    (next_action "tool_call_only: route did not resolve an executable internal tool; provide concrete file_path/directory_path and primary_intent, or restart from lan_agent_mcp_route with an explicit routeable request before any completion claim")
+    (route_target "lan_agent_mcp_route")
+    (matched_rule "route-result-without-resolved-tool-forbids-final-answer"))))
+
 (defrule directory-list-result-requires-declared-continuation
   (declare (salience 52))
   (mcp_tool_result (tool_name "lan_agent_list_directory")

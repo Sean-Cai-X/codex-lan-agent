@@ -466,7 +466,11 @@ std::string ExtractMcpRouteWindowsPathFromText(const std::string & text) {
 std::string InferMcpRoutePrimaryIntent(
     const std::string & primary_intent,
     const std::string & request_text) {
-    const std::string normalized = NormalizeMcpPrimaryIntentForClips(primary_intent);
+    const std::string normalized =
+        codex_lan_agent::InferIntentBySemanticLexicon(primary_intent, request_text);
+    if (normalized == "comment_cleanup" || normalized == "code_format" || normalized == "source_edit") {
+        return normalized;
+    }
     const std::string lowered_intent = ToLowerAscii(Trim(normalized));
     const std::string lowered_request = ToLowerAscii(request_text);
     const bool mentions_source_file =
@@ -489,15 +493,12 @@ std::string InferMcpRoutePrimaryIntent(
         || lowered_request.find("comment") != std::string::npos
         || (lowered_intent.find("cleanup") != std::string::npos
             && mentions_source_file)
-        || ((lowered_intent == "file_modification"
-                || lowered_intent == "file modification"
-                || lowered_intent == "source_edit"
-                || lowered_intent == "source edit")
-            && mentions_source_file
-            && has_non_ascii_or_lossy_action_text)
         || request_text.find("\xE6\xB3\xA8") != std::string::npos
         || request_text.find("\xE6\xB3\xA8\xE9\x87\x8A") != std::string::npos
-        || request_text.find("注释") != std::string::npos;
+        || request_text.find("注释") != std::string::npos
+        || lowered_request.find("\\u6ce8") != std::string::npos
+        || lowered_request.find("\\u91ca") != std::string::npos
+        || lowered_request.find("\\u6ce8\\u91ca") != std::string::npos;
     if (mentions_comment) {
         return "comment_cleanup";
     }
@@ -540,6 +541,316 @@ bool McpRoutePathIsDirectory(const std::string & file_path) {
     }
     std::error_code ec;
     return std::filesystem::is_directory(std::filesystem::path(file_path), ec) && !ec;
+}
+
+struct McpBoundaryCase {
+    std::string case_id;
+    std::string purpose;
+    std::string params_json;
+    std::string expected_decision;
+    std::string expected_reason_code;
+};
+
+std::string McpBoundaryJsonStringField(const std::string & key, const std::string & value) {
+    return "\"" + codex_lan_agent::JsonEscape(key) + "\":\"" + codex_lan_agent::JsonEscape(value) + "\"";
+}
+
+std::vector<McpBoundaryCase> BuildDefaultMcpBoundaryCases() {
+    return {
+        {
+            "route_no_tool_resolved",
+            "Gateway route failed to resolve an executable tool; final answer must be blocked.",
+            "{\"decision_domain\":\"mcp_result_guard\",\"tool_name\":\"lan_agent_mcp_route\","
+            "\"tool_use_decision\":\"no_tool_resolved\",\"result_hash\":\"case-route-no-tool\","
+            "\"schema_version\":\"mcp_result_schema_v1\"}",
+            "route",
+            "route_no_tool_resolved_not_terminal"
+        },
+        {
+            "non_terminal_completion_gate",
+            "A non-terminal result with completion_claim_allowed=false cannot enter assistant text.",
+            "{\"decision_domain\":\"mcp_result_guard\",\"tool_name\":\"lan_agent_mcp_route\","
+            "\"terminal_state\":\"false\",\"completion_claim_allowed\":\"false\","
+            "\"result_hash\":\"case-non-terminal\",\"schema_version\":\"mcp_result_schema_v1\"}",
+            "route",
+            "non_terminal_result_forbids_final_answer"
+        },
+        {
+            "delete_has_more",
+            "Window deletion with has_more=true must continue through the delete loop.",
+            "{\"decision_domain\":\"mcp_result_guard\",\"tool_name\":\"lan_agent_delete_text_range_window_atomic\","
+            "\"has_more\":\"true\",\"result_hash\":\"case-delete-has-more\","
+            "\"schema_version\":\"mcp_result_schema_v1\"}",
+            "route",
+            "text_range_delete_incomplete"
+        },
+        {
+            "directory_remaining_forbid_terminal",
+            "Directory-scope cleanup cannot be terminal while remaining files are recorded.",
+            "{\"decision_domain\":\"mcp_result_guard\",\"tool_name\":\"lan_agent_delete_text_range_window_atomic\","
+            "\"directory_scope_active\":\"true\",\"terminal_state\":\"true\","
+            "\"directory_remaining_code_file_count\":\"2\",\"result_hash\":\"case-directory-remaining\","
+            "\"schema_version\":\"mcp_result_schema_v1\"}",
+            "route",
+            "directory_scope_remaining_files_forbid_terminal"
+        },
+        {
+            "declared_next_call_requires_continuation",
+            "A result that declares next_call_json must not be summarized before that continuation runs.",
+            "{\"decision_domain\":\"mcp_result_guard\",\"tool_name\":\"lan_agent_probe_text_file\","
+            "\"next_call_json\":\"{\\\"name\\\":\\\"lan_agent_delete_text_range_window_atomic\\\",\\\"arguments\\\":{}}\","
+            "\"result_hash\":\"case-next-call\",\"schema_version\":\"mcp_result_schema_v1\"}",
+            "route",
+            "declared_next_call_requires_continuation"
+        },
+        {
+            "final_answer_disallowed",
+            "Any result with final_answer_allowed=false must be blocked from assistant completion.",
+            "{\"decision_domain\":\"mcp_result_guard\",\"tool_name\":\"lan_agent_mcp_route\","
+            "\"final_answer_allowed\":\"false\",\"result_hash\":\"case-final-disallowed\","
+            "\"schema_version\":\"mcp_result_schema_v1\"}",
+            "route",
+            "final_answer_disallowed_by_result"
+        },
+        {
+            "pending_continuation_matching_tool_allows",
+            "A pending continuation must not block the exact expected next tool.",
+            "{\"decision_domain\":\"mcp_tool_guard\",\"tool_name\":\"lan_agent_probe_text_file\","
+            "\"file_path\":\"D:\\\\Codex-WorkDir\\\\Sean_WorkDir\\\\codex-lan-agent\\\\logs\\\\boundary\\\\one.cpp\","
+            "\"primary_intent\":\"comment_cleanup\",\"trace_id\":\"case-pending-match\","
+            "\"pending_continuation_active\":true,"
+            "\"pending_required_tool\":\"lan_agent_probe_text_file\","
+            "\"pending_required_arguments_json\":\"{\\\"name\\\":\\\"lan_agent_probe_text_file\\\",\\\"arguments\\\":{\\\"trace_id\\\":\\\"case-pending-match\\\"}}\","
+            "\"pending_trace_id\":\"case-pending-match\",\"pending_goal_id\":\"case-pending-match\"}",
+            "allow",
+            ""
+        },
+        {
+            "pending_continuation_wrong_tool_reroutes",
+            "A pending continuation must reroute any different tool before execution.",
+            "{\"decision_domain\":\"mcp_tool_guard\",\"tool_name\":\"lan_agent_delete_text_range_window_atomic\","
+            "\"file_path\":\"D:\\\\Codex-WorkDir\\\\Sean_WorkDir\\\\codex-lan-agent\\\\logs\\\\boundary\\\\one.cpp\","
+            "\"primary_intent\":\"comment_cleanup\",\"trace_id\":\"case-pending-mismatch\","
+            "\"pending_continuation_active\":true,"
+            "\"pending_required_tool\":\"lan_agent_task_memory_freeze\","
+            "\"pending_required_arguments_json\":\"{\\\"name\\\":\\\"lan_agent_task_memory_freeze\\\",\\\"arguments\\\":{\\\"goal_id\\\":\\\"case-pending-mismatch\\\"}}\","
+            "\"pending_trace_id\":\"case-pending-mismatch\",\"pending_goal_id\":\"case-pending-mismatch\"}",
+            "route",
+            "pending_continuation_mismatch"
+        }
+    };
+}
+
+std::string BuildSyntheticNoToolResolvedJsonl() {
+    const std::string tool_content =
+        "ok=false\n"
+        "status=failed\n"
+        "exit_code=68\n"
+        "summary=mcp gateway route returned\n"
+        "tool_name=lan_agent_mcp_route\n"
+        "result=clips_decision_completed\n"
+        "error=NEXT_CALL_JSON_MISSING\n"
+        "mcp_route_mode=route\n"
+        "tool_use_decision=no_tool_resolved\n"
+        "continue_required=true\n"
+        "current_tool_chain_node=route_decision\n"
+        "chain_state=needs_user_or_route_detail\n"
+        "semantic_model_clamp=supervision_alarm\n"
+        "assistant_response_allowed=false\n"
+        "terminal_state=false\n"
+        "completion_claim_allowed=false\n"
+        "final_answer_allowed=false\n"
+        "verification_ok=false\n";
+    std::ostringstream jsonl;
+    jsonl << "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"\","
+          << "\"id\":\"a1\",\"toolCalls\":[{\"id\":\"tc1\",\"type\":\"function\",\"function\":{\"name\":\"lan_agent_mcp_route\","
+          << "\"arguments\":\"{\\\"request_text\\\":\\\"please continue previous files\\\"}\"}}]}}\n";
+    jsonl << "{\"type\":\"message\",\"message\":{\"role\":\"tool\",\"content\":\""
+          << codex_lan_agent::JsonEscape(tool_content)
+          << "\",\"toolCallId\":\"tc1\",\"id\":\"t1\"}}\n";
+    jsonl << "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"我已经开始处理这些文件。\","
+          << "\"id\":\"a2\",\"parent\":\"t1\"}}\n";
+    return jsonl.str();
+}
+
+CommandResult BuildMcpBoundaryExploreResult(
+    const AgentConfig & config,
+    const std::string & out_dir,
+    bool include_synthetic_flow) {
+    CommandResult result;
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["provider_id"] = "codex-lan-agent";
+    result.fields["capability_id"] = "mcp_boundary_explore";
+    result.fields["status"] = "success";
+    result.fields["result"] = "mcp_boundary_explored";
+    const std::filesystem::path output_dir =
+        codex_lan_agent::FlowObsDefaultOutRoot(config, "mcp_boundary_explore", out_dir);
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    if (ec) {
+        result.ok = false;
+        result.exit_code = 1;
+        result.fields["status"] = "failed";
+        result.fields["error"] = "failed to create output directory";
+        result.fields["error_message"] = ec.message();
+        return result;
+    }
+
+    const std::filesystem::path cases_path = output_dir / "boundary_cases.jsonl";
+    const std::filesystem::path summary_path = output_dir / "boundary_summary.json";
+    const std::filesystem::path candidates_path = output_dir / "rule_candidates.md";
+    std::ofstream cases(cases_path, std::ios::binary);
+    int case_count = 0;
+    int pass_count = 0;
+    int fail_count = 0;
+    std::ostringstream candidate_md;
+    candidate_md << "# MCP Boundary Rule Candidates\n\n";
+    candidate_md << "Generated by lan_agent_mcp_boundary_explore. C++ produced facts and invoked CLIPS; CLIPS made guard decisions.\n\n";
+
+    for (const McpBoundaryCase & test_case : BuildDefaultMcpBoundaryCases()) {
+        JsonRequestView params(test_case.params_json);
+        CommandResult decision = BuildClipsDecisionResult(config, params);
+        const std::string actual_decision = codex_lan_agent::FlowObsField(decision, "decision");
+        const std::string actual_reason = codex_lan_agent::FlowObsField(decision, "reason_code");
+        const bool passed =
+            actual_decision == test_case.expected_decision
+            && actual_reason == test_case.expected_reason_code;
+        ++case_count;
+        if (passed) {
+            ++pass_count;
+        } else {
+            ++fail_count;
+            candidate_md << "## " << test_case.case_id << "\n\n"
+                         << "- Expected: `" << test_case.expected_decision << "` / `"
+                         << test_case.expected_reason_code << "`\n"
+                         << "- Actual: `" << actual_decision << "` / `" << actual_reason << "`\n"
+                         << "- Candidate action: add or adjust CLIPS rule in `mcp_result_guard.clp`.\n\n";
+        }
+        if (cases.is_open()) {
+            cases << "{"
+                  << McpBoundaryJsonStringField("case_id", test_case.case_id) << ","
+                  << McpBoundaryJsonStringField("purpose", test_case.purpose) << ","
+                  << McpBoundaryJsonStringField("expected_decision", test_case.expected_decision) << ","
+                  << McpBoundaryJsonStringField("expected_reason_code", test_case.expected_reason_code) << ","
+                  << McpBoundaryJsonStringField("actual_decision", actual_decision) << ","
+                  << McpBoundaryJsonStringField("actual_reason_code", actual_reason) << ","
+                  << McpBoundaryJsonStringField("matched_rule", codex_lan_agent::FlowObsField(decision, "matched_rule")) << ","
+                  << "\"passed\":" << (passed ? "true" : "false")
+                  << "}\n";
+        }
+    }
+    if (fail_count == 0) {
+        candidate_md << "No new rule candidates. All boundary cases are guarded by existing CLIPS rules.\n";
+    }
+
+    int synthetic_violation_count = -1;
+    std::filesystem::path synthetic_flow_dir;
+    if (include_synthetic_flow) {
+        const std::filesystem::path synthetic_jsonl_path = output_dir / "synthetic_no_tool_resolved.jsonl";
+        codex_lan_agent::FlowObsWriteTextFile(synthetic_jsonl_path, BuildSyntheticNoToolResolvedJsonl());
+        synthetic_flow_dir = output_dir / "synthetic_flow";
+        CommandResult flow = codex_lan_agent::BuildMcpFlowVisualizeResult(
+            config,
+            synthetic_jsonl_path.string(),
+            synthetic_flow_dir.string());
+        synthetic_violation_count =
+            codex_lan_agent::FlowObsExtractJsonInt(
+                codex_lan_agent::FlowObsField(flow, "script_stdout_json"),
+                "violation_count",
+                -1);
+        result.fields["synthetic_jsonl_path"] = synthetic_jsonl_path.string();
+        result.fields["synthetic_flow_status"] = codex_lan_agent::FlowObsField(flow, "status");
+        result.fields["synthetic_flow_completion_state"] = codex_lan_agent::FlowObsField(flow, "completion_state");
+        result.fields["synthetic_flow_violation_count"] = std::to_string(synthetic_violation_count);
+        result.fields["synthetic_flow_state_dashboard_html_path"] =
+            (synthetic_flow_dir / "flow_state_dashboard.html").string();
+    }
+
+    const bool synthetic_ok = !include_synthetic_flow || synthetic_violation_count > 0;
+    const bool accepted = fail_count == 0 && synthetic_ok;
+    std::ostringstream summary;
+    summary << "{\n"
+            << "  \"status\":\"success\",\n"
+            << "  \"accepted\":" << (accepted ? "true" : "false") << ",\n"
+            << "  \"case_count\":" << case_count << ",\n"
+            << "  \"pass_count\":" << pass_count << ",\n"
+            << "  \"fail_count\":" << fail_count << ",\n"
+            << "  \"synthetic_violation_count\":" << synthetic_violation_count << ",\n"
+            << "  \"conclusion\":\"" << (accepted ? "MCP_BOUNDARY_EXPLORATION_ACCEPTED" : "MCP_BOUNDARY_EXPLORATION_HAS_GAPS") << "\"\n"
+            << "}\n";
+    codex_lan_agent::FlowObsWriteTextFile(summary_path, summary.str());
+    codex_lan_agent::FlowObsWriteTextFile(candidates_path, candidate_md.str());
+
+    result.fields["out_dir"] = output_dir.string();
+    result.fields["boundary_cases_jsonl_path"] = cases_path.string();
+    result.fields["boundary_summary_json_path"] = summary_path.string();
+    result.fields["rule_candidates_md_path"] = candidates_path.string();
+    result.fields["case_count"] = std::to_string(case_count);
+    result.fields["pass_count"] = std::to_string(pass_count);
+    result.fields["fail_count"] = std::to_string(fail_count);
+    result.fields["accepted"] = accepted ? "true" : "false";
+    result.fields["conclusion"] =
+        accepted ? "MCP_BOUNDARY_EXPLORATION_ACCEPTED" : "MCP_BOUNDARY_EXPLORATION_HAS_GAPS";
+    result.fields["summary"] = accepted
+        ? "MCP boundary exploration passed"
+        : "MCP boundary exploration found guard gaps";
+    result.fields["result_ref"] = summary_path.string();
+    result.fields["evidence_ref"] = cases_path.string();
+    return result;
+}
+
+CommandResult BuildMcpGuardRegressionAcceptanceResult(
+    const AgentConfig & config,
+    const std::string & input_jsonl,
+    const std::string & out_dir) {
+    const std::filesystem::path output_dir =
+        codex_lan_agent::FlowObsDefaultOutRoot(config, "mcp_guard_regression_acceptance", out_dir);
+    CommandResult boundary = BuildMcpBoundaryExploreResult(config, (output_dir / "boundary").string(), true);
+    CommandResult flow;
+    const bool has_flow_input = !codex_lan_agent::FlowObsTrim(input_jsonl).empty();
+    if (has_flow_input) {
+        flow = codex_lan_agent::BuildMcpFlowConformanceCheckResult(
+            config,
+            input_jsonl,
+            (output_dir / "flow").string());
+    }
+    const bool boundary_pass = codex_lan_agent::FlowObsField(boundary, "accepted") == "true";
+    const bool flow_pass_or_not_run =
+        !has_flow_input || codex_lan_agent::FlowObsField(flow, "conformance_pass") == "true";
+    const bool accepted = boundary_pass && flow_pass_or_not_run;
+
+    CommandResult result;
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["provider_id"] = "codex-lan-agent";
+    result.fields["capability_id"] = "mcp_guard_regression_acceptance";
+    result.fields["status"] = "success";
+    result.fields["result"] = "mcp_guard_regression_acceptance_complete";
+    result.fields["out_dir"] = output_dir.string();
+    result.fields["boundary_summary_json_path"] = codex_lan_agent::FlowObsField(boundary, "boundary_summary_json_path");
+    result.fields["boundary_cases_jsonl_path"] = codex_lan_agent::FlowObsField(boundary, "boundary_cases_jsonl_path");
+    result.fields["rule_candidates_md_path"] = codex_lan_agent::FlowObsField(boundary, "rule_candidates_md_path");
+    result.fields["boundary_case_count"] = codex_lan_agent::FlowObsField(boundary, "case_count");
+    result.fields["boundary_pass_count"] = codex_lan_agent::FlowObsField(boundary, "pass_count");
+    result.fields["boundary_fail_count"] = codex_lan_agent::FlowObsField(boundary, "fail_count");
+    result.fields["synthetic_flow_violation_count"] = codex_lan_agent::FlowObsField(boundary, "synthetic_flow_violation_count");
+    result.fields["input_jsonl"] = input_jsonl;
+    result.fields["flow_conformance_pass"] =
+        has_flow_input ? codex_lan_agent::FlowObsField(flow, "conformance_pass") : "not_run";
+    result.fields["flow_violation_count"] =
+        has_flow_input ? codex_lan_agent::FlowObsField(flow, "violation_count") : "";
+    result.fields["flow_state_dashboard_html_path"] =
+        has_flow_input ? codex_lan_agent::FlowObsField(flow, "flow_state_dashboard_html_path") : "";
+    result.fields["accepted"] = accepted ? "true" : "false";
+    result.fields["conclusion"] =
+        accepted ? "MCP_GUARD_REGRESSION_ACCEPTED" : "MCP_GUARD_REGRESSION_HAS_GAPS";
+    result.fields["summary"] = accepted
+        ? "MCP guard regression acceptance passed"
+        : "MCP guard regression acceptance found gaps";
+    result.fields["result_ref"] = codex_lan_agent::FlowObsField(boundary, "boundary_summary_json_path");
+    result.fields["evidence_ref"] = codex_lan_agent::FlowObsField(boundary, "boundary_cases_jsonl_path");
+    return result;
 }
 
 std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
@@ -610,9 +921,10 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 const bool route_is_directory =
                     McpRoutePathIsDirectory(routed_file_path)
                     || McpRouteRequestMentionsDirectoryListing(route_params.GetString("request_text"));
+                const std::string clips_route_target = GetFieldOrDefault(result, "route_target", "");
                 const std::string route_target = FirstNonEmpty(
+                    clips_route_target,
                     route_is_directory ? std::string("lan_agent_list_directory") : std::string(),
-                    GetFieldOrDefault(result, "route_target", ""),
                     route_params.GetString("route_hint"),
                     routed_file_path.empty()
                         ? std::string()
@@ -623,7 +935,10 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                                 : std::string("lan_agent_probe_text_file"))),
                     "");
                 if (!route_target.empty()) {
-                    const std::string next_call_json = BuildPreGuardRouteCallJson(route_target, route_params);
+                    const std::string next_call_json = FirstNonEmpty(
+                        GetFieldOrDefault(result, "route_arguments_json", ""),
+                        BuildPreGuardRouteCallJson(route_target, route_params),
+                        "");
                     result.fields["tool_use_decision"] = "use_tool";
                     result.fields["chain_state"] = "needs_tool_call";
                     result.fields["route_target"] = route_target;
@@ -648,6 +963,25 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                         inferred_intent == "comment_cleanup"
                             ? "comment_cleanup_then_optional_code_format"
                             : inferred_intent;
+                    if (inferred_intent == "comment_cleanup" && route_is_directory) {
+                        const std::string route_trace_id = route_params.GetString("trace_id");
+                        const std::string route_goal_id = FirstNonEmpty(
+                            GetFieldOrDefault(result, "goal_id", ""),
+                            route_trace_id,
+                            "directory_comment_cleanup");
+                        CommandResult task_list = codex_lan_agent::BuildDirectoryCommentCleanupTaskListResult(
+                            config,
+                            route_goal_id,
+                            route_trace_id,
+                            routed_file_path,
+                            "T2");
+                        result.fields["flow_id"] = "directory_comment_cleanup_bounded_window_v1";
+                        result.fields["flow_task_list_required"] = "true";
+                        result.fields["flow_current_task_id"] = "T2";
+                        result.fields["flow_next_task_id"] = "T2";
+                        result.fields["flow_task_list_path"] = GetFieldOrDefault(task_list, "flow_task_list_path", "");
+                        result.fields["flow_task_list_md_path"] = GetFieldOrDefault(task_list, "flow_task_list_md_path", "");
+                    }
                 } else {
                     result.fields["tool_use_decision"] = "no_tool_resolved";
                     result.fields["chain_state"] = "needs_user_or_route_detail";
@@ -691,20 +1025,38 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 return result;
             }
 
+            std::string arguments_json = params.GetString("arguments_json");
+            if (arguments_json.empty()) {
+                arguments_json = ExtractJsonObjectRaw(params.body(), "arguments");
+            }
+            if (arguments_json.empty()) {
+                arguments_json = ExtractJsonObjectRaw(params.body(), "params");
+            }
+            if (arguments_json.empty()) {
+                arguments_json = "{}";
+            }
+            JsonRequestView routed_params(arguments_json);
+
+            CommandResult preflight_result;
+            if (MaybeApplyClipsPreflightBlock(config, target_tool_name, routed_params, &preflight_result)) {
+                LanResultBuilder(&preflight_result).Finalize(config, target_tool_name);
+                preflight_result.fields["mcp_route_mode"] = "call";
+                preflight_result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
+                preflight_result.fields["routed_tool_name"] = target_tool_name;
+                preflight_result.fields["routed_tool_surface"] = "internal_registry_hidden_from_tools_list";
+                preflight_result.fields["internal_execution_performed"] = "false";
+                preflight_result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                preflight_result.fields["tool_use_decision"] =
+                    preflight_result.ok ? "pre_guard_rerouted" : "pre_guard_blocked";
+                preflight_result.fields["current_tool_chain_node"] = target_tool_name;
+                preflight_result.fields["chain_state"] =
+                    preflight_result.ok ? "needs_tool_call" : "blocked_before_execution";
+                return preflight_result;
+            }
+
             const auto & registry = BuildMcpToolHandlerRegistry();
             const auto tool_it = registry.find(target_tool_name);
             if (tool_it == registry.end()) {
-                std::string arguments_json = params.GetString("arguments_json");
-                if (arguments_json.empty()) {
-                    arguments_json = ExtractJsonObjectRaw(params.body(), "arguments");
-                }
-                if (arguments_json.empty()) {
-                    arguments_json = ExtractJsonObjectRaw(params.body(), "params");
-                }
-                if (arguments_json.empty()) {
-                    arguments_json = "{}";
-                }
-                JsonRequestView routed_params(arguments_json);
                 CommandResult remote_result;
                 if (::codex_lan_agent::remote_mcp_bridge::TryHandleRemoteMcpTool(
                         config,
@@ -734,17 +1086,6 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 return result;
             }
 
-            std::string arguments_json = params.GetString("arguments_json");
-            if (arguments_json.empty()) {
-                arguments_json = ExtractJsonObjectRaw(params.body(), "arguments");
-            }
-            if (arguments_json.empty()) {
-                arguments_json = ExtractJsonObjectRaw(params.body(), "params");
-            }
-            if (arguments_json.empty()) {
-                arguments_json = "{}";
-            }
-            JsonRequestView routed_params(arguments_json);
             CommandResult result = tool_it->second(config, routed_params);
             LanResultBuilder(&result).Finalize(config, target_tool_name);
             result.fields["mcp_route_mode"] = "call";
@@ -1253,6 +1594,45 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("input_jsonl", params.GetString("jsonl_path")),
                 params.GetString("rule_root"),
                 params.GetString("out_root", params.GetString("out_dir", params.GetString("output_dir"))));
+        }},
+        {"lan_agent_mcp_boundary_explore", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildMcpBoundaryExploreResult(
+                config,
+                params.GetString("out_dir", params.GetString("output_dir")),
+                params.GetBool("include_synthetic_flow", true));
+        }},
+        {"lan_agent_mcp_flow_conformance_check", [](const AgentConfig & config, const JsonRequestView & params) {
+            return codex_lan_agent::BuildMcpFlowConformanceCheckResult(
+                config,
+                params.GetString("input_jsonl", params.GetString("jsonl_path")),
+                params.GetString("out_dir", params.GetString("output_dir")));
+        }},
+        {"lan_agent_mcp_guard_regression_acceptance", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildMcpGuardRegressionAcceptanceResult(
+                config,
+                params.GetString("input_jsonl", params.GetString("jsonl_path")),
+                params.GetString("out_dir", params.GetString("output_dir")));
+        }},
+        {"lan_agent_flow_task_list", [](const AgentConfig & config, const JsonRequestView & params) {
+            const std::string flow_id = params.GetString(
+                "flow_id",
+                "directory_comment_cleanup_bounded_window_v1");
+            if (flow_id == "directory_comment_cleanup_bounded_window_v1") {
+                return codex_lan_agent::BuildDirectoryCommentCleanupTaskListResult(
+                    config,
+                    FirstNonEmpty(params.GetString("goal_id"), params.GetString("trace_id"), "directory_comment_cleanup"),
+                    params.GetString("trace_id"),
+                    params.GetString("directory_path", params.GetString("file_path")),
+                    params.GetString("current_task_id", "T1"));
+            }
+            CommandResult result;
+            result.ok = false;
+            result.exit_code = 400;
+            result.fields["status"] = "failed";
+            result.fields["result"] = "unsupported_flow_task_list";
+            result.fields["flow_id"] = flow_id;
+            result.fields["error"] = "flow_id is not supported by lan_agent_flow_task_list";
+            return result;
         }},
         {"lan_agent_scan_text_ranges", [](const AgentConfig & config, const JsonRequestView & params) {
             return ScanTextRangesResult(
@@ -1792,6 +2172,7 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_run_cxparser_flow", "cxparser_flow_execution", "cxparser_flow_step", "medium", "cxparser,flow,orchestrated,supervised"},
         {"lan_agent_execute_semantic_action", "semantic_action_execution_bridge", "semantic_action_execute", "high", "semantic-action,bridge,edit,build,test,evidence"},
         {"lan_agent_clips_chain_template", "clips_chain_template", "clips_chain_template", "low", "clips,template,read_only"},
+        {"lan_agent_flow_task_list", "flow_task_list", "flow_task_list", "low", "flow,task-list,read_only"},
         {"lan_agent_scan_text_ranges", "text_range_scan", "scan_text_ranges", "low", "file,scan,range,read_only"},
         {"lan_agent_find_line_metadata", "read_observe", "find_line_metadata", "low", "file,line,metadata_only"},
         {"lan_agent_find_content_matches", "read_observe", "find_content_matches", "low", "file,locate,metadata_only"},

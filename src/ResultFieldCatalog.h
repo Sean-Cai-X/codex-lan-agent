@@ -103,7 +103,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "mcp_gateway_route",
             "mcp gateway route returned",
-            "ok,exit_code,tool_name,status,result,error,summary,next_action,mcp_route_mode,mcp_route_entry_tool,tool_use_decision,current_tool_chain_node,chain_state,tool_surface_policy,visible_tool_count,visible_tool_name,internal_execution_performed,routed_tool_name,routed_tool_surface,route_target,primary_intent,directory_mutation_flow,directory_scope_active,directory_manifest_path,directory_current_file_index,directory_next_file_index,directory_total_code_file_count,directory_remaining_code_file_count,directory_scope_incomplete,directory_next_probe_call_json,remote_endpoint,remote_prefix,remote_tool_count,remote_tools_csv,local_proxy_tools_csv,bridge_mode,local_proxy_tool_name,remote_tool_name,remote_status_code,remote_status,remote_result,remote_summary,remote_error,remote_has_more,remote_next_call_json,remote_required_tool_name,remote_required_tool_arguments_json,source_file,dry_run,would_change,changed,format_apply_required,dry_run_only,directory_path,normalized_path,total_entries,file_count,code_file_count,remaining_code_file_count,directory_count,entry_labels_json,file_paths_json,file_names_json,directory_listing_complete,known_file_list_complete,batch_manifest_complete,batch_manifest_path,batch_total_files,batch_read_file_count,remaining_batch_file_count,batch_completion,content_read_completion,incomplete_scope,next_batch_file_path,next_tool_name,next_file_path,next_max_lines,analysis_allowed,analysis_blocked_reason,required_next_action_type,required_tool_name,required_tool_arguments_json,continue_required,auto_continue_required,semantic_model_clamp,assistant_response_allowed,completion_guard,task_memory_freeze_recovery,task_memory_freeze_recovered_from_short_call,goal_id,trace_id,terminal_state,completion_claim_allowed,final_answer_allowed,verification_ok,clean_chat_close_allowed,conversation_close_status,chat_context_reset_required,chat_context_reset_requested,chat_context_reset_acknowledged,host_chat_history_mutable_by_mcp,old_context_dropped,mcp_continuation_ready,new_chat_entry_tool_name,new_chat_entry_arguments_json,local_ai_mcp_guidance_version,local_ai_required_entry,local_ai_guidance_json,local_ai_context_bootstrap_json,result_ref,evidence_ref,provider_id,capability_id",
+            "ok,exit_code,tool_name,status,result,error,summary,next_action,mcp_route_mode,mcp_route_entry_tool,tool_use_decision,current_tool_chain_node,chain_state,tool_surface_policy,visible_tool_count,visible_tool_name,internal_execution_performed,routed_tool_name,routed_tool_surface,route_target,pre_guard_route_arguments_source,clips_pre_call_tool_decision,clips_pre_call_tool_verification,clips_pre_call_tool_reason_code,clips_pre_call_tool_matched_rule,clips_pre_call_tool_route_target,clips_pre_call_tool_route_arguments_json,clips_pre_call_tool_route_arguments_json_ref,clips_pre_call_tool_route_arguments_json_available,clips_pre_call_tool_route_arguments_json_transport,task_execution_in_mcp_required,forced_task_memory_execution,long_loop_budget_recommended,long_loop_freeze_tool_name,long_loop_budget_tool_name,primary_intent,directory_mutation_flow,directory_scope_active,directory_manifest_path,directory_current_file_index,directory_next_file_index,directory_total_code_file_count,directory_remaining_code_file_count,directory_scope_incomplete,directory_next_probe_call_json,flow_id,flow_task_list_required,flow_current_task_id,flow_next_task_id,flow_task_list_path,flow_task_list_md_path,remote_endpoint,remote_prefix,remote_tool_count,remote_tools_csv,local_proxy_tools_csv,bridge_mode,local_proxy_tool_name,remote_tool_name,remote_status_code,remote_status,remote_result,remote_summary,remote_error,remote_has_more,remote_next_call_json,remote_required_tool_name,remote_required_tool_arguments_json,source_file,dry_run,would_change,changed,format_apply_required,dry_run_only,directory_path,normalized_path,total_entries,file_count,code_file_count,remaining_code_file_count,directory_count,entry_labels_json,file_paths_json,file_names_json,directory_listing_complete,known_file_list_complete,batch_manifest_complete,batch_manifest_path,batch_total_files,batch_read_file_count,remaining_batch_file_count,batch_completion,content_read_completion,incomplete_scope,next_batch_file_path,next_tool_name,next_file_path,next_max_lines,analysis_allowed,analysis_blocked_reason,required_next_action_type,required_tool_name,required_tool_arguments_json,continue_required,auto_continue_required,semantic_model_clamp,assistant_response_allowed,completion_guard,task_memory_freeze_recovery,task_memory_freeze_recovered_from_short_call,goal_id,trace_id,terminal_state,completion_claim_allowed,final_answer_allowed,verification_ok,clean_chat_close_allowed,conversation_close_status,chat_context_reset_required,chat_context_reset_requested,chat_context_reset_acknowledged,host_chat_history_mutable_by_mcp,old_context_dropped,mcp_continuation_ready,new_chat_entry_tool_name,new_chat_entry_arguments_json,local_ai_mcp_guidance_version,local_ai_required_entry,local_ai_guidance_json,local_ai_context_bootstrap_json,accepted,conclusion,case_count,pass_count,fail_count,boundary_case_count,boundary_pass_count,boundary_fail_count,synthetic_flow_violation_count,conformance_pass,flow_conformance_pass,flow_violation_count,violation_count,completion_state,current_node,next_expected_node,boundary_cases_jsonl_path,boundary_summary_json_path,rule_candidates_md_path,flow_state_dashboard_html_path,violations_md_path,result_ref,evidence_ref,provider_id,capability_id",
             "public"
         },
         {
@@ -112,6 +112,14 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "runtime_health",
             "agent health returned",
             "ok,exit_code,status,workspace_root,log_root,generation_endpoint,generation_ready,local_chat_endpoint_primary,local_chat_endpoint_fallback,local_chat_endpoint_effective,local_chat_endpoint_source,local_chat_endpoint_policy,local_chat_ready,local_chat_detail,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_flow_task_list",
+            "codex-lan-agent",
+            "flow_task_list",
+            "flow task list generated",
+            "ok,exit_code,status,result,error,summary,flow_id,goal_id,trace_id,current_task_id,flow_task_count,flow_task_list_path,flow_task_list_md_path,result_ref,evidence_ref,provider_id,capability_id",
             "public"
         },
         {
@@ -383,7 +391,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "clips_rule_decision",
             "clips rule decision returned",
-            "ok,exit_code,status,result,decision_result_status,decision_domain,target_tool_name,decision,target_verification,verification,reason_code,matched_rule,next_action,route_target",
+            "ok,exit_code,status,result,decision_result_status,decision_domain,target_tool_name,decision,target_verification,verification,reason_code,matched_rule,next_action,route_target,route_arguments_json_ref,route_arguments_json_available,route_arguments_json_transport",
             "public"
         },
         {
@@ -416,6 +424,30 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "mcp_flow_export",
             "MCP flow HTML report exported",
             "ok,exit_code,status,result,input_jsonl,rule_root,out_dir,conclusion,event_count,tool_call_count,tool_result_count,violation_count,completion_state,current_node,next_expected_node,html_report_path,artifact_bundle_dir,index_md_path,flow_report_md_path,flow_graph_dot_path,flow_graph_mermaid_path,flow_state_json_path,flow_state_graph_dot_path,flow_state_graph_mermaid_path,flow_state_dashboard_html_path,violations_md_path,result_ref,script_stdout_ref,stderr_ref,summary,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_mcp_boundary_explore",
+            "codex-lan-agent",
+            "mcp_boundary_explore",
+            "MCP boundary exploration completed",
+            "ok,exit_code,status,result,out_dir,case_count,pass_count,fail_count,accepted,conclusion,boundary_cases_jsonl_path,boundary_summary_json_path,rule_candidates_md_path,synthetic_jsonl_path,synthetic_flow_status,synthetic_flow_completion_state,synthetic_flow_violation_count,synthetic_flow_state_dashboard_html_path,result_ref,evidence_ref,summary,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_mcp_flow_conformance_check",
+            "codex-lan-agent",
+            "mcp_flow_conformance_check",
+            "MCP flow conformance checked",
+            "ok,exit_code,status,result,input_jsonl,out_dir,conformance_pass,conclusion,event_count,tool_call_count,tool_result_count,violation_count,completion_state,current_node,next_expected_node,flow_events_jsonl_path,flow_graph_dot_path,flow_graph_mermaid_path,flow_state_json_path,flow_state_graph_dot_path,flow_state_graph_mermaid_path,flow_state_dashboard_html_path,flow_report_md_path,violations_md_path,result_ref,script_stdout_ref,stderr_ref,summary,error,provider_id,capability_id",
+            "public"
+        },
+        {
+            "lan_agent_mcp_guard_regression_acceptance",
+            "codex-lan-agent",
+            "mcp_guard_regression_acceptance",
+            "MCP guard regression acceptance completed",
+            "ok,exit_code,status,result,out_dir,input_jsonl,accepted,conclusion,boundary_case_count,boundary_pass_count,boundary_fail_count,synthetic_flow_violation_count,flow_conformance_pass,flow_violation_count,flow_state_dashboard_html_path,boundary_summary_json_path,boundary_cases_jsonl_path,rule_candidates_md_path,result_ref,evidence_ref,summary,error,provider_id,capability_id",
             "public"
         },
         {
@@ -687,7 +719,7 @@ const std::vector<ToolMeta> & GetToolMetaCatalog() {
             "codex-lan-agent",
             "directory_list",
             "directory listing returned",
-            "ok,exit_code,status,result,summary,directory_path,normalized_path,total_entries,file_count,directory_count,entry_labels_json,file_paths_json,file_names_json,response_preview_truncated,file_paths_total_count,file_names_total_count,directory_complete,directory_listing_complete,known_file_list_complete,batch_manifest_complete,batch_total_files,batch_read_file_count,remaining_batch_file_count,batch_completion,content_read_completion,incomplete_scope,next_batch_file_path,next_call_json,task_completion,continue_required,auto_continue_required,analysis_allowed,result_ref,evidence_ref,provider_id,capability_id",
+            "ok,exit_code,status,result,summary,directory_path,normalized_path,total_entries,file_count,code_file_count,remaining_code_file_count,directory_count,entry_labels_json,file_paths_json,file_names_json,response_preview_truncated,file_paths_total_count,file_names_total_count,directory_complete,directory_listing_complete,known_file_list_complete,batch_manifest_complete,batch_manifest_path,batch_total_files,batch_read_file_count,remaining_batch_file_count,batch_completion,content_read_completion,incomplete_scope,next_batch_file_path,next_tool_name,next_file_path,next_max_lines,next_call_json,required_tool_name,required_tool_arguments_json,task_completion,continue_required,auto_continue_required,analysis_allowed,analysis_blocked_reason,flow_id,flow_task_list_required,flow_current_task_id,flow_next_task_id,flow_task_list_path,flow_task_list_md_path,result_ref,evidence_ref,provider_id,capability_id",
             "public"
         },
         {

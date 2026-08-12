@@ -3,6 +3,8 @@
 #include "AgentConfig.h"
 #include "HttpClient.h"
 #include "ProcessRunner.h"
+#include "FlowTaskListOperations.h"
+#include "SemanticIntentLexicon.h"
 #include "types.h"
 
 #include <cstddef>
@@ -16,42 +18,7 @@
 std::vector<std::string> SplitLinesPreserveText(const std::string & text);
 
 std::string NormalizeLocalAiPrimaryIntent(const std::string & primary_intent) {
-    const std::string lowered = ToLowerAscii(Trim(primary_intent));
-    if (lowered == "delete comments"
-        || lowered == "remove comments"
-        || lowered == "strip comments"
-        || lowered == "comment cleanup"
-        || lowered == "cleanup comments"
-        || lowered == "comment_cleanup"
-        || lowered == "delete_comments"
-        || lowered == "remove_comments"
-        || lowered == "strip_comments"
-        || lowered == "删除注释"
-        || lowered == "清理注释"
-        || lowered == "去除注释"
-        || lowered == "移除注释"
-        || lowered == "删注释") {
-        return "comment_cleanup";
-    }
-    if (lowered == "format code"
-        || lowered == "code format"
-        || lowered == "format_code"
-        || lowered == "code_format"
-        || lowered == "formatting"
-        || lowered == "whitespace_cleanup"
-        || lowered == "whitespace cleanup"
-        || lowered == "newline_cleanup"
-        || lowered == "newline cleanup"
-        || lowered == "remove extra newlines"
-        || lowered == "delete extra newlines"
-        || lowered == "删除多余回车换行"
-        || lowered == "删除多余的回车换行"
-        || lowered == "清理多余回车换行"
-        || lowered == "清理空白"
-        || lowered == "格式化代码") {
-        return "code_format";
-    }
-    return primary_intent;
+    return codex_lan_agent::NormalizeIntentBySemanticLexicon(primary_intent);
 }
 
 bool IsLocalAiCommentCleanupIntent(const std::string & primary_intent) {
@@ -2767,6 +2734,14 @@ CommandResult ProbeTextFileResult(
         result.fields["directory_total_code_file_count"] = std::to_string(std::max(0, directory_total_code_file_count));
         const int remaining = std::max(0, directory_total_code_file_count - std::max(0, directory_current_file_index));
         result.fields["directory_remaining_code_file_count"] = std::to_string(remaining);
+        codex_lan_agent::AttachDirectoryCommentCleanupTaskListFields(
+            &result,
+            config,
+            trace_id,
+            trace_id,
+            normalized.parent_path().string(),
+            "T3",
+            comment_cleanup_intent ? "T4" : "T3");
     }
     result.fields["recommended_next_tool"] = recommended_next_tool;
     result.fields["recommended_read_max_lines"] = std::to_string(recommended_read_max_lines);
@@ -2859,11 +2834,17 @@ CommandResult ListDirectoryResult(
     result.fields["task_type"] = "directory_list";
     result.fields["directory_path"] = directory_path;
     const bool comment_cleanup_intent = IsLocalAiCommentCleanupIntent(primary_intent);
+    const std::string effective_trace_id = !Trim(trace_id).empty()
+        ? trace_id
+        : (comment_cleanup_intent
+            ? "trace-list-directory-comment-cleanup-" + BuildRequestTimestampToken()
+            : std::string());
     if (!primary_intent.empty()) {
         result.fields["primary_intent"] = NormalizeLocalAiPrimaryIntent(primary_intent);
     }
-    if (!trace_id.empty()) {
-        result.fields["trace_id"] = trace_id;
+    if (!effective_trace_id.empty()) {
+        result.fields["trace_id"] = effective_trace_id;
+        result.fields["trace_id_recovered"] = trace_id.empty() ? "true" : "false";
     }
 
     if (directory_path.empty()) {
@@ -2971,7 +2952,8 @@ CommandResult ListDirectoryResult(
 
         std::string manifest_path;
         const bool manifest_saved =
-            !trace_id.empty() && SaveDirectoryReadManifest(config, trace_id, normalized.string(), manifest_files, &manifest_path);
+            !effective_trace_id.empty()
+            && SaveDirectoryReadManifest(config, effective_trace_id, normalized.string(), manifest_files, &manifest_path);
         result.fields["batch_manifest_path"] = manifest_saved ? manifest_path : "";
         result.fields["batch_manifest_ready"] = manifest_saved ? "true" : "false";
         result.fields["batch_manifest_complete"] = manifest_saved ? "true" : "false";
@@ -3050,7 +3032,7 @@ CommandResult ListDirectoryResult(
         result.fields["next_call_json"] = can_continue_comment_cleanup
             ? BuildCommentCleanupProbeCallJson(
                 next_comment_file_path,
-                trace_id,
+                effective_trace_id,
                 manifest_path,
                 0,
                 static_cast<int>(code_files.size()))
@@ -3062,11 +3044,29 @@ CommandResult ListDirectoryResult(
                 2500,
                 0,
                 1,
-                trace_id) : "");
+                effective_trace_id) : "");
         result.fields["required_tool_name"] = can_continue_comment_cleanup
             ? "lan_agent_probe_text_file"
             : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
         result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
+        if (can_continue_comment_cleanup) {
+            const std::string goal_id = FirstNonEmpty(
+                result.fields["goal_id"],
+                effective_trace_id,
+                "directory_comment_cleanup");
+            CommandResult task_list = codex_lan_agent::BuildDirectoryCommentCleanupTaskListResult(
+                config,
+                goal_id,
+                effective_trace_id,
+                normalized.string(),
+                "T3");
+            result.fields["flow_id"] = "directory_comment_cleanup_bounded_window_v1";
+            result.fields["flow_task_list_required"] = "true";
+            result.fields["flow_current_task_id"] = "T3";
+            result.fields["flow_next_task_id"] = "T3";
+            result.fields["flow_task_list_path"] = GetFieldOrDefault(task_list, "flow_task_list_path", "");
+            result.fields["flow_task_list_md_path"] = GetFieldOrDefault(task_list, "flow_task_list_md_path", "");
+        }
         return result;
     }
 
@@ -3136,7 +3136,8 @@ CommandResult ListDirectoryResult(
 
     std::string manifest_path;
     const bool manifest_saved =
-        !trace_id.empty() && SaveDirectoryReadManifest(config, trace_id, normalized.string(), manifest_files, &manifest_path);
+        !effective_trace_id.empty()
+        && SaveDirectoryReadManifest(config, effective_trace_id, normalized.string(), manifest_files, &manifest_path);
     result.fields["batch_manifest_path"] = manifest_saved ? manifest_path : "";
     result.fields["batch_manifest_ready"] = manifest_saved ? "true" : "false";
     result.fields["batch_manifest_complete"] = manifest_saved ? "true" : "false";
@@ -3215,7 +3216,7 @@ CommandResult ListDirectoryResult(
     result.fields["next_call_json"] = can_continue_comment_cleanup
         ? BuildCommentCleanupProbeCallJson(
             next_comment_file_path,
-            trace_id,
+            effective_trace_id,
             manifest_path,
             0,
             static_cast<int>(code_files.size()))
@@ -3227,11 +3228,29 @@ CommandResult ListDirectoryResult(
             2500,
             0,
             1,
-            trace_id) : "");
+            effective_trace_id) : "");
     result.fields["required_tool_name"] = can_continue_comment_cleanup
         ? "lan_agent_probe_text_file"
         : (can_continue_directory_batch ? "lan_agent_read_directory_files" : "");
     result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
+    if (can_continue_comment_cleanup) {
+        const std::string goal_id = FirstNonEmpty(
+            result.fields["goal_id"],
+            effective_trace_id,
+            "directory_comment_cleanup");
+        CommandResult task_list = codex_lan_agent::BuildDirectoryCommentCleanupTaskListResult(
+            config,
+            goal_id,
+            effective_trace_id,
+            normalized.string(),
+            "T3");
+        result.fields["flow_id"] = "directory_comment_cleanup_bounded_window_v1";
+        result.fields["flow_task_list_required"] = "true";
+        result.fields["flow_current_task_id"] = "T3";
+        result.fields["flow_next_task_id"] = "T3";
+        result.fields["flow_task_list_path"] = GetFieldOrDefault(task_list, "flow_task_list_path", "");
+        result.fields["flow_task_list_md_path"] = GetFieldOrDefault(task_list, "flow_task_list_md_path", "");
+    }
     return result;
 }
 
@@ -4287,6 +4306,14 @@ CommandResult DeleteTextRangeWindowAtomicResult(
         result.fields["directory_manifest_path"] = directory_manifest_path;
         result.fields["directory_current_file_index"] = std::to_string(std::max(0, directory_current_file_index));
         result.fields["directory_total_code_file_count"] = std::to_string(std::max(0, directory_total_code_file_count));
+        codex_lan_agent::AttachDirectoryCommentCleanupTaskListFields(
+            &result,
+            config,
+            trace_id,
+            trace_id,
+            normalized.parent_path().string(),
+            "T4",
+            "T4");
     }
     const bool directory_scope_active = !directory_manifest_path.empty();
     const int next_directory_file_index = std::max(0, directory_current_file_index) + 1;
@@ -4336,6 +4363,14 @@ CommandResult DeleteTextRangeWindowAtomicResult(
             result.fields["directory_remaining_code_file_count"] = std::to_string(directory_remaining_after_current);
             result.fields["directory_scope_incomplete"] = directory_has_next_file ? "true" : "false";
             result.fields["directory_next_probe_call_json"] = directory_next_probe_call_json;
+            codex_lan_agent::AttachDirectoryCommentCleanupTaskListFields(
+                &result,
+                config,
+                trace_id,
+                trace_id,
+                normalized.parent_path().string(),
+                directory_has_next_file ? "T5" : "T6",
+                directory_has_next_file ? "T3" : "T6");
         }
         result.fields["next_call_json"] = directory_next_probe_call_json;
         result.fields["required_tool_name"] = directory_has_next_file ? "lan_agent_probe_text_file" : "";
@@ -4371,6 +4406,16 @@ CommandResult DeleteTextRangeWindowAtomicResult(
             primary_intent,
             trace_id,
             probe_ref);
+        if (directory_scope_active) {
+            codex_lan_agent::AttachDirectoryCommentCleanupTaskListFields(
+                &result,
+                config,
+                trace_id,
+                trace_id,
+                normalized.parent_path().string(),
+                "T4",
+                "T4");
+        }
         return result;
     }
 
@@ -4421,6 +4466,14 @@ CommandResult DeleteTextRangeWindowAtomicResult(
             result.fields["directory_remaining_code_file_count"] = std::to_string(directory_remaining_after_current);
             result.fields["directory_scope_incomplete"] = directory_has_next_file ? "true" : "false";
             result.fields["directory_next_probe_call_json"] = directory_next_probe_call_json;
+            codex_lan_agent::AttachDirectoryCommentCleanupTaskListFields(
+                &result,
+                config,
+                trace_id,
+                trace_id,
+                normalized.parent_path().string(),
+                has_more_windows ? "T4" : (directory_has_next_file ? "T5" : "T6"),
+                has_more_windows ? "T4" : (directory_has_next_file ? "T3" : "T6"));
         }
         result.fields["required_tool_name"] = has_more_windows
             ? "lan_agent_delete_text_range_window_atomic"
@@ -4593,6 +4646,14 @@ CommandResult DeleteTextRangeWindowAtomicResult(
         result.fields["directory_remaining_code_file_count"] = std::to_string(directory_remaining_after_current);
         result.fields["directory_scope_incomplete"] = directory_has_next_file_after_write ? "true" : "false";
         result.fields["directory_next_probe_call_json"] = directory_next_probe_call_json;
+        codex_lan_agent::AttachDirectoryCommentCleanupTaskListFields(
+            &result,
+            config,
+            trace_id,
+            trace_id,
+            normalized.parent_path().string(),
+            has_more ? "T4" : (directory_has_next_file_after_write ? "T5" : "T6"),
+            has_more ? "T4" : (directory_has_next_file_after_write ? "T3" : "T6"));
     }
     result.fields["required_tool_name"] = has_more
         ? "lan_agent_delete_text_range_window_atomic"

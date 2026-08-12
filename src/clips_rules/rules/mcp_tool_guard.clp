@@ -1,5 +1,46 @@
 ; MCP pre-call allow/block/route rules.
 
+(defrule route-mismatched-pending-continuation
+  (declare (salience 96))
+  (mcp_tool_request (tool_name ?tool)
+                    (pending_continuation_active "true")
+                    (continuation_takeover_allowed "true")
+                    (pending_required_tool ?expected&:(neq ?expected ""))
+                    (pending_required_arguments_json ?args&:(neq ?args "")))
+  (test (neq ?expected ?tool))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "pending_continuation_mismatch")
+    (route_target ?expected)
+    (next_action "tool_call_only: a pending continuation already exists for this trace/goal; call its route_arguments_json exactly before any other tool")
+    (matched_rule "route-mismatched-pending-continuation"))))
+
+(defrule route-pending-continuation-same-tool-missing-context
+  (declare (salience 95))
+  (mcp_tool_request (tool_name ?tool)
+                    (trace_id ?trace)
+                    (pending_continuation_active "true")
+                    (continuation_takeover_allowed "true")
+                    (pending_required_tool ?expected&:(neq ?expected ""))
+                    (pending_required_arguments_json ?args&:(neq ?args ""))
+                    (pending_trace_id ?pending_trace&:(neq ?pending_trace "")))
+  (test (eq ?expected ?tool))
+  (test (neq ?pending_trace ?trace))
+  =>
+  (assert (clips_decision
+    (domain "mcp_tool_guard")
+    (target ?tool)
+    (decision "route")
+    (verification "not_verified")
+    (reason_code "pending_continuation_context_mismatch")
+    (route_target ?expected)
+    (next_action "tool_call_only: this is the expected tool but the saved continuation context is missing or changed; call route_arguments_json exactly")
+    (matched_rule "route-pending-continuation-same-tool-missing-context"))))
+
 (defrule allow-single-file-patch-preview
   (declare (salience 80))
   (mcp_tool_request (tool_name "lan_agent_preview_patch")
@@ -173,14 +214,7 @@
 (defrule route-read-text-file-to-window-delete-for-comment-cleanup
   (declare (salience 84))
   (mcp_tool_request (tool_name "lan_agent_read_text_file")
-                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                 (eq ?intent "remove_comments")
-                                                 (eq ?intent "strip_comments")
-                                                 (eq ?intent "删除注释")
-                                                 (eq ?intent "清理注释")
-                                                 (eq ?intent "去除注释")
-                                                 (eq ?intent "移除注释")
-                                                 (eq ?intent "删注释")))
+                    (primary_intent "comment_cleanup")
                     (probe_ready "true"))
   =>
   (assert (clips_decision
@@ -197,15 +231,7 @@
   (declare (salience 83))
   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_scan_text_ranges")
                                           (eq ?tool "lan_agent_prepare_edit_windows")))
-                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                 (eq ?intent "remove_comments")
-                                                 (eq ?intent "strip_comments")
-                                                 (eq ?intent "delete_comments")
-                                                 (eq ?intent "删除注释")
-                                                 (eq ?intent "清理注释")
-                                                 (eq ?intent "去除注释")
-                                                 (eq ?intent "移除注释")
-                                                 (eq ?intent "删注释")))
+                    (primary_intent "comment_cleanup")
                     (probe_ready "true"))
   =>
   (assert (clips_decision
@@ -221,15 +247,7 @@
 (defrule route-directory-content-read-to-window-delete-for-comment-cleanup
   (declare (salience 83))
   (mcp_tool_request (tool_name "lan_agent_read_directory_files")
-                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                 (eq ?intent "remove_comments")
-                                                 (eq ?intent "strip_comments")
-                                                 (eq ?intent "delete_comments")
-                                                 (eq ?intent "删除注释")
-                                                 (eq ?intent "清理注释")
-                                                 (eq ?intent "去除注释")
-                                                 (eq ?intent "移除注释")
-                                                 (eq ?intent "删注释")))
+                    (primary_intent "comment_cleanup")
                     (file_path ?file_path&:(neq ?file_path ""))
                     (probe_ready "true"))
   =>
@@ -253,15 +271,7 @@
 (defrule block-directory-comment-cleanup-without-current-file
   (declare (salience 82))
   (mcp_tool_request (tool_name "lan_agent_read_directory_files")
-                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                 (eq ?intent "remove_comments")
-                                                 (eq ?intent "strip_comments")
-                                                 (eq ?intent "delete_comments")
-                                                 (eq ?intent "删除注释")
-                                                 (eq ?intent "清理注释")
-                                                 (eq ?intent "去除注释")
-                                                 (eq ?intent "移除注释")
-                                                 (eq ?intent "删注释")))
+                    (primary_intent "comment_cleanup")
                     (file_path ""))
   =>
   (assert (mcp_flow_expectation

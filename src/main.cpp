@@ -54,6 +54,8 @@
 #include "CodeFormatOperations.h"
 #include "McpFlowObservabilityOperations.h"
 #include "SemanticGridOperations.h"
+#include "SemanticIntentLexicon.h"
+#include "FlowTaskListOperations.h"
 
 bool ReadWholeFile(
     const std::filesystem::path & path,
@@ -1003,6 +1005,9 @@ void SetClipsSupervisionAlarm(
     if (result->exit_code == 0) {
         result->exit_code = 68;
     }
+    result->fields["ok"] = "false";
+    result->fields["exit_code"] = std::to_string(result->exit_code);
+    result->fields["status"] = "failed";
     result->fields["supervision_status"] = "alarm";
     result->fields["supervision_alarm"] = "true";
     result->fields["supervision_alarm_code"] = code;
@@ -2071,6 +2076,7 @@ CommandResult BuildTaskMemoryExecuteContinuationBudgetRunnerResult(
         AttachDirectoryCommentCleanupContinuationFactsForBudget(resume_context, trace_id, &step_result);
         ApplyClipsResultGuard(config, tool_name, &step_result);
         ApplySupervisionEnvelope(&step_result);
+        PersistMcpPendingContinuation(config, tool_name, step_result);
         AppendMcpTraceAuditEvent(config, tool_name, step_result);
         AppendMcpSupervisionAlarmEvent(config, tool_name, step_result);
 
@@ -4576,6 +4582,7 @@ bool HandleMcpRoute(
             LanResultBuilder(&result).Finalize(config, tool_name);
             ApplySupervisionEnvelope(&result);
             codex_lan_agent::RememberTaskMemoryPendingFreezeArgumentsFromResult(result);
+            PersistMcpPendingContinuation(config, tool_name, result);
             AppendMcpTraceAuditEvent(config, tool_name, result);
             AppendMcpSupervisionAlarmEvent(config, tool_name, result);
             response->body = BuildMcpToolCallResponse(id_raw, result);
@@ -4588,11 +4595,15 @@ bool HandleMcpRoute(
             ApplyRequestRuleFields(tool_name, tool_params, &result);
             ApplyRawRequestEncodingProbe(tool_name, request.body, &result);
             LanResultBuilder(&result).Finalize(config, tool_name);
-            ApplyAiConclusionValidityGuards(&result);
-            ApplyClipsResultGuard(config, tool_name, &result);
-            ApplyClipsSemanticTraceContinuation(config, &result);
-            ApplySupervisionEnvelope(&result);
-            codex_lan_agent::RememberTaskMemoryPendingFreezeArgumentsFromResult(result);
+            if (tool_name != "lan_agent_clips_decide"
+                && tool_name != "lan_agent_clips_chain_template") {
+                ApplyAiConclusionValidityGuards(&result);
+                ApplyClipsResultGuard(config, tool_name, &result);
+                ApplyClipsSemanticTraceContinuation(config, &result);
+                ApplySupervisionEnvelope(&result);
+                codex_lan_agent::RememberTaskMemoryPendingFreezeArgumentsFromResult(result);
+                PersistMcpPendingContinuation(config, tool_name, result);
+            }
             AppendMcpTraceAuditEvent(config, tool_name, result);
             AppendMcpSupervisionAlarmEvent(config, tool_name, result);
 
@@ -5599,6 +5610,7 @@ bool HandleMcpRoute(
         ApplyClipsResultGuard(config, tool_name, &result);
         ApplyClipsSemanticTraceContinuation(config, &result);
         ApplySupervisionEnvelope(&result);
+        PersistMcpPendingContinuation(config, tool_name, result);
         AppendMcpTraceAuditEvent(config, tool_name, result);
         AppendMcpSupervisionAlarmEvent(config, tool_name, result);
 

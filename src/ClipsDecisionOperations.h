@@ -11,6 +11,10 @@ extern "C" {
 }
 #endif
 
+#include "SemanticIntentLexicon.h"
+
+std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent);
+
 struct ClipsDecision {
     bool engine_ready = false;
     bool loaded_from_files = false;
@@ -23,6 +27,7 @@ struct ClipsDecision {
     std::string reason_code;
     std::string matched_rule;
     std::string route_target;
+    std::string route_arguments_json;
     std::string fact_schema_id = "mcp_fact_schema_v1";
     std::string decision_schema_id = "clips_decision_schema_v1";
     std::string rule_root;
@@ -43,47 +48,137 @@ std::string EscapeForClipsString(const std::string & value) {
     return escaped;
 }
 
+bool IsClipsSafeTokenChar(char ch) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    return std::isalnum(uch) != 0
+        || ch == '_'
+        || ch == '-'
+        || ch == '.'
+        || ch == ':'
+        || ch == '/';
+}
+
+bool IsClipsSafeTokenString(const std::string & value) {
+    if (value.size() > 160) {
+        return false;
+    }
+    for (char ch : value) {
+        if (!IsClipsSafeTokenChar(ch)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string NormalizeClipsCharsByTable(const std::string & value) {
+    std::string output;
+    output.reserve(value.size() + 16);
+    bool last_underscore = false;
+    auto append_token = [&](const std::string & token) {
+        if (token == "_") {
+            if (!last_underscore && !output.empty()) {
+                output.push_back('_');
+                last_underscore = true;
+            }
+            return;
+        }
+        output += token;
+        last_underscore = !token.empty() && token.back() == '_';
+    };
+    const auto append_hex_token = [&](unsigned char ch) {
+        static const char * digits = "0123456789abcdef";
+        std::string token = "_x";
+        token.push_back(digits[(ch >> 4) & 0x0f]);
+        token.push_back(digits[ch & 0x0f]);
+        token.push_back('_');
+        output += token;
+        last_underscore = true;
+    };
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) != 0) {
+            output.push_back(static_cast<char>(std::tolower(ch)));
+            last_underscore = false;
+            continue;
+        }
+        switch (ch) {
+        case '_': append_token("_"); break;
+        case '-': output.push_back('-'); last_underscore = false; break;
+        case '.': output.push_back('.'); last_underscore = false; break;
+        case ':': output.push_back(':'); last_underscore = false; break;
+        case '/': output.push_back('/'); last_underscore = false; break;
+        case '\\': output.push_back('/'); last_underscore = false; break;
+        case ' ':
+        case '\t': append_token("_"); break;
+        case '\r': append_token("_cr_"); break;
+        case '\n': append_token("_nl_"); break;
+        case '"': append_token("_dq_"); break;
+        case '\'': append_token("_sq_"); break;
+        case '{': append_token("_lb_"); break;
+        case '}': append_token("_rb_"); break;
+        case '[': append_token("_ls_"); break;
+        case ']': append_token("_rs_"); break;
+        case '(': append_token("_lp_"); break;
+        case ')': append_token("_rp_"); break;
+        case ',': append_token("_cm_"); break;
+        case ';': append_token("_sc_"); break;
+        case '=': append_token("_eq_"); break;
+        case '&': append_token("_and_"); break;
+        case '|': append_token("_or_"); break;
+        case '*': append_token("_star_"); break;
+        case '?': append_token("_q_"); break;
+        case '#': append_token("_hash_"); break;
+        case '%': append_token("_pct_"); break;
+        default:
+            append_hex_token(ch);
+            break;
+        }
+    }
+    while (!output.empty() && output.front() == '_') {
+        output.erase(output.begin());
+    }
+    while (!output.empty() && output.back() == '_') {
+        output.pop_back();
+    }
+    return output.empty() ? "empty" : output;
+}
+
+std::string NormalizeClipsSlotValue(const char * name, const std::string & value) {
+    const std::string trimmed = Trim(value);
+    if (trimmed.empty()) {
+        return std::string();
+    }
+    const std::string slot_name = name == nullptr ? std::string() : std::string(name);
+    if (slot_name == "primary_intent") {
+        const std::string normalized_intent = NormalizeMcpPrimaryIntentForClips(trimmed);
+        if (IsClipsSafeTokenString(normalized_intent)) {
+            return normalized_intent;
+        }
+        return "intent_" + NormalizeClipsCharsByTable(normalized_intent);
+    }
+    const std::string table_value = NormalizeClipsCharsByTable(trimmed);
+    const std::string bounded_value = table_value.size() <= 160
+        ? table_value
+        : (table_value.substr(0, 120) + "_h_" + StableContentChecksum(trimmed));
+    if (slot_name.find("json") != std::string::npos
+        || slot_name.find("text") != std::string::npos
+        || slot_name.find("summary") != std::string::npos
+        || slot_name.find("answer") != std::string::npos
+        || slot_name.find("path") != std::string::npos
+        || slot_name.find("ref") != std::string::npos
+        || slot_name.find("error") != std::string::npos
+        || slot_name.find("action") != std::string::npos
+        || slot_name.find("fact") != std::string::npos) {
+        return bounded_value;
+    }
+    return bounded_value;
+}
+
 std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent) {
-    const std::string lowered = ToLowerAscii(Trim(primary_intent));
-    if (lowered == "delete comments"
-        || lowered == "remove comments"
-        || lowered == "strip comments"
-        || lowered == "comment cleanup"
-        || lowered == "cleanup comments"
-        || lowered == "comment_cleanup"
-        || lowered == "delete_comments"
-        || lowered == "remove_comments"
-        || lowered == "strip_comments"
-        || lowered == "删除注释"
-        || lowered == "清理注释"
-        || lowered == "去除注释"
-        || lowered == "移除注释"
-        || lowered == "删注释") {
-        return "comment_cleanup";
-    }
-    if (lowered == "format code"
-        || lowered == "code format"
-        || lowered == "format_code"
-        || lowered == "code_format"
-        || lowered == "formatting"
-        || lowered == "whitespace_cleanup"
-        || lowered == "whitespace cleanup"
-        || lowered == "newline_cleanup"
-        || lowered == "newline cleanup"
-        || lowered == "remove extra newlines"
-        || lowered == "delete extra newlines"
-        || lowered == "删除多余回车换行"
-        || lowered == "删除多余的回车换行"
-        || lowered == "清理多余回车换行"
-        || lowered == "清理空白"
-        || lowered == "格式化代码") {
-        return "code_format";
-    }
-    return primary_intent;
+    return codex_lan_agent::NormalizeIntentBySemanticLexicon(primary_intent);
 }
 
 std::string ClipsStringSlot(const char * name, const std::string & value) {
-    return "(" + std::string(name) + " \"" + EscapeForClipsString(value) + "\")";
+    return "(" + std::string(name) + " \"" + EscapeForClipsString(NormalizeClipsSlotValue(name, value)) + "\")";
 }
 
 std::string ClipsBoolSlot(const char * name, bool value) {
@@ -167,6 +262,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot route_hint (default ""))
               (slot source_type (default ""))
               (slot file_path (default ""))
+              (slot directory_path (default ""))
               (slot scan_mode (default ""))
               (slot probe_ref (default ""))
               (slot patch_id (default ""))
@@ -187,7 +283,16 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot requires_preview (default "false"))
               (slot requires_approval (default "false"))
               (slot requires_revert_plan (default "false"))
-              (slot requires_post_verify (default "false"))))",
+              (slot requires_post_verify (default "false"))
+              (slot pending_continuation_active (default "false"))
+              (slot pending_required_tool (default ""))
+              (slot pending_required_arguments_json (default ""))
+              (slot pending_trace_id (default ""))
+              (slot pending_goal_id (default ""))
+              (slot pending_source_tool (default ""))
+              (slot pending_hash (default ""))
+              (slot pending_trace_match (default "false"))
+              (slot continuation_takeover_allowed (default "true"))))",
         R"((deftemplate mcp_tool_result
               (slot tool_name)
               (slot request_id (default ""))
@@ -205,6 +310,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot error_code (default ""))
               (slot error_message (default ""))
               (slot status (default ""))
+              (slot tool_use_decision (default ""))
               (slot task_completion (default ""))
               (slot has_more (default "false"))
               (slot next_start_line (default ""))
@@ -225,6 +331,12 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot directory_remaining_code_file_count (default "0"))
               (slot directory_scope_incomplete (default "false"))
               (slot directory_next_probe_call_json (default ""))
+              (slot flow_id (default ""))
+              (slot flow_task_list_required (default "false"))
+              (slot flow_current_task_id (default ""))
+              (slot flow_next_task_id (default ""))
+              (slot flow_task_list_path (default ""))
+              (slot flow_task_list_md_path (default ""))
               (slot content_read_completion (default ""))
               (slot incomplete_scope (default ""))
               (slot terminal_state (default ""))
@@ -291,7 +403,8 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot next_action (default ""))
               (slot reason_code (default ""))
               (slot matched_rule (default ""))
-              (slot route_target (default ""))))",
+              (slot route_target (default ""))
+              (slot route_arguments_json (default ""))))",
         R"((deftemplate cmm_project_state
               (slot repo_path (default ""))
               (slot normalized_project (default ""))
@@ -324,6 +437,45 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
 std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) {
     if (domain == "mcp_tool_guard") {
         return {
+            R"((defrule route-mismatched-pending-continuation
+              (declare (salience 96))
+              (mcp_tool_request (tool_name ?tool)
+                                (pending_continuation_active "true")
+                                (continuation_takeover_allowed "true")
+                                (pending_required_tool ?expected&:(neq ?expected ""))
+                                (pending_required_arguments_json ?args&:(neq ?args "")))
+              (test (neq ?expected ?tool))
+              =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "pending_continuation_mismatch")
+                      (route_target ?expected)
+                      (next_action "tool_call_only: a pending continuation already exists for this trace/goal; call its route_arguments_json exactly before any other tool")
+                      (matched_rule "route-mismatched-pending-continuation")))))",
+            R"((defrule route-pending-continuation-same-tool-missing-context
+              (declare (salience 95))
+              (mcp_tool_request (tool_name ?tool)
+                                (trace_id ?trace)
+                                (pending_continuation_active "true")
+                                (continuation_takeover_allowed "true")
+                                (pending_required_tool ?expected&:(neq ?expected ""))
+                                (pending_required_arguments_json ?args&:(neq ?args ""))
+                                (pending_trace_id ?pending_trace&:(neq ?pending_trace "")))
+              (test (eq ?expected ?tool))
+              (test (neq ?pending_trace ?trace))
+              =>
+                  (assert (clips_decision
+                      (domain "mcp_tool_guard")
+                      (target ?tool)
+                      (decision "route")
+                      (verification "not_verified")
+                      (reason_code "pending_continuation_context_mismatch")
+                      (route_target ?expected)
+                      (next_action "tool_call_only: this is the expected tool but the saved continuation context is missing or changed; call route_arguments_json exactly")
+                      (matched_rule "route-pending-continuation-same-tool-missing-context")))))",
             R"((defrule allow-single-file-patch-preview
                   (declare (salience 80))
                   (mcp_tool_request (tool_name "lan_agent_preview_patch")
@@ -488,14 +640,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
             R"((defrule route-read-text-file-to-window-delete-for-comment-cleanup
                   (declare (salience 84))
                   (mcp_tool_request (tool_name "lan_agent_read_text_file")
-                                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                                 (eq ?intent "remove_comments")
-                                                                 (eq ?intent "strip_comments")
-                                                                 (eq ?intent "删除注释")
-                                                                 (eq ?intent "清理注释")
-                                                                 (eq ?intent "去除注释")
-                                                                 (eq ?intent "移除注释")
-                                                                 (eq ?intent "删注释")))
+                                    (primary_intent "comment_cleanup")
                                     (probe_ready "true"))
                   =>
                   (assert (clips_decision
@@ -511,15 +656,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                   (declare (salience 83))
                   (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_scan_text_ranges")
                                                           (eq ?tool "lan_agent_prepare_edit_windows")))
-                                    (primary_intent ?intent&:(or (eq ?intent "comment_cleanup")
-                                                                 (eq ?intent "remove_comments")
-                                                                 (eq ?intent "strip_comments")
-                                                                 (eq ?intent "delete_comments")
-                                                                 (eq ?intent "删除注释")
-                                                                 (eq ?intent "清理注释")
-                                                                 (eq ?intent "去除注释")
-                                                                 (eq ?intent "移除注释")
-                                                                 (eq ?intent "删注释")))
+                                    (primary_intent "comment_cleanup")
                                     (probe_ready "true"))
                   =>
                   (assert (clips_decision
@@ -1174,6 +1311,65 @@ bool BuildEmbeddedClipsBlocks(
     return true;
 }
 
+bool AllowsPendingContinuationTakeover(const std::string & tool_name) {
+    if (tool_name == "lan_agent_mcp_route"
+        || tool_name == "lan_agent_mcp_overview"
+        || tool_name == "lan_agent_remote_mcp_overview"
+        || tool_name == "lan_agent_clips_decide"
+        || tool_name == "lan_agent_flow_task_list"
+        || tool_name == "lan_agent_mcp_flow_visualize"
+        || tool_name == "lan_agent_mcp_flow_analyze"
+        || tool_name == "lan_agent_mcp_flow_export"
+        || tool_name == "lan_agent_mcp_flow_conformance_check"
+        || tool_name == "lan_agent_health"
+        || tool_name == "mcp_capability_registry") {
+        return false;
+    }
+    if (tool_name.find("_overview") != std::string::npos
+        || tool_name.find("_status") != std::string::npos
+        || tool_name.find("dashboard") != std::string::npos
+        || tool_name.find("flow_visualize") != std::string::npos
+        || tool_name.find("flow_analyze") != std::string::npos
+        || tool_name.find("flow_export") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+std::string ClipsContinuationArgumentsFactValue(const std::string & raw_arguments_json) {
+    return Trim(raw_arguments_json).empty()
+        ? std::string()
+        : "__mcp_pending_required_arguments_json_ref__";
+}
+
+bool IsClipsContinuationArgumentsRef(const std::string & value) {
+    const std::string trimmed = Trim(value);
+    return trimmed == "__mcp_pending_required_arguments_json_ref__"
+        || NormalizeClipsCharsByTable(trimmed) == "mcp_pending_required_arguments_json_ref";
+}
+
+std::string WriteClipsRouteArgumentsRef(
+    const AgentConfig & config,
+    const std::string & tool_name,
+    const std::string & route_arguments_json) {
+    if (Trim(route_arguments_json).empty()) {
+        return std::string();
+    }
+    const std::string key = StableContentChecksum(tool_name + "\n" + route_arguments_json);
+    const std::filesystem::path root =
+        std::filesystem::path(config.log_root) / "clips_route_arguments";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    const std::filesystem::path path =
+        root / (SanitizeDispatchToken(tool_name, "tool") + "-" + key + ".json");
+    std::ofstream output(path, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!output.is_open()) {
+        return std::string();
+    }
+    output << route_arguments_json;
+    return path.string();
+}
+
 std::string ResolveMcpChainRequestType(const std::string & tool_name) {
     if (tool_name == "lan_agent_run_local_chat"
         || tool_name == "lan_agent_enqueue_local_chat"
@@ -1448,6 +1644,180 @@ int CountUnifiedDiffHunks(const std::string & diff_text) {
     return count;
 }
 
+struct McpPendingContinuationFields {
+    bool active = false;
+    std::string required_tool;
+    std::string required_arguments_json;
+    std::string trace_id;
+    std::string goal_id;
+    std::string source_tool;
+    std::string hash;
+    std::string path;
+};
+
+std::filesystem::path BuildMcpPendingContinuationRoot(const AgentConfig & config) {
+    return std::filesystem::path(config.log_root) / "mcp_pending_continuations";
+}
+
+std::filesystem::path BuildMcpPendingContinuationPath(
+    const AgentConfig & config,
+    const std::string & key) {
+    return BuildMcpPendingContinuationRoot(config)
+        / (SanitizeDispatchToken(key, "trace") + ".kv");
+}
+
+std::string BuildMcpPendingContinuationPathKey(const std::string & path_text) {
+    const std::string trimmed = Trim(path_text);
+    if (trimmed.empty()) {
+        return std::string();
+    }
+    std::filesystem::path path(trimmed);
+    std::string normalized = path.lexically_normal().string();
+    if (normalized.empty()) {
+        normalized = trimmed;
+    }
+    return "path-" + StableContentChecksum(ToLowerAscii(normalized));
+}
+
+bool LoadMcpPendingContinuationByKey(
+    const AgentConfig & config,
+    const std::string & key,
+    McpPendingContinuationFields * pending) {
+    if (pending == nullptr || Trim(key).empty()) {
+        return false;
+    }
+    const std::filesystem::path path = BuildMcpPendingContinuationPath(config, key);
+    std::string content;
+    std::string read_error;
+    if (!ReadWholeFile(path, &content, &read_error)) {
+        return false;
+    }
+    std::unordered_map<std::string, std::string> fields;
+    std::istringstream input(content);
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::size_t separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        fields[line.substr(0, separator)] = line.substr(separator + 1);
+    }
+    if (fields["pending_continuation_active"] != "true"
+        || fields["pending_required_tool"].empty()
+        || fields["pending_required_arguments_json"].empty()) {
+        return false;
+    }
+    pending->active = true;
+    pending->required_tool = fields["pending_required_tool"];
+    pending->required_arguments_json = fields["pending_required_arguments_json"];
+    pending->trace_id = fields["pending_trace_id"];
+    pending->goal_id = fields["pending_goal_id"];
+    pending->source_tool = fields["pending_source_tool"];
+    pending->hash = fields["pending_hash"];
+    pending->path = path.string();
+    return true;
+}
+
+McpPendingContinuationFields LoadMcpPendingContinuationForParams(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    McpPendingContinuationFields pending;
+    const std::string trace_id = params.GetString("trace_id");
+    const std::string goal_id = FirstNonEmpty(
+        params.GetString("goal_id"),
+        params.GetString("task_id"),
+        "");
+    if (LoadMcpPendingContinuationByKey(config, trace_id, &pending)) {
+        return pending;
+    }
+    if (LoadMcpPendingContinuationByKey(config, goal_id, &pending)) {
+        return pending;
+    }
+    const std::string path_key = BuildMcpPendingContinuationPathKey(FirstNonEmpty(
+        params.GetString("file_path"),
+        params.GetString("source_file"),
+        params.GetString("directory_path"),
+        params.GetString("normalized_path"),
+        ""));
+    LoadMcpPendingContinuationByKey(config, path_key, &pending);
+    return pending;
+}
+
+void WriteMcpPendingContinuationByKey(
+    const AgentConfig & config,
+    const std::string & key,
+    const CommandResult & result,
+    const std::string & source_tool,
+    bool active) {
+    if (Trim(key).empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(BuildMcpPendingContinuationRoot(config), ec);
+    const std::filesystem::path path = BuildMcpPendingContinuationPath(config, key);
+    if (!active) {
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    const std::string required_tool = GetFieldOrDefault(result, "required_tool_name", "");
+    const std::string required_arguments_json =
+        GetFieldOrDefault(result, "required_tool_arguments_json", "");
+    if (required_tool.empty() || required_arguments_json.empty()) {
+        return;
+    }
+    std::ofstream output(path, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!output.is_open()) {
+        return;
+    }
+    const std::string trace_id = GetFieldOrDefault(result, "trace_id", "");
+    const std::string goal_id = GetFieldOrDefault(result, "goal_id", "");
+    const std::string hash = StableContentChecksum(required_tool + "\n" + required_arguments_json);
+    output << "pending_continuation_active=true\n"
+           << "pending_required_tool=" << required_tool << "\n"
+           << "pending_required_arguments_json=" << required_arguments_json << "\n"
+           << "pending_trace_id=" << trace_id << "\n"
+           << "pending_goal_id=" << goal_id << "\n"
+           << "pending_source_tool=" << source_tool << "\n"
+           << "pending_hash=" << hash << "\n"
+           << "stored_at=" << IsoTimestampNow() << "\n";
+}
+
+void PersistMcpPendingContinuation(
+    const AgentConfig & config,
+    const std::string & source_tool,
+    const CommandResult & result) {
+    const std::string trace_id = GetFieldOrDefault(result, "trace_id", "");
+    const std::string goal_id = GetFieldOrDefault(result, "goal_id", "");
+    const bool continuation_active =
+        GetFieldOrDefault(result, "continue_required", "false") == "true"
+        && GetFieldOrDefault(result, "terminal_state", "") != "true"
+        && !GetFieldOrDefault(result, "required_tool_name", "").empty()
+        && !GetFieldOrDefault(result, "required_tool_arguments_json", "").empty();
+    WriteMcpPendingContinuationByKey(config, trace_id, result, source_tool, continuation_active);
+    if (!goal_id.empty() && goal_id != trace_id) {
+        WriteMcpPendingContinuationByKey(config, goal_id, result, source_tool, continuation_active);
+    }
+    const std::string required_arguments_json =
+        GetFieldOrDefault(result, "required_tool_arguments_json", "");
+    const std::vector<std::string> path_values = {
+        GetFieldOrDefault(result, "file_path", ""),
+        GetFieldOrDefault(result, "source_file", ""),
+        GetFieldOrDefault(result, "directory_path", ""),
+        GetFieldOrDefault(result, "normalized_path", ""),
+        GetFieldOrDefault(result, "next_file_path", ""),
+        GetFieldOrDefault(result, "next_batch_file_path", ""),
+        ExtractJsonString(required_arguments_json, "file_path"),
+        ExtractJsonString(required_arguments_json, "source_file"),
+        ExtractJsonString(required_arguments_json, "directory_path")
+    };
+    for (const std::string & path_value : path_values) {
+        const std::string path_key = BuildMcpPendingContinuationPathKey(path_value);
+        if (!path_key.empty()) {
+            WriteMcpPendingContinuationByKey(config, path_key, result, source_tool, continuation_active);
+        }
+    }
+}
+
 std::string BuildMcpToolRequestFact(
     const AgentConfig & config,
     const std::string & tool_name,
@@ -1456,6 +1826,7 @@ std::string BuildMcpToolRequestFact(
     if (file_path.empty() && tool_name.find("lan_agent_cmm_") != std::string::npos) {
         file_path = params.GetString("project");
     }
+    const std::string directory_path = params.GetString("directory_path");
     const bool recent_probe_ready = HasRecentProbePath(file_path);
     const std::string probe_ref = FirstNonEmpty(
         params.GetString("probe_ref"),
@@ -1544,6 +1915,18 @@ std::string BuildMcpToolRequestFact(
         params.GetString("cxparser_preflight_status"),
         params.GetString("preflight_ref").empty() ? std::string() : "ready",
         "missing");
+    McpPendingContinuationFields pending =
+        LoadMcpPendingContinuationForParams(config, params);
+    if (params.GetBool("pending_continuation_active", false)
+        || ToLowerAscii(params.GetString("pending_continuation_active")) == "true") {
+        pending.active = true;
+        pending.required_tool = params.GetString("pending_required_tool");
+        pending.required_arguments_json = params.GetString("pending_required_arguments_json");
+        pending.trace_id = params.GetString("pending_trace_id");
+        pending.goal_id = params.GetString("pending_goal_id");
+        pending.source_tool = params.GetString("pending_source_tool");
+        pending.hash = params.GetString("pending_hash");
+    }
     return "(mcp_tool_request "
         + ClipsStringSlot("tool_name", tool_name) + " "
         + ClipsStringSlot("task_id", params.GetString("task_id")) + " "
@@ -1563,6 +1946,7 @@ std::string BuildMcpToolRequestFact(
         + ClipsStringSlot("route_hint", params.GetString("route_hint")) + " "
         + ClipsStringSlot("source_type", params.GetString("source_type")) + " "
         + ClipsStringSlot("file_path", file_path) + " "
+        + ClipsStringSlot("directory_path", directory_path) + " "
         + ClipsStringSlot("scan_mode", params.GetString("scan_mode")) + " "
         + ClipsStringSlot("probe_ref", probe_ref) + " "
         + ClipsStringSlot("patch_id", patch_id) + " "
@@ -1583,7 +1967,19 @@ std::string BuildMcpToolRequestFact(
         + ClipsBoolSlot("requires_preview", tool_name == "lan_agent_preview_patch") + " "
         + ClipsBoolSlot("requires_approval", is_apply_patch_tool) + " "
         + ClipsBoolSlot("requires_revert_plan", is_apply_patch_tool) + " "
-        + ClipsBoolSlot("requires_post_verify", is_apply_patch_tool)
+        + ClipsBoolSlot("requires_post_verify", is_apply_patch_tool) + " "
+        + ClipsBoolSlot("pending_continuation_active", pending.active) + " "
+        + ClipsStringSlot("pending_required_tool", pending.required_tool) + " "
+        + ClipsStringSlot(
+            "pending_required_arguments_json",
+            ClipsContinuationArgumentsFactValue(pending.required_arguments_json)) + " "
+        + ClipsStringSlot("pending_trace_id", pending.trace_id) + " "
+        + ClipsStringSlot("pending_goal_id", pending.goal_id) + " "
+        + ClipsStringSlot("pending_source_tool", pending.source_tool) + " "
+        + ClipsStringSlot("pending_hash", pending.hash) + " "
+        + ClipsBoolSlot("pending_trace_match", !pending.trace_id.empty() && pending.trace_id == params.GetString("trace_id"))
+        + " "
+        + ClipsBoolSlot("continuation_takeover_allowed", AllowsPendingContinuationTakeover(tool_name))
         + ")";
 }
 
@@ -1688,6 +2084,7 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("error_code", GetFieldOrDefault(result, "error_code", "")) + " "
         + ClipsStringSlot("error_message", GetFieldOrDefault(result, "error_message", "")) + " "
         + ClipsStringSlot("status", GetFieldOrDefault(result, "status", "")) + " "
+        + ClipsStringSlot("tool_use_decision", GetFieldOrDefault(result, "tool_use_decision", "")) + " "
         + ClipsStringSlot("task_completion", GetFieldOrDefault(result, "task_completion", "")) + " "
         + ClipsStringSlot("has_more", GetFieldOrDefault(result, "has_more", "false")) + " "
         + ClipsStringSlot("next_start_line", GetFieldOrDefault(result, "next_start_line", "")) + " "
@@ -1708,6 +2105,12 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("directory_remaining_code_file_count", GetFieldOrDefault(result, "directory_remaining_code_file_count", "0")) + " "
         + ClipsStringSlot("directory_scope_incomplete", GetFieldOrDefault(result, "directory_scope_incomplete", "false")) + " "
         + ClipsStringSlot("directory_next_probe_call_json", GetFieldOrDefault(result, "directory_next_probe_call_json", "")) + " "
+        + ClipsStringSlot("flow_id", GetFieldOrDefault(result, "flow_id", "")) + " "
+        + ClipsStringSlot("flow_task_list_required", GetFieldOrDefault(result, "flow_task_list_required", "false")) + " "
+        + ClipsStringSlot("flow_current_task_id", GetFieldOrDefault(result, "flow_current_task_id", "")) + " "
+        + ClipsStringSlot("flow_next_task_id", GetFieldOrDefault(result, "flow_next_task_id", "")) + " "
+        + ClipsStringSlot("flow_task_list_path", GetFieldOrDefault(result, "flow_task_list_path", "")) + " "
+        + ClipsStringSlot("flow_task_list_md_path", GetFieldOrDefault(result, "flow_task_list_md_path", "")) + " "
         + ClipsStringSlot("content_read_completion", GetFieldOrDefault(result, "content_read_completion", "")) + " "
         + ClipsStringSlot("incomplete_scope", GetFieldOrDefault(result, "incomplete_scope", "")) + " "
         + ClipsStringSlot("terminal_state", GetFieldOrDefault(result, "terminal_state", "")) + " "
@@ -1780,6 +2183,15 @@ ClipsDecision EvaluateClipsDecision(
     const JsonRequestView * params,
     const CommandResult * result) {
     ClipsDecision decision;
+    const bool trace_pending_decision =
+        params != nullptr
+        && params->GetBool("pending_continuation_active", false);
+    auto trace_pending_stage = [&](const char * stage) {
+        if (trace_pending_decision) {
+            std::cerr << "[clips_pending_trace] " << stage << std::endl;
+        }
+    };
+    trace_pending_stage("evaluate_enter");
     decision.domain = domain;
     decision.target = tool_name;
     decision.rule_root = ResolveClipsRuleRoot(config);
@@ -1815,6 +2227,7 @@ ClipsDecision EvaluateClipsDecision(
     }
 
     Reset(env);
+    trace_pending_stage("reset_complete");
 
     auto assert_fact =
         [&](const std::string & fact_text) {
@@ -1832,7 +2245,9 @@ ClipsDecision EvaluateClipsDecision(
     if (domain == "mcp_tool_guard" || domain == "cxparser_preflight_guard" || domain == "cmm_init_guard") {
         if (params != nullptr) {
             assert_fact(BuildMcpToolChainFact(tool_name, "pre_call", params, nullptr));
+            trace_pending_stage("chain_fact_asserted");
             assert_fact(BuildMcpToolRequestFact(config, tool_name, *params));
+            trace_pending_stage("request_fact_asserted");
             if (domain == "cxparser_preflight_guard") {
                 assert_fact(BuildCxparserFact(tool_name, *params));
             } else if (domain == "cmm_init_guard") {
@@ -1852,7 +2267,9 @@ ClipsDecision EvaluateClipsDecision(
         }
     }
 
+    trace_pending_stage("run_enter");
     Run(env, -1);
+    trace_pending_stage("run_complete");
 
     decision.engine_status = "after_run_facts_collecting";
 
@@ -1870,6 +2287,22 @@ ClipsDecision EvaluateClipsDecision(
         decision.reason_code = GetClipsFactSlotString(fact, "reason_code");
         decision.matched_rule = GetClipsFactSlotString(fact, "matched_rule");
         decision.route_target = GetClipsFactSlotString(fact, "route_target");
+        decision.route_arguments_json = GetClipsFactSlotString(fact, "route_arguments_json");
+        trace_pending_stage("decision_slots_read");
+        if (params != nullptr
+            && (IsClipsContinuationArgumentsRef(decision.route_arguments_json)
+                || ((decision.reason_code == "pending_continuation_mismatch"
+                        || decision.reason_code == "pending_continuation_context_mismatch")
+                    && decision.route_arguments_json.empty()))) {
+            McpPendingContinuationFields pending =
+                LoadMcpPendingContinuationForParams(config, *params);
+            if (!pending.required_arguments_json.empty()) {
+                decision.route_arguments_json = pending.required_arguments_json;
+            } else {
+                decision.route_arguments_json = params->GetString("pending_required_arguments_json");
+            }
+            trace_pending_stage("route_arguments_restored");
+        }
         decision.engine_status = "decision_found_by_rule:" + decision.matched_rule;
         break;
     }
@@ -1889,14 +2322,17 @@ ClipsDecision EvaluateClipsDecision(
         decision.loaded_files = output.str();
     }
 
+    trace_pending_stage("destroy_enter");
     DestroyEnvironment(env);
+    trace_pending_stage("destroy_complete");
     return decision;
 }
 
 void ApplyClipsDecisionFields(
     const ClipsDecision & decision,
     const std::string & phase,
-    CommandResult * result) {
+    CommandResult * result,
+    const AgentConfig * config = nullptr) {
     if (result == nullptr) {
         return;
     }
@@ -1910,12 +2346,139 @@ void ApplyClipsDecisionFields(
     result->fields[prefix + "matched_rule"] = decision.matched_rule;
     result->fields[prefix + "next_action"] = decision.next_action;
     result->fields[prefix + "route_target"] = decision.route_target;
+    const bool route_arguments_available = !Trim(decision.route_arguments_json).empty();
+    result->fields[prefix + "route_arguments_json"] = "";
+    result->fields[prefix + "route_arguments_json_available"] =
+        route_arguments_available ? "true" : "false";
+    result->fields[prefix + "route_arguments_json_transport"] =
+        route_arguments_available ? "artifact_ref" : "none";
+    if (route_arguments_available && config != nullptr) {
+        result->fields[prefix + "route_arguments_json_ref"] =
+            WriteClipsRouteArgumentsRef(*config, decision.route_target, decision.route_arguments_json);
+    } else {
+        result->fields[prefix + "route_arguments_json_ref"] = "";
+    }
     result->fields[prefix + "engine_status"] = decision.engine_status;
     result->fields[prefix + "loaded_from_files"] = decision.loaded_from_files ? "true" : "false";
     result->fields[prefix + "fallback_used"] = decision.fallback_used ? "true" : "false";
     result->fields[prefix + "rule_root"] = decision.rule_root;
     result->fields[prefix + "loaded_files"] = decision.loaded_files;
     result->fields[prefix + "asserted_fact_count"] = std::to_string(decision.asserted_fact_count);
+}
+
+std::string BuildPreGuardRouteCallJson(
+    const std::string & route_target,
+    const JsonRequestView & params);
+
+void ApplyDirectClipsDecisionContinuation(
+    const AgentConfig & config,
+    const ClipsDecision & decision,
+    const JsonRequestView & params,
+    CommandResult * result) {
+    if (result == nullptr) {
+        return;
+    }
+
+    if (decision.decision != "route") {
+        return;
+    }
+
+    const std::string route_target = FirstNonEmpty(
+        decision.route_target,
+        params.GetString("pending_required_tool"),
+        params.GetString("route_hint"),
+        params.GetString("file_path").empty() ? std::string() : "lan_agent_probe_text_file");
+    const std::string fallback_next_call_json =
+        BuildPreGuardRouteCallJson(route_target, params);
+    const std::string next_call_json = FirstNonEmpty(
+        decision.route_arguments_json,
+        params.GetString("pending_required_arguments_json"),
+        fallback_next_call_json,
+        "");
+    if (route_target.empty() || next_call_json.empty()) {
+        return;
+    }
+
+    result->fields["status"] = "needs_continue";
+    result->fields["verification"] = "not_verified";
+    result->fields["verification_status"] = "not_verified";
+    result->fields["verification_ok"] = "false";
+    result->fields["semantic_model_clamp"] = "tool_call_only";
+    result->fields["assistant_response_allowed"] = "false";
+    result->fields["final_answer_allowed"] = "false";
+    result->fields["required_next_action_type"] = "mcp_tool_call";
+    result->fields["required_tool_name"] = route_target;
+    result->fields["required_tool_arguments_json"] = next_call_json;
+    result->fields["next_call_json"] = next_call_json;
+    result->fields["route_target"] = route_target;
+    result->fields["clips_continuation_required"] = "true";
+    result->fields["clips_continuation_policy"] =
+        "do not return assistant text; call required_tool_arguments_json until the declared continuation completes";
+    result->fields["pre_guard_route_arguments_source"] =
+        decision.route_arguments_json.empty() ? "rebuilt_from_request" : "clips_route_arguments_json";
+    result->fields["supervision_status"] = "closed_loop_continue";
+    result->fields["goal_status"] = "not_complete";
+    result->fields["terminal_state"] = "false";
+    result->fields["task_done"] = "false";
+    result->fields["continue_required"] = "true";
+    result->fields["auto_continue_required"] = "false";
+    result->fields["analysis_allowed"] = "false";
+    result->fields["completion_claim_allowed"] = "false";
+    result->fields["must_continue_until"] = "continuation_result_is_terminal";
+    result->fields["completion_guard"] =
+        "NON_TERMINAL_RESULT: do not claim completion; execute required_tool_arguments_json";
+    result->fields["ai_conclusion_valid"] = "false";
+    result->fields["invalid_conclusion_reason"] = FirstNonEmpty(
+        decision.reason_code,
+        "clips_route_required");
+    result->fields["supervision_alarm"] = "false";
+    result->fields["supervision_alarm_code"].clear();
+    result->fields["supervision_alarm_message"].clear();
+    result->fields["failure_mode"] = "none";
+    result->ok = true;
+    result->exit_code = 0;
+    result->fields["ok"] = "true";
+    result->fields["next_action_0_tool_name"] = route_target;
+    result->fields["next_action_0_safety_class"] =
+        route_target == "lan_agent_delete_text_range_window_atomic" ? "WRITE_CONTROLLED" : "READ_ONLY";
+    result->fields["next_action_0_params_json"] = next_call_json;
+    result->fields["next_action_0_reason"] = FirstNonEmpty(
+        decision.next_action,
+        "tool_call_only: execute required_tool_arguments_json");
+    result->fields["next_action_0_trace_id"] = FirstNonEmpty(
+        params.GetString("trace_id"),
+        GetFieldOrDefault(*result, "trace_id", ""));
+    result->fields["next_action_0_goal_id"] = FirstNonEmpty(
+        params.GetString("goal_id"),
+        params.GetString("task_id"),
+        GetFieldOrDefault(*result, "goal_id", ""));
+    result->fields["next_action_0_params_hash"] =
+        StableContentChecksum(route_target + "\n" + next_call_json);
+    result->fields["next_actions_count"] = "1";
+
+    if (GetFieldOrDefault(*result, "next_action", "").empty()) {
+        result->fields["next_action"] = FirstNonEmpty(
+            decision.next_action,
+            "tool_call_only: execute required_tool_arguments_json");
+    }
+    if (route_target == "lan_agent_delete_text_range_window_atomic") {
+        result->fields["operation_granularity"] = "bounded_line_window_text_range_delete";
+        result->fields["max_items_per_call"] = "200_lines";
+        result->fields["max_lines_per_call"] = "200";
+        result->fields["batch_mutation_allowed"] = "bounded_window_only";
+        result->fields["window_batch_scope"] = "single_file_bounded_line_window";
+        result->fields["effective_window_policy"] = "comment_cleanup_fixed_200_line_window";
+    }
+    if (GetFieldOrDefault(*result, "route_arguments_json_ref", "").empty()) {
+        result->fields["route_arguments_json_ref"] =
+            WriteClipsRouteArgumentsRef(config, route_target, next_call_json);
+    }
+    if (GetFieldOrDefault(*result, "route_arguments_json_available", "").empty()) {
+        result->fields["route_arguments_json_available"] = "true";
+    }
+    if (GetFieldOrDefault(*result, "route_arguments_json_transport", "").empty()) {
+        result->fields["route_arguments_json_transport"] = "artifact_ref";
+    }
 }
 
 void ApplyClipsChainTemplateFields(
@@ -1936,7 +2499,10 @@ void ApplyClipsChainTemplateFields(
 }
 
 bool ToolRequiresClipsPreflight(const std::string & tool_name) {
-    (void) tool_name;
+    if (tool_name == "lan_agent_clips_decide"
+        || tool_name == "lan_agent_clips_chain_template") {
+        return false;
+    }
     return true;
 }
 
@@ -1958,7 +2524,10 @@ std::string ResolveClipsPreflightDomain(const std::string & tool_name) {
 }
 
 bool ToolRequiresClipsResultGuard(const std::string & tool_name) {
-    (void) tool_name;
+    if (tool_name == "lan_agent_clips_decide"
+        || tool_name == "lan_agent_clips_chain_template") {
+        return false;
+    }
     return true;
 }
 
@@ -2000,6 +2569,7 @@ CommandResult BuildClipsDecisionResult(
     seed_result.fields["summary"] = params.GetString("summary");
     seed_result.fields["assistant_text"] = params.GetString("assistant_text");
     seed_result.fields["error"] = params.GetString("error");
+    seed_result.fields["tool_use_decision"] = params.GetString("tool_use_decision");
     seed_result.fields["ai_conclusion_valid"] = ClipsParamBoolString(params, "ai_conclusion_valid", "true");
     seed_result.fields["task_completion"] = params.GetString("task_completion");
     seed_result.fields["has_more"] = ClipsParamBoolString(params, "has_more", "false");
@@ -2044,10 +2614,37 @@ CommandResult BuildClipsDecisionResult(
     seed_result.fields["result_hash"] = params.GetString("result_hash");
     seed_result.fields["schema_version"] = params.GetString("schema_version");
     seed_result.fields["result_schema_id"] = params.GetString("result_schema_id");
+    seed_result.fields["flow_id"] = params.GetString("flow_id");
+    seed_result.fields["flow_task_list_required"] = ClipsParamBoolString(params, "flow_task_list_required", "false");
+    seed_result.fields["flow_current_task_id"] = params.GetString("flow_current_task_id");
+    seed_result.fields["flow_next_task_id"] = params.GetString("flow_next_task_id");
+    seed_result.fields["flow_task_list_path"] = params.GetString("flow_task_list_path");
+    seed_result.fields["flow_task_list_md_path"] = params.GetString("flow_task_list_md_path");
 
     const CommandResult * result_ptr = domain == "mcp_result_guard" ? &seed_result : nullptr;
     const JsonRequestView * params_ptr = domain == "mcp_result_guard" ? nullptr : &params;
-    const ClipsDecision decision = EvaluateClipsDecision(config, domain, tool_name, params_ptr, result_ptr);
+    ClipsDecision decision;
+    try {
+        decision = EvaluateClipsDecision(config, domain, tool_name, params_ptr, result_ptr);
+    } catch (const std::exception & ex) {
+        decision.domain = domain;
+        decision.target = tool_name;
+        decision.fallback_used = true;
+        decision.engine_status = std::string("exception:") + ex.what();
+        decision.decision = "allow";
+        decision.verification = "not_verified";
+        decision.reason_code = "clips_decision_exception";
+        decision.next_action = "CLIPS decision failed; use conservative MCP route fallback and inspect clips_explicit_engine_status";
+    } catch (...) {
+        decision.domain = domain;
+        decision.target = tool_name;
+        decision.fallback_used = true;
+        decision.engine_status = "exception:unknown";
+        decision.decision = "allow";
+        decision.verification = "not_verified";
+        decision.reason_code = "clips_decision_exception";
+        decision.next_action = "CLIPS decision failed; use conservative MCP route fallback and inspect clips_explicit_engine_status";
+    }
 
     CommandResult result;
     result.ok = true;
@@ -2065,9 +2662,26 @@ CommandResult BuildClipsDecisionResult(
     result.fields["reason_code"] = decision.reason_code;
     result.fields["matched_rule"] = decision.matched_rule;
     result.fields["route_target"] = decision.route_target;
+    const bool expose_route_arguments_json =
+        params.GetBool("expose_route_arguments_json", false)
+        || ToLowerAscii(params.GetString("expose_route_arguments_json")) == "true";
+    const std::string route_arguments_json_ref =
+        WriteClipsRouteArgumentsRef(config, tool_name, decision.route_arguments_json);
+    result.fields["route_arguments_json"] =
+        expose_route_arguments_json ? decision.route_arguments_json : std::string();
+    result.fields["route_arguments_json_ref"] = route_arguments_json_ref;
+    result.fields["route_arguments_json_available"] =
+        decision.route_arguments_json.empty() ? "false" : "true";
+    result.fields["route_arguments_json_transport"] =
+        decision.route_arguments_json.empty()
+            ? "none"
+            : (expose_route_arguments_json ? "inline" : "artifact_ref");
     result.fields["schema"] =
-        "fact_schema_id,decision_schema_id,decision,verification,next_action,reason_code,matched_rule,route_target,engine_status";
-    if (domain == "mcp_result_guard") {
+        "fact_schema_id,decision_schema_id,decision,verification,next_action,reason_code,matched_rule,route_target,route_arguments_json_ref,engine_status";
+    if (decision.reason_code == "clips_decision_exception") {
+        result.fields["input_fact"] = "";
+        result.fields["input_fact_status"] = "skipped_after_clips_exception";
+    } else if (domain == "mcp_result_guard") {
         result.fields["input_fact"] = BuildMcpToolResultFact(tool_name, seed_result);
     } else if (domain == "slice_ingest_guard") {
         result.fields["input_fact"] = BuildSliceIngestFact(params);
@@ -2076,7 +2690,7 @@ CommandResult BuildClipsDecisionResult(
     } else {
         result.fields["input_fact"] = BuildMcpToolRequestFact(config, tool_name, params);
     }
-    ApplyClipsDecisionFields(decision, "explicit", &result);
+    ApplyClipsDecisionFields(decision, "explicit", &result, &config);
 
     // Debug: Add parameter summary for debugging
     result.fields["debug_file_path"] = params.GetString("file_path");
@@ -2305,7 +2919,10 @@ void ApplyClipsPreflightRouteResult(
         return;
     }
     const std::string route_target = FirstNonEmpty(decision.route_target, params.GetString("route_hint"), params.GetString("file_path").empty() ? std::string() : "lan_agent_probe_text_file");
-    const std::string next_call_json = BuildPreGuardRouteCallJson(route_target, params);
+    const std::string next_call_json = FirstNonEmpty(
+        decision.route_arguments_json,
+        BuildPreGuardRouteCallJson(route_target, params),
+        "");
 
     result->ok = true;
     result->exit_code = 0;
@@ -2331,6 +2948,16 @@ void ApplyClipsPreflightRouteResult(
     result->fields["required_tool_name"] = route_target;
     result->fields["required_tool_arguments_json"] = next_call_json;
     result->fields["next_call_json"] = next_call_json;
+    result->fields["pre_guard_route_arguments_source"] =
+        decision.route_arguments_json.empty() ? "rebuilt_from_request" : "clips_route_arguments_json";
+    if (route_target == "lan_agent_task_memory_freeze") {
+        result->fields["task_execution_in_mcp_required"] = "true";
+        result->fields["forced_task_memory_execution"] = "true";
+        result->fields["long_loop_budget_recommended"] = "true";
+        result->fields["long_loop_freeze_tool_name"] = "lan_agent_task_memory_freeze";
+        result->fields["long_loop_budget_tool_name"] =
+            "lan_agent_task_memory_execute_continuation_budget";
+    }
     result->fields["local_ai_guidance_enforced"] = "true";
     result->fields["local_ai_required_first_tool"] = "lan_agent_mcp_overview";
     result->fields["local_ai_uncertain_route_tool"] = "lan_agent_clips_decide";
@@ -2394,6 +3021,9 @@ bool MaybeApplyClipsPreflightBlock(
     const std::string & tool_name,
     const JsonRequestView & params,
     CommandResult * result) {
+    if (tool_name == "lan_agent_mcp_route") {
+        return false;
+    }
     if (!ToolRequiresClipsPreflight(tool_name) || result == nullptr) {
         return false;
     }
@@ -2404,7 +3034,7 @@ bool MaybeApplyClipsPreflightBlock(
         &params,
         nullptr);
     ApplyClipsChainTemplateFields(tool_name, "pre_call_tool", result);
-    ApplyClipsDecisionFields(tool_decision, "pre_call_tool", result);
+    ApplyClipsDecisionFields(tool_decision, "pre_call_tool", result, &config);
     result->fields["clips_pre_call_tool_chain_fact"] =
         BuildMcpToolChainFact(tool_name, "pre_call", &params, nullptr);
     result->fields["clips_pre_call_tool_fact"] = BuildMcpToolRequestFact(config, tool_name, params);
@@ -2467,7 +3097,7 @@ bool MaybeApplyClipsPreflightBlock(
         &params,
         nullptr);
     ApplyClipsChainTemplateFields(tool_name, "pre_call", result);
-    ApplyClipsDecisionFields(decision, "pre_call", result);
+    ApplyClipsDecisionFields(decision, "pre_call", result, &config);
     result->fields["clips_pre_call_chain_fact"] =
         BuildMcpToolChainFact(tool_name, "pre_call", &params, nullptr);
     result->fields["clips_pre_call_fact"] = BuildMcpToolRequestFact(config, tool_name, params);
@@ -2541,7 +3171,7 @@ void ApplyClipsResultGuard(
         nullptr,
         result);
     ApplyClipsChainTemplateFields(tool_name, "post_result", result);
-    ApplyClipsDecisionFields(decision, "post_result", result);
+    ApplyClipsDecisionFields(decision, "post_result", result, &config);
     result->fields["clips_post_result_chain_fact"] =
         BuildMcpToolChainFact(tool_name, "post_result", nullptr, result);
     const bool pending_text_range_delete =
@@ -2684,7 +3314,8 @@ void ApplyClipsResultGuard(
         tool_name == "lan_agent_mcp_route"
         && GetFieldOrDefault(*result, "continue_required", "false") == "true"
         && !GetFieldOrDefault(*result, "required_tool_name", "").empty();
-    if (pending_mcp_route_continuation) {
+    if (pending_mcp_route_continuation
+        && GetFieldOrDefault(*result, "supervision_alarm", "false") != "true") {
         result->ok = true;
         result->exit_code = 0;
         result->fields["ok"] = "true";
