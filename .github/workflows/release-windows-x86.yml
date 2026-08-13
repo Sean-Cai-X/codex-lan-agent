@@ -1,0 +1,399 @@
+name: release-windows-x86
+
+# ================================================================
+# Windows X86 (32-bit) release pipeline — mirrors release-windows-x64.
+#
+# Root cause of previous x86 GN failures:
+#   The repo had NO .gn / *.gni / BUILD.gn files at all; only CMake was
+#   the real build system.  GN actions failed at `gn gen out/release`
+#   because the root .gn was missing.  This pipeline uses CMake + Ninja
+#   with vcvars32.bat (the X86 MSVC toolchain bootstrap) so the CMake
+#   build naturally targets Win32.
+#
+# Two-layer architecture (same as x64, but cache keys carry -x86 suffix
+# to keep 32-bit prebuilt .lib isolated from 64-bit ones):
+#   Layer 1 - llvm-toolchain-x86:
+#       Builds LLVM/Clang 18.1.8 static libs (Win32) once, caches.
+#   Layer 2 - codex-build-release-x86:
+#       Restores cached flat LLVM_ROOT, does incremental compile of
+#       codex_lan_agent (32-bit) only.
+# ================================================================
+
+on:
+  push:
+    tags:
+      - "v*-x86"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to create release for (e.g. v2026.08.13-x86)"
+        required: false
+        default: ""
+        type: string
+      force_rebuild_llvm:
+        description: "Force rebuild LLVM toolchain (ignore cache)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  LLVM_VERSION: 18.1.8
+  # Cache key encodes version + compile flags + x86 architecture.
+  # Bump the -vN suffix ONLY when changing LLVM compile flags / version.
+  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-msvc-ninja-x86-v3
+  ROCKSDB_VERSION: 11.0.4
+  ROCKSDB_CACHE_KEY: rocksdb-11.0.4-static-msvc-md-x86-v1
+  ARCH: x86
+
+jobs:
+  # ============================================================
+  # Layer 1: LLVM/Clang 32-bit toolchain (cached)
+  # ============================================================
+  llvm-toolchain-x86:
+    name: "Layer 1 · LLVM/Clang 18.1.8 x86 toolchain (cached)"
+    runs-on: windows-latest
+    outputs:
+      llvm_root: ${{ steps.llvm-root-output.outputs.llvm_root }}
+      cache_hit: ${{ steps.cache-llvm.outputs.cache-hit }}
+
+    steps:
+      - name: Probe MSVC (vcvars32 path for X86 target)
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "VS install: $VS_INSTALL"
+          # 关键差异：使用 vcvars32.bat 初始化 Win32 工具链
+          $vcvars = Join-Path $VS_INSTALL "VC\Auxiliary\Build\vcvars32.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars32.bat not found at $vcvars" }
+          Write-Host "vcvars (x86): $vcvars"
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache flat LLVM/Clang 18.1.8 x86 static libs
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/llvm_root_x86
+          key: ${{ env.LLVM_CACHE_KEY }}
+          # Save even if business build later fails — Layer 1 cache is independent.
+          save-always: true
+
+      - name: Build LLVM/Clang 18.1.8 x86 static libs + assemble flat LLVM_ROOT
+        if: |
+          steps.cache-llvm.outputs.cache-hit != 'true' ||
+          github.event.inputs.force_rebuild_llvm == 'true'
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          echo on
+          :: Critical: after vcvars32 the CMAKE_GENERATOR_PLATFORM / triple
+          :: defaults to X86 — no extra -A flag needed with Ninja.
+          set LLVM_SRC=%RUNNER_WORKSPACE%\llvm-project-src-x86
+          set LLVM_BUILD=%RUNNER_WORKSPACE%\llvm-project-build-x86
+          set LLVM_ROOT_FLAT=%RUNNER_WORKSPACE%\llvm_root_x86
+          if exist %LLVM_SRC% rmdir /s /q %LLVM_SRC%
+          if exist %LLVM_BUILD% rmdir /s /q %LLVM_BUILD%
+          if exist %LLVM_ROOT_FLAT% rmdir /s /q %LLVM_ROOT_FLAT%
+          git clone --depth 1 --branch llvmorg-%LLVM_VERSION% https://github.com/llvm/llvm-project.git %LLVM_SRC%
+          if errorlevel 1 exit /b 1
+          cmake -G Ninja -S %LLVM_SRC%\llvm -B %LLVM_BUILD% ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLVM_ENABLE_PROJECTS=clang ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DLLVM_TARGETS_TO_BUILD=X86 ^
+            -DLLVM_INCLUDE_TESTS=OFF ^
+            -DLLVM_INCLUDE_EXAMPLES=OFF ^
+            -DLLVM_INCLUDE_BENCHMARKS=OFF ^
+            -DLLVM_INCLUDE_DOCS=OFF ^
+            -DCLANG_INCLUDE_TESTS=OFF ^
+            -DCLANG_INCLUDE_DOCS=OFF ^
+            -DLLVM_BUILD_TOOLS=OFF ^
+            -DCLANG_BUILD_TOOLS=OFF ^
+            -DLLVM_ENABLE_DIA_SDK=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build %LLVM_BUILD% --config Release --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          mkdir %LLVM_ROOT_FLAT%\include
+          mkdir %LLVM_ROOT_FLAT%\lib
+          xcopy /y /e /i %LLVM_SRC%\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          if exist %LLVM_SRC%\clang\include\clang-c xcopy /y /e /i %LLVM_SRC%\clang\include\clang-c %LLVM_ROOT_FLAT%\include\clang-c >nul
+          xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
+          if exist %LLVM_SRC%\llvm\include\llvm-c xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm-c %LLVM_ROOT_FLAT%\include\llvm-c >nul
+          xcopy /y /e /i %LLVM_BUILD%\include\llvm\Config %LLVM_ROOT_FLAT%\include\llvm\Config >nul
+          xcopy /y /e /i %LLVM_BUILD%\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
+          if exist %LLVM_BUILD%\tools\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\tools\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          if exist %LLVM_BUILD%\projects\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\projects\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          if exist %LLVM_BUILD%\NATIVE\tools\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\NATIVE\tools\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          if exist %LLVM_BUILD%\NATIVE\projects\clang\include\clang (
+            xcopy /y /e /i %LLVM_BUILD%\NATIVE\projects\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          )
+          copy /y %LLVM_BUILD%\lib\*.lib %LLVM_ROOT_FLAT%\lib\ >nul
+          if not exist %LLVM_ROOT_FLAT%\include\clang\AST\ASTConsumer.h (
+            echo ERROR: clang AST source header missing & exit /b 1
+          )
+          if not exist %LLVM_ROOT_FLAT%\include\clang\Basic\DiagnosticCommonKinds.inc (
+            echo ERROR: TableGen DiagnosticCommonKinds.inc missing & exit /b 1
+          )
+          if not exist %LLVM_ROOT_FLAT%\include\llvm\Frontend\OpenMP\OMP.inc (
+            echo ERROR: LLVM OMP.inc missing & exit /b 1
+          )
+          if not exist %LLVM_ROOT_FLAT%\lib\clangTooling.lib (
+            echo ERROR: clangTooling.lib (x86) missing & exit /b 1
+          )
+          dir /b %LLVM_ROOT_FLAT%\lib\*.lib | find /c /v "" > %TEMP%\libcount.txt
+          set /p LIBCOUNT=<%TEMP%\libcount.txt
+          echo LLVM x86 flat root assembled (%LIBCOUNT% .lib files)
+
+      - name: Verify LLVM_ROOT x86 integrity
+        shell: pwsh
+        run: |
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root_x86"
+          $h    = Join-Path $Root "include\clang\AST\ASTConsumer.h"
+          $inc  = Join-Path $Root "include\clang\Basic\DiagnosticCommonKinds.inc"
+          $omp  = Join-Path $Root "include\llvm\Frontend\OpenMP\OMP.inc"
+          $l    = Join-Path $Root "lib\clangTooling.lib"
+          if (-not (Test-Path $h))   { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $inc)) { Write-Error "Missing TableGen header $inc"; exit 1 }
+          if (-not (Test-Path $omp)) { Write-Error "Missing LLVM generated header $omp"; exit 1 }
+          if (-not (Test-Path $l))   { Write-Error "Missing $l"; exit 1 }
+          $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
+          $incCount = (Get-ChildItem (Join-Path $Root "include\clang") -Recurse -Filter "*.inc").Count
+          $llvmIncCount = (Get-ChildItem (Join-Path $Root "include\llvm") -Recurse -Filter "*.inc").Count
+          Write-Host "LLVM_ROOT(x86)=$Root  (.lib count: $libCount, clang .inc: $incCount, llvm .inc: $llvmIncCount)"
+
+      - name: Export LLVM_ROOT x86 path
+        id: llvm-root-output
+        shell: pwsh
+        run: |
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root_x86"
+          "llvm_root=$Root" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+  # ============================================================
+  # Layer 2: Business build (32-bit)
+  # ============================================================
+  codex-build-release-x86:
+    name: "Layer 2 · codex_lan_agent x86 build + Release"
+    runs-on: windows-latest
+    needs: llvm-toolchain-x86
+
+    steps:
+      - name: Checkout codex-lan-agent sources
+        uses: actions/checkout@v4
+
+      - name: Probe MSVC (vcvars32 path — critical for x86 target)
+        shell: pwsh
+        run: |
+          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          Write-Host "ninja: $ninja"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "VS install: $VS_INSTALL"
+          $vcvars = Join-Path $VS_INSTALL "VC\Auxiliary\Build\vcvars32.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars32.bat not found at $vcvars" }
+          Write-Host "vcvars (x86): $vcvars"
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore cached flat LLVM_ROOT x86
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/llvm_root_x86
+          key: ${{ env.LLVM_CACHE_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Verify LLVM_ROOT x86 integrity
+        shell: pwsh
+        run: |
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root_x86"
+          $h    = Join-Path $Root "include\clang\AST\ASTConsumer.h"
+          $inc  = Join-Path $Root "include\clang\Basic\DiagnosticCommonKinds.inc"
+          $omp  = Join-Path $Root "include\llvm\Frontend\OpenMP\OMP.inc"
+          $l    = Join-Path $Root "lib\clangTooling.lib"
+          if (-not (Test-Path $h))   { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $inc)) { Write-Error "Missing $inc"; exit 1 }
+          if (-not (Test-Path $omp)) { Write-Error "Missing $omp"; exit 1 }
+          if (-not (Test-Path $l))   { Write-Error "Missing $l"; exit 1 }
+          $libCount = (Get-ChildItem (Join-Path $Root "lib") -Filter "*.lib").Count
+          Write-Host "LLVM_ROOT(x86) restored  (.lib count: $libCount)  [cache-hit: ${{ needs.llvm-toolchain-x86.outputs.cache_hit }}]"
+
+      - name: Restore cached RocksDB 11.0.4 x86
+        id: cache-rocksdb
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/rocksdb_install_x86
+          key: ${{ env.ROCKSDB_CACHE_KEY }}
+
+      - name: Build RocksDB 11.0.4 x86 (static lib, /MD)
+        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          set ROCKSDB_SRC=%RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION%-x86-src
+          set ROCKSDB_BUILD=%RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION%-x86-build
+          set ROCKSDB_INSTALL=%RUNNER_WORKSPACE%\rocksdb_install_x86
+          if exist %ROCKSDB_INSTALL% rmdir /s /q %ROCKSDB_INSTALL%
+          curl -L -o %TEMP%\rocksdb.tar.gz https://github.com/facebook/rocksdb/archive/refs/tags/v%ROCKSDB_VERSION%.tar.gz
+          if errorlevel 1 exit /b 1
+          tar -xzf %TEMP%\rocksdb.tar.gz -C %RUNNER_WORKSPACE%
+          move %RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION% %ROCKSDB_SRC%
+          if errorlevel 1 exit /b 1
+          cmake -G Ninja -S %ROCKSDB_SRC% -B %ROCKSDB_BUILD% ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DPORTABLE=1 ^
+            -DWITH_TESTS=OFF -DWITH_BENCHMARK_TOOLS=OFF -DWITH_TOOLS=OFF ^
+            -DWITH_JNI=OFF -DWITH_GFLAGS=OFF ^
+            -DWITH_SNAPPY=OFF -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZIP2=OFF -DWITH_TBB=OFF ^
+            -DROCKSDB_BUILD_SHARED=OFF ^
+            -DUSE_RTTI=1 ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+          if errorlevel 1 exit /b 1
+          cmake --build %ROCKSDB_BUILD% --target rocksdb --config Release --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          mkdir %ROCKSDB_INSTALL%\include
+          mkdir %ROCKSDB_INSTALL%\lib
+          xcopy /y /e /i %ROCKSDB_SRC%\include\* %ROCKSDB_INSTALL%\include\ >nul
+          copy /y %ROCKSDB_BUILD%\rocksdb.lib %ROCKSDB_INSTALL%\lib\rocksdb.lib >nul
+          if not exist %ROCKSDB_INSTALL%\include\rocksdb\db.h ( echo ERROR: rocksdb/db.h missing & exit /b 1 )
+          if not exist %ROCKSDB_INSTALL%\lib\rocksdb.lib ( echo ERROR: rocksdb.lib (x86) missing & exit /b 1 )
+          echo RocksDB x86 static lib staged
+
+      - name: Verify RocksDB x86 install
+        shell: pwsh
+        run: |
+          $Install = Join-Path "${{ runner.workspace }}" "rocksdb_install_x86"
+          $h = Join-Path $Install "include\rocksdb\db.h"
+          $l = Join-Path $Install "lib\rocksdb.lib"
+          if (-not (Test-Path $h)) { Write-Error "Missing $h"; exit 1 }
+          if (-not (Test-Path $l)) { Write-Error "Missing $l"; exit 1 }
+          $libSize = (Get-Item $l).Length
+          Write-Host "RocksDB x86 install OK  (rocksdb.lib: $([math]::Round($libSize/1MB,2)) MB)  [cache-hit: ${{ steps.cache-rocksdb.outputs.cache-hit }}]"
+
+      - name: Configure codex_lan_agent x86 (Ninja + vcvars32)
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          set REPO=%CD%
+          set INSTALLDIR=%RUNNER_WORKSPACE%\llvm_root_x86
+          set BUILD=%REPO%\build_release_x86
+          cmake -S %REPO% -B %BUILD% ^
+            -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCODEX_LAN_AGENT_ENABLE_CLANG_AST=ON ^
+            -DCODEX_LAN_AGENT_BUILD_CLANG_INDEXER=OFF ^
+            -DCODEX_LAN_AGENT_COPY_TO_ROOT=OFF ^
+            -DCODEX_LAN_AGENT_BUNDLE_CMM=OFF ^
+            -DCODEX_LAN_AGENT_WITH_ROCKSDB=ON ^
+            -DCODEX_LAN_AGENT_ROCKSDB_INCLUDE_DIR="%RUNNER_WORKSPACE%\rocksdb_install_x86\include" ^
+            -DCODEX_LAN_AGENT_ROCKSDB_LIBRARY="%RUNNER_WORKSPACE%\rocksdb_install_x86\lib\rocksdb.lib" ^
+            -DCODEX_LLVM_ROOT="%INSTALLDIR%"
+          if errorlevel 1 exit /b 1
+
+      - name: Build codex_lan_agent x86 (Release)
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          set BUILD=%CD%\build_release_x86
+          cmake --build %BUILD% --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          if not exist %BUILD%\codex_lan_agent.exe (
+            echo ERROR: codex_lan_agent.exe (x86) not built & exit /b 1
+          )
+          for %%I in (%BUILD%\codex_lan_agent.exe) do echo Build OK (x86): %%~nxI  size=%%~zI bytes
+
+      - name: Stage x86 release package
+        shell: pwsh
+        run: |
+          $Repo = Get-Location
+          $Exe = Join-Path $Repo "build_release_x86\codex_lan_agent.exe"
+          if (-not (Test-Path $Exe)) { Write-Error "exe missing at $Exe"; exit 1 }
+          $Stage = Join-Path $Repo "stage\codex_lan_agent-windows-x86"
+          New-Item -ItemType Directory -Force -Path (Join-Path $Stage "bin") | Out-Null
+          Copy-Item $Exe (Join-Path $Stage "bin\codex_lan_agent.exe")
+          if (Test-Path (Join-Path $Repo "codex_lan_agent.cfg")) {
+            Copy-Item (Join-Path $Repo "codex_lan_agent.cfg") $Stage
+          }
+          if (Test-Path (Join-Path $Repo "README.md")) {
+            Copy-Item (Join-Path $Repo "README.md") $Stage
+          }
+          if (Test-Path (Join-Path $Repo "LICENSE")) {
+            Copy-Item (Join-Path $Repo "LICENSE") $Stage
+          }
+          $Zip = Join-Path $Repo "codex_lan_agent-windows-x86.zip"
+          if (Test-Path $Zip) { Remove-Item $Zip }
+          Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip
+          $zipItem = Get-Item $Zip
+          Write-Host "Package: $($zipItem.Name)  $([math]::Round($zipItem.Length/1MB,2)) MB  (x86 / Win32)"
+
+      - name: Create GitHub Release (x86 tag) and upload artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $Repo = Get-Location
+          $Zip = Join-Path $Repo "codex_lan_agent-windows-x86.zip"
+          if (-not (Test-Path $Zip)) { Write-Error "zip missing"; exit 1 }
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ github.event.inputs.tag }}' -ne '') {
+            $Tag = '${{ github.event.inputs.tag }}'
+          } elseif ('${{ github.ref_type }}' -eq 'tag') {
+            $Tag = '${{ github.ref_name }}'
+          } else {
+            $Tag = 'v' + (Get-Date -Format 'yyyy.MM.dd') + '-x86'
+            Write-Host "No tag context, fallback: $Tag"
+          }
+          $Sha = (git rev-parse HEAD).Substring(0,7)
+          $Layer1Hit = '${{ needs.llvm-toolchain-x86.outputs.cache_hit }}'
+          $Body = @"
+          ## codex_lan_agent $Tag (Windows x86 · Win32)
+
+          > Previous x86 GN builds failed because the repo had **no .gn / BUILD.gn files at all**. This pipeline uses the **real build system** (CMake + Ninja + vcvars32 MSVC toolchain bootstrap) to produce a native 32-bit build.
+
+          ### Two-layer build (GitHub-hosted runner · x86)
+          - **Layer 1 - LLVM toolchain (x86)**: LLVM/Clang 18.1.8 built from source (Win32 static libs)
+            - Status: $(if ($Layer1Hit -eq 'true') {'cache HIT (reused prebuilt static libs)'} else {'cache MISS (rebuilt from source, ~hours)'})
+            - Cache key: ```${{ env.LLVM_CACHE_KEY }}```
+          - **Layer 2 - Business build (x86)**: codex_lan_agent incremental compile on cached LLVM_ROOT (x86)
+            - Toolchain bootstrap: **vcvars32.bat** (the key difference vs x64)
+            - Static linkage: all x86 LLVM/Clang .lib statically linked into the single exe
+            - Release ZIP contains NO .lib/.dll — third-party code is compiled-in from source
+          - Commit sha: $Sha
+
+          ### Architecture matrix
+          | Arch | Tag pattern | Pipeline | Toolchain bootstrap |
+          |---|---|---|---|
+          | x64 | `vYYYY.MM.DD-x64` | release.yml | vcvars64.bat |
+          | x86 | `vYYYY.MM.DD-x86` | release-windows-x86.yml | **vcvars32.bat** (NEW) |
+
+          ### Trigger
+          - **Push tag** `git tag v$(Get-Date -Format 'yyyy.MM.dd')-x86; git push origin v$(Get-Date -Format 'yyyy.MM.dd')-x86`
+          - Or use the **workflow_dispatch** button on this file with a tag input like `v2026.08.13-x86`
+
+          ### Third-party dependencies (ALL online, nothing vendored)
+          - **LLVM/Clang 18.1.8 x86**: official llvmorg-18.1.8 · Apache-2.0 WITH LLVM-exception
+          - **RocksDB 11.0.4 x86**: official v11.0.4 · GPL/Apache (static link, /MD CRT)
+          "@
+          $NotesFile = Join-Path $env:RUNNER_TEMP "release_notes_$Tag.md"
+          $Body | Out-File -FilePath $NotesFile -Encoding utf8
+          $existing = gh release view $Tag --repo '${{ github.repository }}' 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Creating release $Tag (x86)..."
+            gh release create $Tag --repo '${{ github.repository }}' `
+              --title "codex_lan_agent $Tag · Windows x86 (Win32 · CMake + vcvars32)" `
+              --notes-file $NotesFile `
+              --target '${{ github.sha }}' `
+              $Zip
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          } else {
+            Write-Host "Release $Tag exists; uploading asset..."
+            gh release upload $Tag --repo '${{ github.repository }}' --clobber $Zip
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          }
+          Write-Host "=== x86 Release completed for tag $Tag ==="

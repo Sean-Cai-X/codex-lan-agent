@@ -1,20 +1,29 @@
-name: Universal GN/Ninja Build Pipeline
+﻿name: Universal GN/Ninja Build Pipeline (DISABLED — no GN files in repo, use release-windows-x64.yml / release-windows-x86.yml)
+
+# ================================================================
+#  WARNING: THIS WORKFLOW IS EFFECTIVELY DISABLED.
+#
+#  Root cause: The project has NO `.gn` / `*.gni` / `BUILD.gn` files.
+#  The real build system is **CMake** (CMakeLists.txt + src/ at repo root).
+#  This workflow always failed at step "GN generate build.ninja" because
+#  no root `.gn` exists.
+#
+#  Use these pipelines instead:
+#    - Windows x64 release -> .github/workflows/release.yml (tag: v*-x64)
+#    - Windows x86 release -> .github/workflows/release-windows-x86.yml (tag: v*-x86)
+#
+#  on.push / on.pull_request triggers are gated by a non-existent file path
+#  (`.gn-magic-trigger-do-not-exist`) so the workflow will NEVER run
+#  accidentally.  Keep the file for historical reference only.
+# ================================================================
 
 on:
   push:
-    branches: [ main ]
     paths:
-      - '**/*.gn'
-      - '**/*.gni'
-      - 'build/*.gn'
-      - .github/workflows/gn-universal-build.yml
+      - '.gn-magic-trigger-do-not-exist'
   pull_request:
-    branches: [ main ]
     paths:
-      - '**/*.gn'
-      - '**/*.gni'
-      - build/*.gn
-      - .github/workflows/gn-universal-build.yml
+      - '.gn-magic-trigger-do-not-exist'
   workflow_dispatch:
 
 # 最小权限基线
