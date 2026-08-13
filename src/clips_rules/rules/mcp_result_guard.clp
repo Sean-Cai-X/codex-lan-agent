@@ -157,11 +157,16 @@
     (route_target ?tool)
     (matched_rule "text-range-delete-result-still-pending-by-continuation"))))
 
+; Only block when the tool explicitly declares a mandatory next_call_json.
+; If terminal_state=false but no next_call_json is declared, the LLM is free
+; to process the result and decide the next step. This prevents infinite
+; route loops where every intermediate result blocks completion.
 (defrule non-terminal-result-forbids-final-answer
   (declare (salience 47))
   (mcp_tool_result (tool_name ?tool)
                    (terminal_state "false")
-                   (completion_claim_allowed "false"))
+                   (completion_claim_allowed "false")
+                   (next_call_json ?next&:(neq ?next "")))
   =>
   (assert (clips_decision
     (domain "mcp_result_guard")
@@ -169,7 +174,7 @@
     (decision "route")
     (verification "not_verified")
     (reason_code "non_terminal_result_forbids_final_answer")
-    (next_action "tool_call_only: result is non-terminal; continue with next_call_json or move the continuation into task_memory budget runner before any completion claim")
+    (next_action "tool_call_only: result is non-terminal and declares next_call_json; execute that continuation before any completion claim")
     (route_target ?tool)
     (matched_rule "non-terminal-result-forbids-final-answer"))))
 
@@ -205,11 +210,14 @@
     (route_target "lan_agent_mcp_route")
     (matched_rule "route-result-without-resolved-tool-forbids-final-answer"))))
 
+; Only force continuation when the tool explicitly declares a next_call_json.
+; Simple directory listing for exploration should not be forced into batch reading.
 (defrule directory-list-result-requires-declared-continuation
   (declare (salience 52))
   (mcp_tool_result (tool_name "lan_agent_list_directory")
                    (analysis_allowed "false")
-                   (batch_completion "incomplete"))
+                   (batch_completion "incomplete")
+                   (next_call_json ?next&:(neq ?next "")))
   =>
   (assert (mcp_flow_observation
     (flow_id "directory_comment_cleanup_bounded_window_v1")
@@ -234,7 +242,7 @@
     (decision "route")
     (verification "not_verified")
     (reason_code "directory_manifest_not_terminal")
-    (next_action "tool_call_only: directory listing is an intermediate manifest; call required_tool_arguments_json exactly. Do not summarize, do not read file bodies manually, and do not claim completion.")
+    (next_action "tool_call_only: directory listing declares next_call_json; execute that continuation. Do not summarize or claim completion.")
     (route_target "lan_agent_list_directory")
     (matched_rule "directory-list-result-requires-declared-continuation"))))
 
@@ -242,7 +250,8 @@
   (declare (salience 51))
   (mcp_tool_result (tool_name "lan_agent_read_directory_files")
                    (analysis_allowed "false")
-                   (batch_completion "incomplete"))
+                   (batch_completion "incomplete")
+                   (next_call_json ?next&:(neq ?next "")))
   =>
   (assert (mcp_flow_observation
     (flow_id "directory_comment_cleanup_bounded_window_v1")
@@ -339,7 +348,8 @@
 (defrule final-answer-disallowed-by-result
   (declare (salience 46))
   (mcp_tool_result (tool_name ?tool)
-                   (final_answer_allowed "false"))
+                   (final_answer_allowed "false")
+                   (next_call_json ?next&:(neq ?next "")))
   =>
   (assert (clips_decision
     (domain "mcp_result_guard")
@@ -347,7 +357,7 @@
     (decision "route")
     (verification "not_verified")
     (reason_code "final_answer_disallowed_by_result")
-    (next_action "tool_call_only: the tool result explicitly disallows final answer; execute the required MCP continuation or use task_memory_execute_continuation_budget")
+    (next_action "tool_call_only: the tool result disallows final answer and declares next_call_json; execute that continuation or use task_memory_execute_continuation_budget")
     (route_target ?tool)
     (matched_rule "final-answer-disallowed-by-result"))))
 
@@ -380,7 +390,6 @@
 (defrule incomplete-read-result-requires-continuation
   (declare (salience 33))
 (mcp_tool_result (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
-                                         (eq ?tool "lan_agent_list_directory")
                                          (eq ?tool "lan_agent_read_directory_files")
                                          (eq ?tool "lan_agent_run_cxparser_flow")))
                    (task_completion "incomplete"))
@@ -398,10 +407,8 @@
 (defrule directory-batch-read-still-pending
   (declare (salience 48))
 (mcp_tool_result (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
-                                         (eq ?tool "lan_agent_list_directory")
                                          (eq ?tool "lan_agent_read_directory_files")
-                                         (eq ?tool "lan_agent_run_cxparser_flow")
-                                         (eq ?tool "lan_agent_final_answer")))
+                                         (eq ?tool "lan_agent_run_cxparser_flow")))
                    (analysis_allowed "false")
                    (batch_completion "incomplete")
                    (remaining_batch_file_count ?count&:(neq ?count "0")))

@@ -3347,3 +3347,155 @@ INIT → RUNNING ─┬─→ SUSPENDED ──┐（可无限次往返）
 > 这是从 **「对话式 AI」** 走向 **「自治式实体 AI」** 的关键范式跃迁。
 
 ---
+---
+
+# 23. 案例：MCP 守卫层死循环阻塞诊断与修正
+
+> **场景**：将 codex-lan-agent 作为 Codex 的本地 MCP 守卫，运行期间出现大量工具调用被无限拦截、任务无法推进的问题。本节还原完整的诊断链路、根因分析、规则修正与验证结论，作为次级大脑范式下「独立裁决引擎」调优的典型参考案例。
+
+---
+
+## 23.1 现象描述
+
+| 现象 | 观测结果 |
+|---|---|
+| 审计日志 
+eeds_continue 事件 | 连续 10+ 次命中同一 reason_code |
+| lan_agent_mcp_route 返回被拒 | 	erminal_state=false 后下一次调用仍然返回非终态 |
+| lan_agent_list_directory 目录浏览 | 被强制要求读取全部 150 个文件才允许终态 |
+| 大文件分页读取 | 即使只需要片段内容，也被强制读完整个文件 |
+| pending continuation 积压 | logs/mcp_pending_continuations/ 30 个文件堆积 |
+| 任务整体体感 | codex 处理非常不通畅，大量无效工具调用循环 |
+
+审计事件快照（8 月 13 日 16:14 ~ 16:42）：
+
+`
+status=needs_continue  10+  (非终态无限拦截)
+status=failed            8  (工具调用失败)
+status=success           3  (正常通过)
+`
+
+---
+
+## 23.2 诊断步骤
+
+### Step 1：审计事件聚合定位高频阻塞规则
+
+从 logs/mcp_trace_audit_events.jsonl 提取当天全部事件，按 post_guard_reason_code 聚合，Top 3 阻塞项：
+
+| reason_code | 命中次数 | 对应 CLIPS 规则 |
+|---|---|---|
+| 
+on_terminal_result_forbids_final_answer | 10 | 
+on-terminal-result-forbids-final-answer |
+| directory_batch_pending | 6 | directory-batch-read-still-pending |
+| ead_chain_incomplete | 5 | incomplete-read-result-requires-continuation |
+
+### Step 2：逐条规则回溯，提炼根因
+
+读取 src/clips_rules/rules/mcp_result_guard.clp，对照审计事件的 slot 字段，得出以下结论：
+
+**根因 1：
+on_terminal_result_forbids_final_answer 无差别拦截**
+
+原始规则（mcp_result_guard.clp L160~L174）：
+`clips
+(defrule non-terminal-result-forbids-final-answer
+  (declare (salience 47))
+  (mcp_tool_result (tool_name ?tool)
+                   (terminal_state "false")          ; ← 仅判断非终态
+                   (completion_claim_allowed "false")); ← 仅判断未允许完成
+  =>
+  (decision "route")                          ; ← 无条件强制续行
+`
+
+问题：C++ 侧（[main.cpp#L1547](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/main.cpp#L1547-L1549)）在所有 	ool_call_only 中间结果上都写入 	erminal_state=false + completion_claim_allowed=false。如果工具返回了实际可用结果但没有声明后续动作，则该规则**永远返回 decision=route**，codex 被要求"继续调用工具" → 再次得到非终态 → **死循环**。
+
+**根因 2：directory_batch_pending 工具集合过宽**
+
+原始规则（mcp_result_guard.clp L398~L417）把 lan_agent_list_directory（列目录）和 lan_agent_final_answer（最终回答工具）也纳入了批读未完成阻塞集合。codex 列目录只是为了了解文件结构，并非进入批量清理流水线，结果被强制要求"读完 150 个文件"。
+
+**根因 3：ead_chain_incomplete 对列目录也生效**
+
+原始规则（mcp_result_guard.clp L380~L396）中 lan_agent_list_directory 也被当作"分页读取"类工具。列目录返回分页列表（	ask_completion=incomplete）时，被强制续读至最后一页，即使 codex 只看第一页就够用。
+
+**根因 4：directory-list/read-result-requires-declared-continuation 无条件**
+
+原始规则（mcp_result_guard.clp L208~L272）只判断 atch_completion=incomplete，不判断是否有 
+ext_call_json。对于只是"探索式列目录"的请求，会被误判成有强制续行任务。
+
+**根因 5：inal_answer_disallowed_by_result 无差别拦截**
+
+与根因 1 对称：所有设置了 inal_answer_allowed=false 的中间结果都被阻止完成，但该字段在 C++ 侧几乎所有非终态分支都会写入，无法用作区分"是否真的存在强制后续步骤"的信号。
+
+**根因 6：pending continuation 长期积压干扰判断**
+
+logs/mcp_pending_continuations/ 目录中积累了 30 个过期 .kv 文件，最早的从 8 月 11 日起堆积。规则 oute-mismatched-pending-continuation 会在检测到 pending_continuation_active=true 时强行接管请求，干扰了新的、无 continuation 上下文的正常任务。
+
+---
+
+## 23.3 修正方案
+
+**核心设计原则**：守卫层只有在工具**显式声明 
+ext_call_json**时才强制续行。没有声明后续调用的结果，视为"codex 可自主理解并决策下一步"，让 LLM 的意图判断发挥作用。
+
+| 规则 | 修改前 | 修改后 |
+|---|---|---|
+| 
+on-terminal-result-forbids-final-answer | 	erminal_state=false + completion_claim_allowed=false → 无条件拦截 | **增加 (next_call_json ?next&:(neq ?next "")) 条件**，仅在工具显式声明后续调用时才拦截 |
+| inal-answer-disallowed-by-result | inal_answer_allowed=false → 无条件拦截 | **增加 (next_call_json ?next&:(neq ?next "")) 条件** |
+| directory-list-result-requires-declared-continuation | atch_completion=incomplete → 强制续行 | **增加 (next_call_json ?next&:(neq ?next "")) 条件** |
+| directory-read-result-requires-declared-continuation | atch_completion=incomplete → 强制续行 | **增加 (next_call_json ?next&:(neq ?next "")) 条件** |
+| incomplete-read-result-requires-continuation | 拦截 lan_agent_list_directory | **移除 lan_agent_list_directory**（列目录是清单操作，不是读取链） |
+| directory-batch-read-still-pending | 拦截 lan_agent_list_directory + lan_agent_final_answer | **移除此两项**；仅对实际读取工具生效 |
+
+同时：
+- 清理 logs/mcp_pending_continuations/ 全部过期文件（30 → 0），防止旧 continuation 状态干扰新请求
+- 同步修改 src/ClipsDecisionOperations.h 中 **embedded fallback 规则**（当 .clp 文件缺失时使用的内嵌版本），确保 fallback 路径与文件规则一致
+
+---
+
+## 23.4 修正后效果预期
+
+| 场景 | 修改前行为 | 修改后行为 |
+|---|---|---|
+| lan_agent_mcp_route 返回实际结果但无后续调用 | 死循环 decision=route | 落到 default-mcp-result-verified（salience=-100），decision=allow，codex 可消化结果 |
+| lan_agent_list_directory 列目录探索 | 强制要求批读 150 文件 + 读完最后一页 | 目录列表结果直接 allow，codex 可选择读取需要的文件 |
+| 工具显式写了 
+ext_call_json | 强制续行（不变） | 强制续行（不变） |
+| 有 pending continuation 残留 | 误触发 continuation takeover 规则 | 清理后不再干扰；可按工具本身规则处理 |
+
+---
+
+## 23.5 工程落地修正清单（变更文件）
+
+| 文件 | 变更性质 |
+|---|---|
+| src/clips_rules/rules/mcp_result_guard.clp | **5 条规则条件收紧 + 工具集合收窄** |
+| src/ClipsDecisionOperations.h | **embedded fallback 规则同步对齐** |
+| logs/mcp_pending_continuations/*.kv | 清理积压（30 → 0） |
+| codex_lan_agent.exe | 重新编译部署，确保 header 变更生效 |
+
+验证方式：Release 编译通过，CLIPS .clp 文件通过 LoadClipsFileIfExists 加载成功，审计日志中不再出现连续 10+ 次相同 reason_code 的 needs_continue 事件。
+
+---
+
+## 23.6 经验沉淀：次级大脑裁决引擎的调优原则
+
+> 从此次修正提炼的 4 条裁决设计原则，直接对应范式白皮书第 6 章「工程落地拆分原则」。
+
+1. **强制续行必须有 
+ext_call_json 实锤**  
+   	erminal_state=false / inal_answer_allowed=false / completion_claim_allowed=false 这些是 C++ 侧统一写入的"非终态标识"，不能直接等同于"守卫必须强制接管"。只有 
+ext_call_json 非空才表示工具本身明确声明了下一步动作。
+
+2. **工具集合宁窄勿宽**  
+   atch_completion=incomplete 只在真正的读取链工具（lan_agent_read_text_file / lan_agent_read_directory_files / lan_agent_run_cxparser_flow）上有意义。清单类操作（lan_agent_list_directory）、终结类工具（lan_agent_final_answer）永远不应被批读未完成规则覆盖。
+
+3. **Fallback 与主路径必须镜像一致**  
+   CLIPS 规则同时存在「文件加载路径」和「内嵌 raw string fallback 路径」。任何修改都必须在两处同步，否则 file_rules 缺失时会回退到旧行为，导致"有时正常有时阻塞"的间歇性问题。
+
+4. **pending continuation 必须有 TTL**  
+   过期的 continuation 状态会污染新请求。工程上应建立「超过 24 小时自动清理」机制，本次通过手动清理完成，后续将固化为运行时自动回收。
+
+---
