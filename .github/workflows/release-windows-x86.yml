@@ -231,40 +231,90 @@ jobs:
         with:
           path: ${{ runner.workspace }}/rocksdb_install_x86
           key: ${{ env.ROCKSDB_CACHE_KEY }}
+          fail-on-cache-miss: false
+
+      # Fix for historical failures (same root cause as x64):
+      #   Cache may report cache-hit=true but contain a partial/empty install.
+      #   This step verifies structural completeness (db.h + rocksdb.lib exist
+      #   AND rocksdb.lib > 8MB).  If check fails we force cache-miss.
+      - name: Validate RocksDB x86 cache integrity (force rebuild if stale/partial)
+        id: rocksdb-cache-check
+        shell: pwsh
+        run: |
+          $Install = Join-Path "${{ runner.workspace }}" "rocksdb_install_x86"
+          $h = Join-Path $Install "include\rocksdb\db.h"
+          $l = Join-Path $Install "lib\rocksdb.lib"
+          $ok = $true
+          if (-not (Test-Path $h)) { Write-Host "CACHE INVALID: missing $h"; $ok = $false }
+          if (-not (Test-Path $l)) { Write-Host "CACHE INVALID: missing $l"; $ok = $false }
+          if ($ok -and (Get-Item $l).Length -lt 8MB) { Write-Host "CACHE INVALID: rocksdb.lib too small ($([math]::Round((Get-Item $l).Length/1MB,2)) MB < 8 MB -> partial build)"; $ok = $false }
+          if ($ok) {
+            Write-Host "RocksDB x86 cache VALID  (rocksdb.lib: $([math]::Round((Get-Item $l).Length/1MB,2)) MB)"
+            "needs_rebuild=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            Write-Host "RocksDB x86 cache INVALID or cache-miss -> will rebuild"
+            "needs_rebuild=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
 
       - name: Build RocksDB 11.0.4 x86 (static lib, /MD)
-        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
+        if: steps.rocksdb-cache-check.outputs.needs_rebuild == 'true'
         shell: cmd
         run: |
           call "%VCVARS_PATH%"
           set ROCKSDB_SRC=%RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION%-x86-src
           set ROCKSDB_BUILD=%RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION%-x86-build
           set ROCKSDB_INSTALL=%RUNNER_WORKSPACE%\rocksdb_install_x86
+          :: Hard clean: ensure stale partial dirs (from previous failed runs) are gone
+          if exist %ROCKSDB_SRC% rmdir /s /q %ROCKSDB_SRC%
+          if exist %ROCKSDB_BUILD% rmdir /s /q %ROCKSDB_BUILD%
           if exist %ROCKSDB_INSTALL% rmdir /s /q %ROCKSDB_INSTALL%
-          curl -L -o %TEMP%\rocksdb.tar.gz https://github.com/facebook/rocksdb/archive/refs/tags/v%ROCKSDB_VERSION%.tar.gz
+          :: Download rocksdb 11.0.4 source tarball (official GitHub release, with retries)
+          curl -L --retry 3 --retry-delay 5 -o %TEMP%\rocksdb.tar.gz https://github.com/facebook/rocksdb/archive/refs/tags/v%ROCKSDB_VERSION%.tar.gz
           if errorlevel 1 exit /b 1
           tar -xzf %TEMP%\rocksdb.tar.gz -C %RUNNER_WORKSPACE%
+          if errorlevel 1 exit /b 1
           move %RUNNER_WORKSPACE%\rocksdb-%ROCKSDB_VERSION% %ROCKSDB_SRC%
           if errorlevel 1 exit /b 1
+          if not exist %ROCKSDB_SRC%\CMakeLists.txt ( echo ERROR: %ROCKSDB_SRC%\CMakeLists.txt missing after extract & exit /b 1 )
+          :: Configure: static lib, /MD CRT (matches codex_lan_agent), all optional compression deps OFF
           cmake -G Ninja -S %ROCKSDB_SRC% -B %ROCKSDB_BUILD% ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DPORTABLE=1 ^
-            -DWITH_TESTS=OFF -DWITH_BENCHMARK_TOOLS=OFF -DWITH_TOOLS=OFF ^
-            -DWITH_JNI=OFF -DWITH_GFLAGS=OFF ^
-            -DWITH_SNAPPY=OFF -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZIP2=OFF -DWITH_TBB=OFF ^
+            -DWITH_TESTS=OFF ^
+            -DWITH_BENCHMARK_TOOLS=OFF ^
+            -DWITH_TOOLS=OFF ^
+            -DWITH_JNI=OFF ^
+            -DWITH_GFLAGS=OFF ^
+            -DWITH_SNAPPY=OFF ^
+            -DWITH_LZ4=OFF ^
+            -DWITH_ZLIB=OFF ^
+            -DWITH_ZSTD=OFF ^
+            -DWITH_BZIP2=OFF ^
+            -DWITH_TBB=OFF ^
             -DROCKSDB_BUILD_SHARED=OFF ^
             -DUSE_RTTI=1 ^
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
           if errorlevel 1 exit /b 1
+          :: Build rocksdb static lib only
           cmake --build %ROCKSDB_BUILD% --target rocksdb --config Release --parallel %NUMBER_OF_PROCESSORS%
           if errorlevel 1 exit /b 1
+          :: Stage into install dir (flat: include/ + lib/rocksdb.lib)
+          if not exist %ROCKSDB_INSTALL% mkdir %ROCKSDB_INSTALL%
           mkdir %ROCKSDB_INSTALL%\include
           mkdir %ROCKSDB_INSTALL%\lib
           xcopy /y /e /i %ROCKSDB_SRC%\include\* %ROCKSDB_INSTALL%\include\ >nul
+          if errorlevel 1 exit /b 1
           copy /y %ROCKSDB_BUILD%\rocksdb.lib %ROCKSDB_INSTALL%\lib\rocksdb.lib >nul
-          if not exist %ROCKSDB_INSTALL%\include\rocksdb\db.h ( echo ERROR: rocksdb/db.h missing & exit /b 1 )
-          if not exist %ROCKSDB_INSTALL%\lib\rocksdb.lib ( echo ERROR: rocksdb.lib (x86) missing & exit /b 1 )
-          echo RocksDB x86 static lib staged
+          if errorlevel 1 exit /b 1
+          :: Sanity checks (minimum size thresholds to catch truncated builds)
+          if not exist %ROCKSDB_INSTALL%\include\rocksdb\db.h ( echo ERROR: rocksdb/db.h missing after stage & exit /b 1 )
+          if not exist %ROCKSDB_INSTALL%\lib\rocksdb.lib ( echo ERROR: rocksdb.lib (x86) missing after stage & exit /b 1 )
+          for %%I in (%ROCKSDB_INSTALL%\lib\rocksdb.lib) do set _SZ=%%~zI
+          echo rocksdb.lib (x86) size=%_SZ% bytes
+          :: Minimum expected size ~ 8 MB for x86; anything below signals partial link failure
+          if %_SZ% LSS 6000000 ( echo ERROR: rocksdb.lib (x86) size %_SZ% is suspiciously small (<6 MB) -> likely partial build & exit /b 1 )
+          echo RocksDB %ROCKSDB_VERSION% x86 static lib built at %ROCKSDB_INSTALL%
 
       - name: Verify RocksDB x86 install
         shell: pwsh
