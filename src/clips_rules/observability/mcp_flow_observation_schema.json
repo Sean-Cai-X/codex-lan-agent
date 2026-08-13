@@ -1,0 +1,98 @@
+{
+  "schema_id": "mcp_flow_observation_v1",
+  "purpose": "Describe observable MCP flow nodes, CLIPS decisions, continuation gates, and violation evidence.",
+  "node_types": {
+    "user_input": {
+      "shape": "oval",
+      "color": "#B3D9FF"
+    },
+    "gateway_route": {
+      "shape": "hexagon",
+      "color": "#D9B3FF"
+    },
+    "clips_decision": {
+      "shape": "diamond",
+      "color_by_decision": {
+        "allow": "#90EE90",
+        "route": "#FFCC66",
+        "block": "#FF8A8A"
+      }
+    },
+    "tool_execution": {
+      "shape": "box",
+      "color_by_status": {
+        "success": "#90EE90",
+        "needs_continue": "#FFCC66",
+        "failed": "#FF8A8A",
+        "pending": "#CFCFCF"
+      }
+    },
+    "fixed_flow_state": {
+      "shape": "rounded_box",
+      "color_by_status": {
+        "not_started": "#E5E7EB",
+        "running": "#93C5FD",
+        "success": "#86EFAC",
+        "needs_continue": "#FCD34D",
+        "failed": "#FCA5A5",
+        "violated": "#F87171"
+      }
+    },
+    "task_memory_freeze": {
+      "shape": "box",
+      "peripheries": 2,
+      "color": "#FFE4B5"
+    },
+    "resume_boundary": {
+      "shape": "box",
+      "style": "dashed",
+      "color": "#FFDAB9"
+    },
+    "verification_gate": {
+      "shape": "diamond",
+      "peripheries": 2,
+      "color": "#87CEEB"
+    },
+    "final_answer": {
+      "shape": "oval",
+      "peripheries": 2,
+      "color": "#2E8B57"
+    }
+  },
+  "required_event_fields": [
+    "step_index",
+    "node_type",
+    "tool_name",
+    "status",
+    "decision",
+    "matched_rule",
+    "reason_code",
+    "required_tool_name",
+    "required_tool_arguments_json",
+    "terminal_state",
+    "completion_claim_allowed",
+    "final_answer_allowed",
+    "verification_ok",
+    "result_ref",
+    "evidence_ref"
+  ],
+  "violation_classes": {
+    "manual_content_processing_forbidden": "The model read or transformed file bodies in chat for a flow that must use atomic tools.",
+    "non_terminal_completion_claim": "The model claimed completion while terminal/completion/final/verification gates were not all true.",
+    "required_tool_arguments_ignored": "A tool result provided required_tool_arguments_json but the next tool call did not use it.",
+    "directory_manifest_not_terminal": "A directory listing was treated as analysis completion instead of an intermediate manifest.",
+    "text_range_delete_incomplete": "A bounded deletion step returned has_more=true but the loop stopped.",
+    "context_growth_unbounded": "The flow brought large file content into the chat context instead of keeping state in MCP artifacts."
+  },
+  "recommended_outputs": [
+    "flow_events.jsonl",
+    "flow_graph.dot",
+    "flow_graph.mmd",
+    "flow_state.json",
+    "flow_state_graph.dot",
+    "flow_state_graph.mmd",
+    "flow_state_dashboard.html",
+    "flow_report.md",
+    "violations.md"
+  ]
+}

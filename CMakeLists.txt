@@ -55,6 +55,46 @@ target_include_directories(codex_lan_agent PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
+# --- fact-factory 守卫层依赖 ---
+# CppJieba (header-only, INTERFACE library)
+set(CODEX_LAN_AGENT_CPPJIEBA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cppjieba"
+  CACHE PATH "CppJieba source directory (header-only)")
+if(EXISTS "${CODEX_LAN_AGENT_CPPJIEBA_DIR}/include/cppjieba/Jieba.hpp")
+  target_include_directories(codex_lan_agent PRIVATE
+    "${CODEX_LAN_AGENT_CPPJIEBA_DIR}/include"
+  )
+  target_compile_definitions(codex_lan_agent PRIVATE CODEX_LAN_AGENT_WITH_CPPJIEBA=1)
+endif()
+
+# marisa-trie (header + static lib)
+set(CODEX_LAN_AGENT_MARISA_INCLUDE_DIR ""
+  CACHE PATH "marisa-trie include directory (parent of marisa/)")
+set(CODEX_LAN_AGENT_MARISA_LIBRARY ""
+  CACHE FILEPATH "marisa-trie static library file")
+if(NOT CODEX_LAN_AGENT_MARISA_INCLUDE_DIR)
+  set(_default_marisa_inc "D:/weasel-latest/librime/deps/marisa-trie/include")
+  if(EXISTS "${_default_marisa_inc}/marisa/trie.h")
+    set(CODEX_LAN_AGENT_MARISA_INCLUDE_DIR "${_default_marisa_inc}")
+  endif()
+endif()
+if(NOT CODEX_LAN_AGENT_MARISA_LIBRARY)
+  set(_default_marisa_lib "D:/weasel-latest/librime/lib/marisa.lib")
+  if(EXISTS "${_default_marisa_lib}")
+    set(CODEX_LAN_AGENT_MARISA_LIBRARY "${_default_marisa_lib}")
+  endif()
+endif()
+if(CODEX_LAN_AGENT_MARISA_INCLUDE_DIR AND EXISTS "${CODEX_LAN_AGENT_MARISA_INCLUDE_DIR}/marisa/trie.h")
+  target_include_directories(codex_lan_agent PRIVATE
+    "${CODEX_LAN_AGENT_MARISA_INCLUDE_DIR}"
+  )
+  target_compile_definitions(codex_lan_agent PRIVATE CODEX_LAN_AGENT_WITH_MARISA_TRIE=1)
+  # 源码编译 marisa-trie (避免预编译 lib CRT /MT 冲突)
+  set(_marisa_src "${CODEX_LAN_AGENT_MARISA_INCLUDE_DIR}/../lib")
+  if(EXISTS "${_marisa_src}/marisa/grimoire.cc")
+    target_sources(codex_lan_agent PRIVATE "${_marisa_src}/marisa/grimoire.cc")
+  endif()
+endif()
+
 find_package(Threads REQUIRED)
 
 target_link_libraries(codex_lan_agent PRIVATE

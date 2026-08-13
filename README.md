@@ -22,6 +22,9 @@
 14. [常见问题排查](#14-常见问题排查)
 15. [项目演进分析报告（8月9日 → 8月11日）](#15-项目演进分析报告8月9日--8月11日)
 16. [CLIPS 规则体系详解](#16-clips-规则体系详解)
+17. [Fact-Factory 守卫层（LLM ↔ CLIPS 中间防护）](#17-fact-factory-守卫层llm--clips-中间防护)
+18. [optfile 原子文件操作工具](#18-optfile-原子文件操作工具)
+19. [Fact-Factory 守卫层冒烟测试](#19-fact-factory-守卫层冒烟测试)
 
 ---
 
@@ -2395,3 +2398,323 @@ salience -100 ─ 所有域的 default-allow 兜底
 6. 更新本节文档的规则表
 
 > **规则文件加载**：CLIPS 规则文件在 MCP 服务启动时由 C++ 侧批量加载（`BuildClipsDecisionResult` 等函数），规则文件路径相对于 `src/clips_rules/`。修改 `.clp` 文件后需重新编译（规则嵌入二进制）或重启服务（若从磁盘加载）。
+---
+
+## 17. Fact-Factory 守卫层（LLM ↔ CLIPS 中间防护）
+
+### 17.1 设计定位
+
+Fact-Factory 是 LLM 探路模块输出与 Myrmidon/CLIPS 推理内核之间的**守卫层**，负责在原始 slot 值进入 CLIPS fact 之前进行字节消毒、分词、业务词匹配和语义归一。
+
+```
+LLM 探路模块输出原始 JSON 候选 slot 值
+        ↓
+【第0层：字节硬过滤｜纯 C++，无 NLP 库】
+        ↓
+【第1层：词法分词｜CppJieba 精确模式（条件编译，当前默认关闭）】
+        ↓
+【第2层：业务词候选检索｜marisa-trie（条件编译，当前默认关闭）】
+        ↓
+【第3层：语义同义归一｜WordNet + 哈工大同义词词林扩展版 cilin_ext.txt】
+        ↓
+输出：候选标准 tag 列表 + is_dirty 标记 + 告警信息
+        ↓
+送入 CLIPS 推理内核
+```
+
+### 17.2 核心设计约束
+
+| 约束 | 说明 |
+|---|---|
+| **守卫是校验层，不是修复层** | 优先标记脏（`is_dirty=true`），禁止写复杂启发式修复逻辑；带脏标记的 fact 仍然送入 CLIPS，不直接丢弃 |
+| **消歧不在守卫层做** | 一词多义时保留全部候选 tag 并标记 dirty，交由 CLIPS 规则层结合上下文研判 |
+| **大段原始文本禁止进入 slot** | 原始对话走 SQLite + UUID 引用，slot 仅传递短标签 |
+| **不引入深度学习/Python/Java** | 全部为词典 + 字符串算法 |
+
+### 17.3 四层管线详解
+
+#### 第0层：字节硬过滤（ByteSanitizer）
+
+- **文件**：[src/fact_factory/ByteSanitizer.h](src/fact_factory/ByteSanitizer.h)
+- **纯 C++ 字符串处理，最高优先级，无任何 NLP 库**
+- **C-CLIPS 防 segfault 内存崩溃的唯一屏障**
+
+处理规则（按顺序执行）：
+
+| 规则 | 说明 |
+|---|---|
+| 长度阈值 | slot 单字段最大字节（默认 32，可配置），超长直接 `is_dirty=true` |
+| 零字节检测 | 删除内部 `\0`，检测到零字节直接标记脏 |
+| 控制字符过滤 | 过滤全部 ASCII 0-31 不可见控制字符 |
+| CLIPS 语法转义 | 转义 `" ( ) ;` 特殊字符，防止语法注入 |
+| UTF-8 合法性校验 | 非法 UTF-8 直接 `is_dirty=true`，含 overlong encoding 检测 |
+
+关键 API：
+
+```cpp
+struct ByteSanitizerConfig {
+    uint32_t max_field_bytes = 32;
+    bool escape_clips_syntax = true;
+    bool strip_control_chars = true;
+    bool validate_utf8 = true;
+};
+
+struct ByteSanitizerResult {
+    std::string sanitized;
+    bool is_dirty = false;
+    std::string reason;
+};
+
+ByteSanitizerResult SanitizeSlotValue(std::string_view raw, const ByteSanitizerConfig & config);
+```
+
+#### 第1层：词法分词（CppJieba，条件编译）
+
+- **文件**：[src/fact_factory/JiebaTokenizer.h](src/fact_factory/JiebaTokenizer.h)
+- **依赖**：[cppjieba](cppjieba/)（clone 自 `https://github.com/Sean-Cai-X/cppjieba`）
+- **模式**：精确模式，关闭 HMM 未登录词猜测
+- **状态**：当前默认关闭（`#undef CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE`），因 ClipsDecisionOperations.h 中的 `extern "C"` 块会污染 CppJieba 头文件的 `using std::xxx` 声明
+
+> 启用方式：使用独立编译单元 `FactFactoryIntegration.cpp` 并定义 `CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE` 宏，避免在 `extern "C"` 上下文中 include CppJieba。
+
+#### 第2层：业务词候选检索（marisa-trie，条件编译）
+
+- **文件**：[src/fact_factory/BusinessTrieMatcher.h](src/fact_factory/BusinessTrieMatcher.h)
+- **依赖**：marisa-trie 源码编译（`grimoire.cc`），不引入 Rime 输入法上层逻辑
+- **状态**：当前默认关闭，与第1层一同通过宏控制
+
+#### 第3层：语义同义归一（SemanticNormalizer）
+
+- **文件**：[src/fact_factory/SemanticNormalizer.h](src/fact_factory/SemanticNormalizer.h)
+- **中文同义库**：[src/fact_factory/resources/cilin_ext.txt](src/fact_factory/resources/cilin_ext.txt)（892,620 字节）
+  - 数据源：哈工大《同义词词林（扩展版）》，标准化文本来自 HanLP v1.8.6 `data/dictionary/synonym/CoreSynonym.txt`
+  - 格式：`五级语义编码=空格分隔同义词列表`，如 `Aa01A01= 人 士 人物 人士`
+  - 仅复用纯文本词库，**不引入 HanLP Java/Python 源码、运行时、算法模块**
+- **英文同义库**：WordNet 静态词典（C++ 查表封装，无网络）
+- **业务补丁表**：[src/fact_factory/resources/business_supplement.txt](src/fact_factory/resources/business_supplement.txt)
+- **业务词典**：[src/fact_factory/resources/business_dict.utf8](src/fact_factory/resources/business_dict.utf8)
+
+词林使用约束：
+
+1. 程序启动一次性加载构建内存哈希索引，运行时不再读磁盘
+2. 查询结果**强制过滤，只允许输出 40 个业务词集合内的 tag**，防止泛义近义词灌入 CLIPS
+3. 一词多义一律打上 `is_dirty=true`，歧义交给 CLIPS 规则层处理
+4. 词林覆盖不到的业务专属术语，使用 `business_supplement.txt` 兜底
+
+### 17.4 业务标准 Tag 体系（40 个）
+
+- **文件**：[src/fact_factory/BusinessTagRegistry.h](src/fact_factory/BusinessTagRegistry.h)
+
+| 分组 | 数量 | 示例 tag |
+|---|---|---|
+| Intent（意图） | 10 | `comment_cleanup`, `code_format`, `source_edit`, `code_search`, `refactor_file` |
+| RequestType（请求类型） | 8 | `analysis_review`, `read_observe`, `file_mutation`, `execution_task`, `clips_control` |
+| SafetyRisk（安全/风险） | 4 | `write_audited`, `read_only`, `low`, `high` |
+| Decision（守卫决定） | 3 | `allow`, `block`, `route` |
+| Verification（验证状态） | 3 | `verified`, `not_verified`, `invalid` |
+| ExecutionClass（执行分类） | 3 | `read`, `write`, `execute` |
+| ActionVerb（动作动词） | 9 | `probe`, `scan`, `delete`, `insert`, `replace`, `build`, `test` |
+
+每个 tag 附带中文别名列表，`ResolveBusinessTag()` 支持中英文混合别名解析。
+
+### 17.5 集成钩子
+
+两个 `inline` 钩子函数直接实现在 [src/ClipsDecisionOperations.h](src/ClipsDecisionOperations.h) 末尾：
+
+| 钩子 | 作用 | 当前路径 |
+|---|---|---|
+| `ApplyFactFactoryNormalizePrimaryIntent(raw_intent)` | primary_intent 归一化 | ByteSanitizer → BusinessTagRegistry 别名映射 → 大小写折叠 |
+| `ApplyFactFactoryByteSanitizeSlot(raw_value, is_token_slot)` | slot 值字节消毒 | ByteSanitizer（token slot 64 字节 / 普通 slot 256 字节） |
+
+### 17.6 Pending Continuation 崩溃修复
+
+**问题**：`SemanticIntentLexiconEntry` 使用 `std::initializer_list<const char*>` 存储别名，导致 dangling 引用——当 CLIPS pending continuation 场景触发时（`pending_continuation_active=true` + `pending_required_arguments_json` 非空），服务发生 segfault 崩溃。
+
+**修复**：
+1. 将 `std::initializer_list<const char*>` 改为 `std::vector<const char*>`（[src/SemanticIntentLexicon.h](src/SemanticIntentLexicon.h)）
+2. 清理 `EvaluateClipsDecision` 中的临时 trace 代码
+3. 确保 `route_arguments_json` 不暴露 raw JSON 参数（`route_arguments_json_available=false`, `transport=none`）
+
+### 17.7 资源文件清单
+
+```
+src/fact_factory/
+├── ByteSanitizer.h           ← 第0层：字节硬过滤
+├── JiebaTokenizer.h          ← 第1层：CppJieba 分词适配
+├── BusinessTrieMatcher.h     ← 第2层：marisa-trie 业务词检索
+├── SemanticNormalizer.h      ← 第3层：语义同义归一
+├── FactFactory.h             ← 管线集成入口
+├── BusinessTagRegistry.h     ← 40 个业务标准 tag + 别名解析
+└── resources/
+    ├── business_dict.utf8     ← 40 个业务词词典（CppJieba + marisa-trie 共用）
+    ├── business_supplement.txt← 业务补充映射表（词林缺口兜底）
+    └── cilin_ext.txt          ← 哈工大同义词词林扩展版（892KB，~7万词）
+```
+
+### 17.8 编译开关
+
+| 宏 | 默认 | 说明 |
+|---|---|---|
+| `CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE` | `#undef`（关闭） | 启用完整 4 层管线（含 CppJieba + marisa-trie） |
+| 无宏定义（轻量模式） | 默认生效 | 仅 ByteSanitizer + BusinessTagRegistry，header-only，无外部依赖 |
+
+> **当前状态**：轻量模式已编译通过并冒烟验证。完整管线需通过独立编译单元接入，避免 `extern "C"` 污染。
+
+---
+
+## 18. optfile 原子文件操作工具
+
+### 18.1 概述
+
+`optfile` 是一个基于 Qt 的独立命令行文件操作工具，提供原子写入、哈希校验、锚点定位插入、行范围替换等 MCP 级别的文件操作能力。
+
+- **源码**：[optfile/main.cpp](optfile/main.cpp)
+- **可执行文件**：`optfile.exe`（项目根目录）
+- **依赖**：Qt5Core（`QSaveFile`、`QCryptographicHash`、`QJsonDocument`）
+
+### 18.2 命令行接口
+
+```powershell
+optfile.exe --td <target_dir> --tf <test_file> [options]
+```
+
+| 选项 | 说明 |
+|---|---|
+| `--td, --target-dir <path>` | 目标目录 |
+| `--tf, --test-file <name>` | 目标文件名 |
+| `--locate-text <text>` | 查找匹配行（精确/模糊） |
+| `--find-line <n>` | 按行号查找单行 |
+| `--insert-after-anchor <text>` | 在锚点行后插入 |
+| `--replace-start-line <n>` | 替换起始行 |
+| `--replace-end-line <n>` | 替换结束行 |
+| `--replacement-text <text>` | 插入/替换文本 |
+| `--delete-line <n>` | 按行号原子删除 |
+| `--delete-content <text>` | 按内容匹配原子删除 |
+| `--expected-anchor-hash <hash>` | 锚点行哈希校验 |
+| `--expected-line-hash <hash>` | 目标行哈希校验 |
+| `--expected-range-hash <hash>` | 范围哈希校验 |
+| `--show-preview` | 在 locate 结果中显示预览 |
+| `--fuzzy-threshold <0-100>` | 模糊匹配阈值（默认 60） |
+| `--occurrence <n>` | 第 N 次出现的锚点（默认 1） |
+
+### 18.3 核心功能
+
+| 功能 | 函数 | 说明 |
+|---|---|---|
+| 行定位 | `locate_text_lines_mcp` | 精确/模糊匹配，返回行号 + 内容 + 哈希 |
+| 行查找 | `find_line_metadata_mcp` | 按行号返回元数据 |
+| 锚点插入 | `insert_after_anchor_atomic_mcp` | 原子写入，可选哈希校验 |
+| 范围替换 | `replace_line_range_atomic_mcp` | 原子替换行范围，可选哈希校验 |
+| 行删除 | `delete_line_atomic_mcp` | 原子删除单行 |
+| 内容删除 | `delete_content_atomic_mcp` | 按内容匹配原子删除 |
+
+> **原子写入**：所有写操作使用 `QSaveFile` 实现——先写入临时文件，再原子重命名，确保操作中途崩溃不会损坏原文件。每个操作返回 JSON 结果，包含操作状态和文件哈希。
+
+### 18.4 输出格式
+
+所有操作通过 `std::cout` 输出 JSON 到 stdout：
+
+```json
+{"status":"success","operation":"locate","file_path":"...","matched_lines":[...],"file_hash":"..."}
+```
+
+错误时返回 exit code 2：
+
+```json
+{"status":"error","error":"anchor not found"}
+```
+
+### 18.5 编译方式
+
+optfile 独立于主项目 CMake 构建，使用 qmake 编译：
+
+```powershell
+cd D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\optfile
+qmake optfile.pro
+mingw32-make
+# 将 optfile.exe 复制到项目根目录，并确保 Qt5Core.dll 等依赖在 PATH 或同目录
+```
+
+---
+
+## 19. Fact-Factory 守卫层冒烟测试
+
+### 19.1 测试环境
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent` |
+| 构建目录 | `build\Release` |
+| 可执行文件 | `codex_lan_agent.exe`（38,003,200 字节） |
+| 配置文件 | `test_config.ini` |
+| 服务端口 | 18080 |
+| Machine Code | `8EE5-2336-71AE-74DD` |
+| 测试日期 | 2026-08-13 |
+
+### 19.2 测试结果总览
+
+| 测试 | 结果 | 关键断言 |
+|---|---|---|
+| TEST 1: Health Check | **PASS** | `ok=true, status=ok, listen_port=18080, outcome=PASS` |
+| TEST 2: MCP Overview | **PASS** | `ok=true, tool_count=1, semantic_action_count=78` |
+| TEST 3: CLIPS decide - observe | **PASS** | `ok=true, exit_code=0, status=success, decision=allow, terminal_state=true, outcome=PASS` |
+| TEST 4: CLIPS decide - pending continuation | **PASS** | `ok=true, exit_code=0, status=success, decision=allow, failure_mode=none, outcome=PASS` |
+| TEST 5: Concurrent Stress (8 mixed) | **PASS** | `PASS=8, FAIL=0`（5×observe + 3×pending） |
+
+### 19.3 关键断言：route 参数不泄露 raw JSON
+
+| 字段 | 值 | 断言 |
+|---|---|---|
+| `route_arguments_json` | `""`（len=0） | **PASS** - raw JSON 未泄露 |
+| `route_arguments_json_available` | `false` | **PASS** |
+| `route_arguments_json_transport` | `none` | **PASS** |
+| `route_arguments_json_ref` | `""` | **PASS** |
+
+### 19.4 Pending Continuation 场景验证
+
+测试 payload 包含：
+
+```json
+{
+  "primary_intent": "run_build",
+  "tool_name": "cmake_build",
+  "pending_continuation_active": "true",
+  "pending_required_tool": "cmake_build",
+  "pending_required_arguments_json": "{\"file_path\":\"D:/test.txt\",\"anchor\":\"line1\",\"new_lines\":\"a\\nb\\nc\"}",
+  "pending_trace_id": "trace-pend-test-...",
+  "pending_hash": "",
+  "pending_trace_match": "true",
+  "continuation_takeover_allowed": "true"
+}
+```
+
+**结果**：服务未崩溃，返回 `decision=allow, failure_mode=none, outcome=PASS`。
+
+> 此场景在修复前会导致 segfault 崩溃（`SemanticIntentLexiconEntry` 的 `std::initializer_list` 生命周期 bug）。
+
+### 19.5 并发压力测试
+
+连续发送 8 个混合请求（5 个 observe + 3 个 pending continuation），全部 PASS，服务进程全程在线：
+
+```
+Stress result: PASS=8 FAIL=0 (total=8)
+```
+
+### 19.6 Fact-Factory 守卫层当前状态
+
+| 组件 | 状态 | 说明 |
+|---|---|---|
+| 第0层 ByteSanitizer | **已启用** | 字节硬过滤，5 项检查全部生效 |
+| BusinessTagRegistry | **已启用** | 40 个业务 tag + 别名解析 |
+| 第1层 CppJieba | **已关闭** | 条件编译，需独立编译单元接入 |
+| 第2层 marisa-trie | **已关闭** | 条件编译，需独立编译单元接入 |
+| 第3层 SemanticNormalizer | **资源就绪** | cilin_ext.txt 已下载（892KB），代码已落地，待管线开关打开 |
+| cilin_ext.txt | **已就绪** | 892,620 字节，HanLP v1.8.6 CoreSynonym.txt |
+| Pending Continuation 崩溃修复 | **已修复** | `std::initializer_list` → `std::vector` |
+| route 参数泄露 | **已修复** | `route_arguments_json` 始终为空 |
+
+### 19.7 已知限制
+
+1. **optfile stdout 捕获**：optfile.exe 在 .NET `Process.StandardOutput` 捕获下 stdout 为空（Qt QCoreApplication 缓冲问题），直接终端运行正常
+2. **完整管线未启用**：CppJieba + marisa-trie 需通过独立编译单元接入，当前轻量模式（ByteSanitizer + BusinessTagRegistry）已满足基本守卫需求
+3. **cilin_ext.txt 词量**：约 7 万词，启动一次性加载耗时可控（<1s），但完整管线启用后需验证内存占用

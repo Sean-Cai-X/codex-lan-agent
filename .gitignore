@@ -95,3 +95,6 @@ test_*_output*
 !scripts/**
 !build/
 !build/*.args
+
+# --- Temp trace output ---
+src/temp_trace/

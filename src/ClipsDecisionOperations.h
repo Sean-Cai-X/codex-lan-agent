@@ -13,6 +13,12 @@ extern "C" {
 
 #include "SemanticIntentLexicon.h"
 
+// FactFactory 守卫层归一化钩子（可选，无外部依赖时为 stub）
+//   返回: 归一后的标准 tag；若未匹配则返回空字符串，调用方回退原始值
+std::string ApplyFactFactoryNormalizePrimaryIntent(const std::string & raw_intent);
+//   对任意 slot 值做字节硬过滤 + CLIPS 安全加固（即使无外部依赖也生效）
+std::string ApplyFactFactoryByteSanitizeSlot(const std::string & raw_value, bool is_token_slot);
+
 std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent);
 
 struct ClipsDecision {
@@ -174,6 +180,12 @@ std::string NormalizeClipsSlotValue(const char * name, const std::string & value
 }
 
 std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent) {
+    // 1. 优先走 fact-factory 守卫层，命中标准 tag 直接落地
+    const std::string factory_tag = ApplyFactFactoryNormalizePrimaryIntent(primary_intent);
+    if (!factory_tag.empty()) {
+        return factory_tag;
+    }
+    // 2. 回退旧的 SemanticIntentLexicon 词典
     return codex_lan_agent::NormalizeIntentBySemanticLexicon(primary_intent);
 }
 
@@ -2183,15 +2195,6 @@ ClipsDecision EvaluateClipsDecision(
     const JsonRequestView * params,
     const CommandResult * result) {
     ClipsDecision decision;
-    const bool trace_pending_decision =
-        params != nullptr
-        && params->GetBool("pending_continuation_active", false);
-    auto trace_pending_stage = [&](const char * stage) {
-        if (trace_pending_decision) {
-            std::cerr << "[clips_pending_trace] " << stage << std::endl;
-        }
-    };
-    trace_pending_stage("evaluate_enter");
     decision.domain = domain;
     decision.target = tool_name;
     decision.rule_root = ResolveClipsRuleRoot(config);
@@ -2227,7 +2230,6 @@ ClipsDecision EvaluateClipsDecision(
     }
 
     Reset(env);
-    trace_pending_stage("reset_complete");
 
     auto assert_fact =
         [&](const std::string & fact_text) {
@@ -2245,9 +2247,7 @@ ClipsDecision EvaluateClipsDecision(
     if (domain == "mcp_tool_guard" || domain == "cxparser_preflight_guard" || domain == "cmm_init_guard") {
         if (params != nullptr) {
             assert_fact(BuildMcpToolChainFact(tool_name, "pre_call", params, nullptr));
-            trace_pending_stage("chain_fact_asserted");
             assert_fact(BuildMcpToolRequestFact(config, tool_name, *params));
-            trace_pending_stage("request_fact_asserted");
             if (domain == "cxparser_preflight_guard") {
                 assert_fact(BuildCxparserFact(tool_name, *params));
             } else if (domain == "cmm_init_guard") {
@@ -2267,9 +2267,7 @@ ClipsDecision EvaluateClipsDecision(
         }
     }
 
-    trace_pending_stage("run_enter");
     Run(env, -1);
-    trace_pending_stage("run_complete");
 
     decision.engine_status = "after_run_facts_collecting";
 
@@ -2288,7 +2286,6 @@ ClipsDecision EvaluateClipsDecision(
         decision.matched_rule = GetClipsFactSlotString(fact, "matched_rule");
         decision.route_target = GetClipsFactSlotString(fact, "route_target");
         decision.route_arguments_json = GetClipsFactSlotString(fact, "route_arguments_json");
-        trace_pending_stage("decision_slots_read");
         if (params != nullptr
             && (IsClipsContinuationArgumentsRef(decision.route_arguments_json)
                 || ((decision.reason_code == "pending_continuation_mismatch"
@@ -2301,7 +2298,6 @@ ClipsDecision EvaluateClipsDecision(
             } else {
                 decision.route_arguments_json = params->GetString("pending_required_arguments_json");
             }
-            trace_pending_stage("route_arguments_restored");
         }
         decision.engine_status = "decision_found_by_rule:" + decision.matched_rule;
         break;
@@ -2322,9 +2318,7 @@ ClipsDecision EvaluateClipsDecision(
         decision.loaded_files = output.str();
     }
 
-    trace_pending_stage("destroy_enter");
     DestroyEnvironment(env);
-    trace_pending_stage("destroy_complete");
     return decision;
 }
 
@@ -3337,4 +3331,77 @@ void ApplyClipsResultGuard(
     }
     result->fields["result_hash"] = BuildResultEnvelopeHash(*result);
     result->fields["clips_post_result_fact"] = BuildMcpToolResultFact(tool_name, *result);
+}
+
+// ================================
+// FactFactory 守卫层钩子实现
+//  说明: 钩子独立实现，只依赖 ByteSanitizer 和 BusinessTagRegistry （header-only，无外部 lib）
+//  CppJieba / marisa-trie 属于增强层，通过宏 CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE 控制开关
+// ================================
+
+#include "fact_factory/ByteSanitizer.h"
+#include "fact_factory/BusinessTagRegistry.h"
+
+// 完整4层管线：当前默认关闭（ClipsDecisionOperations.h 中 extern "C" 会污染 CppJieba include）
+// 启用方式：使用独立编译单元 FactFactoryIntegration.cpp 并定义 CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE
+#undef  CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE
+#if defined(CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE)
+#include "fact_factory/FactFactory.h"
+#include <memory>
+#include <mutex>
+#endif
+
+inline std::string ApplyFactFactoryNormalizePrimaryIntent(const std::string & raw_intent) {
+    if (raw_intent.empty()) return {};
+
+#ifdef CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE
+    struct FullPipelineHolder {
+        std::mutex mtx;
+        std::unique_ptr<fact_factory::FactFactory> ff;
+        fact_factory::FactFactory * ensure() {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (ff) return ff.get();
+            fact_factory::FactFactoryConfig cfg;
+            cfg.tokenizer.jieba_dict_dir = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/cppjieba/dict";
+            cfg.tokenizer.business_dict_path = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/fact_factory/resources/business_dict.utf8";
+            cfg.normalizer.supplement_path = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/fact_factory/resources/business_supplement.txt";
+            cfg.normalizer.cilin_ext_path = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/fact_factory/resources/cilin_ext.txt";
+            ff = std::make_unique<fact_factory::FactFactory>(cfg);
+            return ff.get();
+        }
+    };
+    static FullPipelineHolder holder;
+    auto * ff = holder.ensure();
+    if (ff != nullptr) {
+        auto r = ff->Process(raw_intent);
+        if (!r.standard_tags.empty()) return r.standard_tags.front();
+    }
+    return {};
+#else
+    // 轻量 fast-path：只做字节过滤 + 别名映射 + 大小写折叠
+    fact_factory::ByteSanitizerConfig sc;
+    sc.max_field_bytes = 128;
+    auto sr = fact_factory::SanitizeSlotValue(raw_intent, sc);
+    const std::string & clean = sr.sanitized;
+    if (clean.empty()) return {};
+    std::string resolved = fact_factory::ResolveBusinessTag(clean);
+    if (!resolved.empty()) return resolved;
+    std::string lower;
+    lower.reserve(clean.size());
+    for (unsigned char c : clean) {
+        lower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    if (lower != clean) {
+        resolved = fact_factory::ResolveBusinessTag(lower);
+        if (!resolved.empty()) return resolved;
+    }
+    return {};
+#endif
+}
+
+inline std::string ApplyFactFactoryByteSanitizeSlot(const std::string & raw_value, bool is_token_slot) {
+    fact_factory::ByteSanitizerConfig sc;
+    sc.max_field_bytes = is_token_slot ? 64u : 256u;
+    auto r = fact_factory::SanitizeSlotValue(raw_value, sc);
+    return std::move(r.sanitized);
 }

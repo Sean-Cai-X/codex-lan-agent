@@ -1,0 +1,118 @@
+{
+  "flow_id": "directory_comment_cleanup_bounded_window_v1",
+  "title": "Directory comment cleanup by bounded file windows",
+  "owner_layer": "clips_and_flow_script",
+  "cpp_role": "atomic_tool_execution_only",
+  "default_window_lines": 200,
+  "manual_content_processing_allowed": false,
+  "completion_gate": {
+    "terminal_state": "true",
+    "completion_claim_allowed": "true",
+    "final_answer_allowed": "true",
+    "verification_ok": "true"
+  },
+  "states": [
+    {
+      "id": "route_request",
+      "tool": "lan_agent_mcp_route",
+      "purpose": "Normalize user intent and enter CLIPS guard domain.",
+      "allowed_next": ["list_directory", "probe_current_file"]
+    },
+    {
+      "id": "list_directory",
+      "tool": "lan_agent_list_directory",
+      "purpose": "Build a file manifest only. Do not read file bodies.",
+      "must_continue_when": {
+        "analysis_allowed": "false",
+        "batch_completion": "incomplete"
+      },
+      "allowed_next": ["probe_current_file", "list_directory"]
+    },
+    {
+      "id": "probe_current_file",
+      "tool": "lan_agent_probe_text_file",
+      "purpose": "Probe exactly one concrete file before mutation.",
+      "allowed_next": ["delete_current_file_window"]
+    },
+    {
+      "id": "delete_current_file_window",
+      "tool": "lan_agent_delete_text_range_window_atomic",
+      "purpose": "Delete comments in one bounded 200-line window and verify readback.",
+      "must_continue_when": {
+        "has_more": "true"
+      },
+      "allowed_next": ["delete_current_file_window", "probe_next_file", "complete"]
+    },
+    {
+      "id": "probe_next_file",
+      "tool": "lan_agent_probe_text_file",
+      "purpose": "Move to the next concrete file from the manifest.",
+      "allowed_next": ["delete_current_file_window"]
+    },
+    {
+      "id": "complete",
+      "tool": "final_answer",
+      "purpose": "Allowed only after all completion gate fields are true.",
+      "required_fields": {
+        "terminal_state": "true",
+        "completion_claim_allowed": "true",
+        "final_answer_allowed": "true",
+        "verification_ok": "true"
+      }
+    }
+  ],
+  "forbidden_transitions": [
+    {
+      "from": "list_directory",
+      "to": "final_answer",
+      "reason_code": "directory_manifest_not_terminal"
+    },
+    {
+      "from": "list_directory",
+      "to": "read_directory_files_for_manual_edit",
+      "reason_code": "manual_content_processing_forbidden"
+    },
+    {
+      "from": "delete_current_file_window",
+      "to": "final_answer",
+      "when": {
+        "has_more": "true"
+      },
+      "reason_code": "text_range_delete_incomplete"
+    },
+    {
+      "from": "delete_current_file_window",
+      "to": "final_answer",
+      "when": {
+        "directory_scope_active": "true",
+        "directory_scope_incomplete": "true"
+      },
+      "reason_code": "directory_scope_next_file_required"
+    }
+  ],
+  "observable_fields": [
+    "clips_pre_call_matched_rule",
+    "clips_post_result_matched_rule",
+    "clips_post_result_reason_code",
+    "required_tool_name",
+    "required_tool_arguments_json",
+    "next_call_json",
+    "analysis_allowed",
+    "batch_completion",
+    "has_more",
+    "directory_scope_active",
+    "directory_manifest_path",
+    "directory_current_file_index",
+    "directory_next_file_index",
+    "directory_total_code_file_count",
+    "directory_remaining_code_file_count",
+    "directory_scope_incomplete",
+    "directory_next_probe_call_json",
+    "terminal_state",
+    "completion_claim_allowed",
+    "final_answer_allowed",
+    "verification_ok",
+    "result_ref",
+    "evidence_ref"
+  ]
+}
