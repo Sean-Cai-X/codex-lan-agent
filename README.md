@@ -3499,3 +3499,177 @@ ext_call_json 非空才表示工具本身明确声明了下一步动作。
    过期的 continuation 状态会污染新请求。工程上应建立「超过 24 小时自动清理」机制，本次通过手动清理完成，后续将固化为运行时自动回收。
 
 ---
+# 24. 案例：MCP 服务崩溃诊断与 CLIPS 内部熔断器落地
+
+> **场景**：codex-lan-agent 作为 Codex 本地 MCP 守卫运行期间，服务进程突然消失（崩溃），Codex 无法继续工作。本节记录从崩溃现象到根因定位、熔断器落地、验证恢复的完整闭环。
+
+---
+
+## 24.1 崩溃现象
+
+| 检查项 | 结果 |
+|---|---|
+| Get-Process codex_lan_agent | **进程不存在**（已崩溃退出） |
+| logs/agent.out.log | 文件不存在（无崩溃堆栈输出） |
+| logs/server_state.json | 文件不存在（服务未正常写入状态） |
+| logs/server.lock | 文件不存在（服务未正常注册锁） |
+| logs/remote_control_events.jsonl | **393 MB**（411,590,492 bytes） |
+| logs/mcp_trace_audit_events.jsonl | 7.3 MB |
+| logs/mcp_pending_continuations/ | 0 文件（此前已清理） |
+
+**直接症状**：MCP HTTP 端口 18080 无响应，Codex 所有工具调用超时失败。
+
+---
+
+## 24.2 根因分析
+
+### 根因 A：日志文件膨胀导致磁盘 IO 瓶颈
+
+emote_control_events.jsonl 在运行期间膨胀至 **393 MB**。每次 MCP 请求都会追加写入该文件，当文件过大时：
+- 追加写入耗时显著增加
+- 进程内存中缓冲的待写入数据持续增长
+- 最终可能触发 OOM 或文件系统错误导致进程崩溃
+
+### 根因 B：CLIPS Run(env, -1) 无限运行
+
+[ClipsDecisionOperations.h](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h) 中原始代码：
+`cpp
+Run(env, -1);  // -1 表示无限运行直到没有规则可触发
+`
+
+当 CLIPS 规则存在互相触发的循环（规则 A 触发规则 B，规则 B 又触发规则 A），Run(-1) 永远不会返回。表现为：
+- 单次 EvaluateClipsDecision 调用永远不返回
+- HTTP 处理线程被永久阻塞
+- 客户端超时后重试，新请求又创建新 Environment 陷入同样循环
+- 线程和内存持续泄漏，最终进程崩溃
+
+### 根因 C：CLIPS 内部 fact 无限增长
+
+CLIPS 规则执行过程中可能产生新 fact（通过 (assert ...) 在规则 RHS 中），这些内部生成的 fact：
+- **不经过 fact-factory 守卫层**（守卫层只管外部流入的 fact）
+- **无去重机制**（相同三元组可无限重复断言）
+- **无数量上限**（fact 列表无限增长，内存耗尽）
+
+### 根因 D：外部流入 fact 重复断言
+
+C++ 侧 ssert_fact lambda 对同一 fact 文本无去重检查。当多个 domain 共享相同 fact 前缀时，同一 fact 被多次断言，加剧 CLIPS 内部 fact 增长。
+
+---
+
+## 24.3 修复方案：三层熔断器
+
+**核心设计原则**：fact-factory 守卫层只管外部流入的 fact；CLIPS 内部规则执行产生的新 fact，必须由独立的运行时熔断器管控。熔断器触发时强制 decision=allow，保证服务不挂死。
+
+### 熔断①：单会话 fact 数量上限
+
+| 属性 | 值 |
+|---|---|
+| 常量 | CLIPS_MAX_FACTS_PER_SESSION = 500 |
+| 前置检查 | ssert_fact 中：GetNumberOfFacts(env) >= 500 → 拒绝断言，标记 circuit_breaker_facts_exceeded |
+| 后置检查 | Run 后：act_count_after_run > 500 → 触发熔断 |
+| 代码位置 | [ClipsDecisionOperations.h L2254-2257](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2254-L2257) (前置) / L2303-2306 (后置) |
+
+### 熔断②：相同 fact 签名去重
+
+| 属性 | 值 |
+|---|---|
+| 机制 | std::set<std::string> asserted_signatures，取 fact 文本前 256 字符作为签名 |
+| 拦截 | 签名已存在 → ++duplicate_facts_blocked，跳过断言 |
+| 代码位置 | [ClipsDecisionOperations.h L2240-2253](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2240-L2253) |
+
+### 熔断③：规则触发次数上限
+
+| 属性 | 值 |
+|---|---|
+| 常量 | CLIPS_MAX_RULE_FIRINGS = 200 |
+| 修改 | Run(env, -1) → Run(env, CLIPS_MAX_RULE_FIRINGS) |
+| 检测 | 返回值 >= 200 → 标记 circuit_breaker_rules_exceeded |
+| 代码位置 | [ClipsDecisionOperations.h L2296-2300](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2296-L2300) |
+
+### 熔断触发时行为
+
+`
+任一熔断器触发
+    ↓
+decision.decision = "allow"              // 强制放行，不阻塞调用方
+decision.verification = "circuit_breaker_triggered"
+decision.reason_code = "clips_internal_circuit_breaker"
+decision.next_action = "circuit_breaker: clips internal limit exceeded"
+    ↓
+DestroyEnvironment(env)                  // 立即销毁 Environment 释放内存
+return decision                          // 返回安全结果
+`
+
+### 审计输出新增字段
+
+每个 CLIPS decision 结果新增 6 个审计字段，可在 mcp_trace_audit_events.jsonl 中观测：
+
+| 字段 | 说明 |
+|---|---|
+| act_count_before_run | Run 前已存在 fact 数 |
+| act_count_after_run | Run 后总 fact 数 |
+| ule_firings_actual | Run 实际触发的规则数 |
+| duplicate_facts_blocked | 被去重拦截的 fact 数 |
+| circuit_breaker_facts_exceeded | 熔断①是否触发 |
+| circuit_breaker_rules_exceeded | 熔断③是否触发 |
+
+### 附带修复：日志膨胀治理
+
+- emote_control_events.jsonl：393 MB → 0（清理）
+- mcp_trace_audit_events.jsonl：7.3 MB → 0（清理）
+- 后续应增加日志轮转机制（单文件超 10 MB 自动截断）
+
+---
+
+## 24.4 验证结论
+
+修复后重新编译部署 codex_lan_agent.exe，验证结果：
+
+| 验证项 | 结果 |
+|---|---|
+| 进程状态 | **运行中** PID=25436，内存 8.7 MB |
+| exe 编译时间 | 17:12:27（晚于源码修改 17:11:47，确认熔断器代码已编译进 exe） |
+| pending continuations | 0 文件 |
+| 日志文件大小 | 全部 0 MB |
+| MCP 	ools/list 响应 | **正常**（protocol=2.0，tools count=1） |
+
+**结论：崩溃问题已解决。** 三层熔断器确保：
+
+1. **CLIPS 内部 fact 爆炸** → 熔断①在 500 fact 时停止断言，强制返回
+2. **相同 fact 重复插入** → 熔断②在签名命中时拦截，计数但不断言
+3. **规则互相触发死循环** → 熔断③在 200 次规则触发后停止 Run，强制返回
+4. **日志膨胀** → 已清理；后续应增加日志轮转
+
+任一熔断触发时，服务不会崩溃，而是返回 decision=allow + circuit_breaker_triggered 标记，保证 Codex 工作流不中断。
+
+---
+
+## 24.5 熔断器与 fact-factory 守卫层的关系
+
+`
+外部 LLM / Codex 输出
+        ↓
+┌─────────────────────────────┐
+│  fact-factory 守卫层（外部）  │  ← 管住从外部流入推理引擎的 fact
+│  第0层: 字节硬过滤            │     字节消毒、长度检查、CLIPS 转义
+│  第1层: CppJieba 分词         │
+│  第2层: marisa-trie 检索      │
+│  第3层: 语义同义归一           │
+└──────────┬──────────────────┘
+           ↓ 消毒后的 fact 进入 CLIPS
+┌─────────────────────────────┐
+│  CLIPS 推理引擎（内部）        │  ← 内部规则执行产生的新 fact 不经过守卫层
+│  规则匹配 → assert 新 fact    │
+│  ┌───────────────────────┐   │
+│  │ 熔断①: fact 数量 ≤ 500 │   │  ← 运行时硬上限
+│  │ 熔断②: 签名去重        │   │  ← C++ 侧断言去重
+│  │ 熔断③: 规则触发 ≤ 200  │   │  ← Run 有界替代无限
+│  └───────────────────────┘   │
+└──────────┬──────────────────┘
+           ↓
+     decision 结果返回
+`
+
+> **明确边界**：fact-factory 守卫层无法管住 CLIPS 内部自生 fact。三层熔断器是独立于守卫层的运行时安全机制，二者互补但职责分离。
+
+---

@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #include "SemanticIntentLexicon.h"
+#include <set>
 
 // FactFactory 守卫层归一化钩子（可选，无外部依赖时为 stub）
 //   返回: 归一后的标准 tag；若未匹配则返回空字符串，调用方回退原始值
@@ -40,7 +41,18 @@ struct ClipsDecision {
     std::string loaded_files;
     std::string engine_status = "not_started";
     int asserted_fact_count = 0;
+    // — CLIPS 内部熔断器状态 —
+    int fact_count_before_run = 0;          // Run 前已存在 fact 数
+    int fact_count_after_run = 0;           // Run 后总 fact 数
+    int rule_firings_actual = 0;            // Run 实际触发的规则数
+    int duplicate_facts_blocked = 0;        // 被去重拦截的重复 fact 数
+    bool circuit_breaker_facts_exceeded = false;  // 熔断①：fact 数量超限
+    bool circuit_breaker_rules_exceeded = false;  // 熔断③：规则触发次数超限
 };
+
+// — CLIPS 熔断器阈值（编译期常量，可按需调整）—
+constexpr int CLIPS_MAX_FACTS_PER_SESSION   = 500;   // 熔断①：单次 EvaluateClipsDecision 最大 fact 总数
+constexpr int CLIPS_MAX_RULE_FIRINGS        = 200;   // 熔断③：Run 最多触发的规则数（替代 -1 无限）
 
 std::string EscapeForClipsString(const std::string & value) {
     std::string escaped;
@@ -2226,14 +2238,29 @@ ClipsDecision EvaluateClipsDecision(
 
     Reset(env);
 
+    // 熔断②：相同 fact 签名去重，防止 C++ 侧重复断言
+    std::set<std::string> asserted_signatures;
+
     auto assert_fact =
         [&](const std::string & fact_text) {
             if (fact_text.empty()) {
                 return;
             }
+            // 计算 fact 签名（取前 256 字符作为去重 key，覆盖正常 fact 长度）
+            std::string signature = fact_text.substr(0, 256);
+            if (asserted_signatures.count(signature) > 0) {
+                ++decision.duplicate_facts_blocked;
+                return;  // 重复 fact，跳过
+            }
+            // 熔断①前置检查：如果 fact 数已超限，不再断言新 fact
+            if (GetNumberOfFacts(env) >= static_cast<unsigned long>(CLIPS_MAX_FACTS_PER_SESSION)) {
+                decision.circuit_breaker_facts_exceeded = true;
+                return;
+            }
             void * assert_result = AssertString(env, fact_text.c_str());
             if (assert_result != nullptr) {
                 ++decision.asserted_fact_count;
+                asserted_signatures.insert(signature);
             } else {
                 decision.engine_status = "assert_failed:" + fact_text.substr(0, 100);
             }
@@ -2262,7 +2289,34 @@ ClipsDecision EvaluateClipsDecision(
         }
     }
 
-    Run(env, -1);
+    // — 熔断①+③：Run 前记录 fact 数量；有界运行替代无限 —
+    decision.fact_count_before_run = static_cast<int>(GetNumberOfFacts(env));
+
+    // 熔断③：用有界 Run 替代 Run(env, -1) 无限运行，防止规则互相触发死循环
+    int rules_fired = Run(env, CLIPS_MAX_RULE_FIRINGS);
+    decision.rule_firings_actual = rules_fired;
+    if (rules_fired >= CLIPS_MAX_RULE_FIRINGS) {
+        decision.circuit_breaker_rules_exceeded = true;
+    }
+
+    // 熔断①：Run 后检查 fact 总数是否超限
+    decision.fact_count_after_run = static_cast<int>(GetNumberOfFacts(env));
+    if (decision.fact_count_after_run > CLIPS_MAX_FACTS_PER_SESSION) {
+        decision.circuit_breaker_facts_exceeded = true;
+    }
+
+    // 熔断触发时的安全回退：如果任一熔断器触发，强制 decision=allow 并标记告警
+    if (decision.circuit_breaker_facts_exceeded || decision.circuit_breaker_rules_exceeded) {
+        decision.decision = "allow";
+        decision.verification = "circuit_breaker_triggered";
+        decision.engine_status = "circuit_breaker_fired";
+        if (decision.reason_code.empty()) {
+            decision.reason_code = "clips_internal_circuit_breaker";
+        }
+        decision.next_action = "circuit_breaker: clips internal limit exceeded, forcing allow to prevent hang";
+        DestroyEnvironment(env);
+        return decision;
+    }
 
     decision.engine_status = "after_run_facts_collecting";
 
@@ -2353,6 +2407,13 @@ void ApplyClipsDecisionFields(
     result->fields[prefix + "rule_root"] = decision.rule_root;
     result->fields[prefix + "loaded_files"] = decision.loaded_files;
     result->fields[prefix + "asserted_fact_count"] = std::to_string(decision.asserted_fact_count);
+    // — 熔断器状态输出 —
+    result->fields[prefix + "fact_count_before_run"] = std::to_string(decision.fact_count_before_run);
+    result->fields[prefix + "fact_count_after_run"] = std::to_string(decision.fact_count_after_run);
+    result->fields[prefix + "rule_firings_actual"] = std::to_string(decision.rule_firings_actual);
+    result->fields[prefix + "duplicate_facts_blocked"] = std::to_string(decision.duplicate_facts_blocked);
+    result->fields[prefix + "circuit_breaker_facts_exceeded"] = decision.circuit_breaker_facts_exceeded ? "true" : "false";
+    result->fields[prefix + "circuit_breaker_rules_exceeded"] = decision.circuit_breaker_rules_exceeded ? "true" : "false";
 }
 
 std::string BuildPreGuardRouteCallJson(
