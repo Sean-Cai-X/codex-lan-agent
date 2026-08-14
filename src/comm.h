@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -350,6 +351,69 @@ struct CommOperations final {
         return codex_lan_agent::JoinPath(config.log_root, "remote_control_events.jsonl");
     }
 
+    static std::string BuildAgentServerStdoutLogPath(const AgentConfig & config) {
+        return codex_lan_agent::JoinPath(config.log_root, "agent_server_stdout.log");
+    }
+
+    static std::mutex & AgentServerStdoutFileLogMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    static bool & AgentServerStdoutFileLogEnabled() {
+        static bool enabled = false;
+        return enabled;
+    }
+
+    static std::string & AgentServerStdoutFileLogPath() {
+        static std::string path;
+        return path;
+    }
+
+    static void ConfigureAgentServerStdoutFileLog(
+        const AgentConfig & config,
+        bool enabled,
+        const std::string & path = "") {
+        std::lock_guard<std::mutex> lock(AgentServerStdoutFileLogMutex());
+        AgentServerStdoutFileLogEnabled() = enabled;
+        AgentServerStdoutFileLogPath() = path.empty()
+            ? BuildAgentServerStdoutLogPath(config)
+            : path;
+    }
+
+    static bool IsAgentServerStdoutFileLogEnabled() {
+        std::lock_guard<std::mutex> lock(AgentServerStdoutFileLogMutex());
+        return AgentServerStdoutFileLogEnabled();
+    }
+
+    static std::string GetAgentServerStdoutFileLogPath(const AgentConfig & config) {
+        std::lock_guard<std::mutex> lock(AgentServerStdoutFileLogMutex());
+        return AgentServerStdoutFileLogPath().empty()
+            ? BuildAgentServerStdoutLogPath(config)
+            : AgentServerStdoutFileLogPath();
+    }
+
+    static void AppendAgentServerStdoutFileLogLine(
+        const AgentConfig & config,
+        const std::string & line) {
+        std::lock_guard<std::mutex> lock(AgentServerStdoutFileLogMutex());
+        if (!AgentServerStdoutFileLogEnabled()) {
+            return;
+        }
+        const std::string path = AgentServerStdoutFileLogPath().empty()
+            ? BuildAgentServerStdoutLogPath(config)
+            : AgentServerStdoutFileLogPath();
+        const std::filesystem::path log_path(path);
+        const std::filesystem::path parent_path = log_path.parent_path();
+        if (!parent_path.empty()) {
+            std::filesystem::create_directories(parent_path);
+        }
+        std::ofstream output(path, std::ios::out | std::ios::app);
+        if (output.is_open()) {
+            output << line << "\n";
+        }
+    }
+
     static std::string BuildExperienceCardsPath(const AgentConfig & config) {
         return codex_lan_agent::JoinPath(config.log_root, "experience_cards.jsonl");
     }
@@ -382,10 +446,10 @@ struct CommOperations final {
         if (!detail.empty()) {
             output << " detail=\"" << detail << "\"";
         }
-        std::cerr << output.str() << std::endl;
-        (void)config;
+        const std::string line = output.str();
+        std::cerr << line << std::endl;
+        AppendAgentServerStdoutFileLogLine(config, line);
     }
-
     static int GetLastSocketErrorCode() {
 #ifdef _WIN32
         return static_cast<int>(WSAGetLastError());
@@ -425,12 +489,40 @@ struct CommOperations final {
             || path_text[prefix_size] == '/';
     }
 
+    static std::vector<std::filesystem::path> ParsePathList(const std::string & path_list) {
+        std::vector<std::filesystem::path> paths;
+        std::size_t start = 0;
+        while (start <= path_list.size()) {
+            const std::size_t end = path_list.find(';', start);
+            const std::string path_text = Trim(path_list.substr(
+                start,
+                end == std::string::npos ? std::string::npos : end - start));
+            if (!path_text.empty()) {
+                paths.emplace_back(path_text);
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+        return paths;
+    }
+
+    static std::filesystem::path GetPrimaryWorkspaceRoot(const AgentConfig & config) {
+        const std::vector<std::filesystem::path> roots = ParsePathList(config.workspace_root);
+        return roots.empty() ? std::filesystem::path() : roots.front();
+    }
+
+    static std::vector<std::filesystem::path> GetWorkspaceRoots(const AgentConfig & config) {
+        return ParsePathList(config.workspace_root);
+    }
+
     static std::filesystem::path RebaseRequestedPath(
         const AgentConfig & config,
         const std::string & raw_path) {
         std::filesystem::path requested(raw_path);
         if (requested.is_relative()) {
-            requested = std::filesystem::path(config.workspace_root) / requested;
+            requested = GetPrimaryWorkspaceRoot(config) / requested;
         }
         return requested;
     }
@@ -464,6 +556,9 @@ struct CommOperations final {
     static bool StartsWithPath(
         const std::filesystem::path & path,
         const std::filesystem::path & prefix) {
+        if (prefix.empty()) {
+            return false;
+        }
         const std::string path_text = NormalizeForPathComparison(path).string();
         const std::string prefix_text = NormalizeForPathComparison(prefix).string();
 #ifdef _WIN32
@@ -478,6 +573,18 @@ struct CommOperations final {
 #endif
     }
 
+    static bool StartsWithAnyPath(
+        const std::filesystem::path & path,
+        const std::string & path_list) {
+        const std::vector<std::filesystem::path> roots = ParsePathList(path_list);
+        return std::any_of(
+            roots.begin(),
+            roots.end(),
+            [&path](const std::filesystem::path & root) {
+                return StartsWithPath(path, root);
+            });
+    }
+
     static bool TryResolveAllowedPath(
         const AgentConfig & config,
         const std::string & raw_path,
@@ -488,23 +595,10 @@ struct CommOperations final {
             return false;
         }
 
-        const std::filesystem::path logs_root = std::filesystem::path(config.log_root);
-        const std::filesystem::path workspace_root = std::filesystem::path(config.workspace_root);
-        bool is_allowed = StartsWithPath(normalized, logs_root) || StartsWithPath(normalized, workspace_root);
-        std::size_t start = 0;
-        while (!is_allowed && start <= config.allowed_roots.size()) {
-            const std::size_t end = config.allowed_roots.find(';', start);
-            const std::string root_text = Trim(config.allowed_roots.substr(
-                start,
-                end == std::string::npos ? std::string::npos : end - start));
-            if (!root_text.empty()) {
-                is_allowed = StartsWithPath(normalized, std::filesystem::path(root_text));
-            }
-            if (end == std::string::npos) {
-                break;
-            }
-            start = end + 1;
-        }
+        const std::filesystem::path logs_root(config.log_root);
+        const bool is_allowed = StartsWithPath(normalized, logs_root)
+            || StartsWithAnyPath(normalized, config.workspace_root)
+            || StartsWithAnyPath(normalized, config.allowed_roots);
         if (!is_allowed) {
             if (error_message) {
                 *error_message = "path is outside allowed roots";
@@ -526,8 +620,7 @@ struct CommOperations final {
             return false;
         }
         std::error_code ec;
-        const std::filesystem::path workspace_root = std::filesystem::path(config.workspace_root);
-        if (!StartsWithPath(normalized, workspace_root)) {
+        if (!StartsWithAnyPath(normalized, config.workspace_root)) {
             if (error_message) {
                 *error_message = "path is outside workspace_root";
             }
@@ -722,11 +815,36 @@ struct CommOperations final {
         decorated.fields["outcome"] = ComputeCommandOutcome(result);
         std::ostringstream buffer;
         buffer << "{";
+        // ── P1c: 强类型 ok/exit_code（布尔/整数），与字符串 fields 区分 ──
         buffer << "\"ok\":" << (decorated.ok ? "true" : "false");
         buffer << ",\"exit_code\":" << decorated.exit_code;
+        // 跟踪已镜像输出的结构化字段名，避免重复输出
+        std::unordered_set<std::string> mirrored_structured;
         for (const auto & entry : decorated.fields) {
-            buffer << ",\"" << codex_lan_agent::JsonEscape(entry.first) << "\":\""
-                   << codex_lan_agent::JsonEscape(entry.second) << "\"";
+            const std::string & key = entry.first;
+            const std::string & value = entry.second;
+            // ok/exit_code 已在顶层强类型输出；fields 中若再次出现则跳过，避免重复键
+            if (key == "ok" || key == "exit_code") {
+                continue;
+            }
+            const bool ends_with_json =
+                key.size() > 5 && key.compare(key.size() - 5, 5, "_json") == 0;
+            const bool looks_like_json =
+                !value.empty() && (value.front() == '{' || value.front() == '[');
+            if (ends_with_json && looks_like_json) {
+                // P1a: 以 _json 结尾且内容是合法 JSON 起始字符 → 输出为结构化对象/数组
+                buffer << ",\"" << codex_lan_agent::JsonEscape(key) << "\":" << value;
+                // P1a: 同时镜像输出不带 _json 后缀的结构化字段，消除客户端双重解析
+                const std::string mirror_key = key.substr(0, key.size() - 5);
+                if (mirrored_structured.find(mirror_key) == mirrored_structured.end()) {
+                    buffer << ",\"" << codex_lan_agent::JsonEscape(mirror_key)
+                           << "\":" << value;
+                    mirrored_structured.insert(mirror_key);
+                }
+            } else {
+                buffer << ",\"" << codex_lan_agent::JsonEscape(entry.first) << "\":\""
+                       << codex_lan_agent::JsonEscape(entry.second) << "\"";
+            }
         }
         buffer << "}";
         return buffer.str();
@@ -1464,6 +1582,31 @@ inline std::string BuildRemoteControlEventsPath(const AgentConfig & config) {
     return CommOperations::BuildRemoteControlEventsPath(config);
 }
 
+inline std::string BuildAgentServerStdoutLogPath(const AgentConfig & config) {
+    return CommOperations::BuildAgentServerStdoutLogPath(config);
+}
+
+inline void ConfigureAgentServerStdoutFileLog(
+    const AgentConfig & config,
+    bool enabled,
+    const std::string & path = "") {
+    CommOperations::ConfigureAgentServerStdoutFileLog(config, enabled, path);
+}
+
+inline bool IsAgentServerStdoutFileLogEnabled() {
+    return CommOperations::IsAgentServerStdoutFileLogEnabled();
+}
+
+inline std::string GetAgentServerStdoutFileLogPath(const AgentConfig & config) {
+    return CommOperations::GetAgentServerStdoutFileLogPath(config);
+}
+
+inline void AppendAgentServerStdoutFileLogLine(
+    const AgentConfig & config,
+    const std::string & line) {
+    CommOperations::AppendAgentServerStdoutFileLogLine(config, line);
+}
+
 inline std::string BuildExperienceCardsPath(const AgentConfig & config) {
     return CommOperations::BuildExperienceCardsPath(config);
 }
@@ -1494,6 +1637,20 @@ inline bool StartsWithPath(
     const std::filesystem::path & path,
     const std::filesystem::path & prefix) {
     return CommOperations::StartsWithPath(path, prefix);
+}
+
+inline bool StartsWithAnyPath(
+    const std::filesystem::path & path,
+    const std::string & path_list) {
+    return CommOperations::StartsWithAnyPath(path, path_list);
+}
+
+inline std::filesystem::path GetPrimaryWorkspaceRoot(const AgentConfig & config) {
+    return CommOperations::GetPrimaryWorkspaceRoot(config);
+}
+
+inline std::vector<std::filesystem::path> GetWorkspaceRoots(const AgentConfig & config) {
+    return CommOperations::GetWorkspaceRoots(config);
 }
 
 inline bool TryResolveAllowedPath(

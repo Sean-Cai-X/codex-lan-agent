@@ -19,7 +19,7 @@
     (next_action "tool_call_only: a pending continuation already exists for this trace/goal; call its route_arguments_json exactly before any other tool")
     (matched_rule "route-mismatched-pending-continuation"))))
 
-(defrule route-pending-continuation-same-tool-missing-context
+(defrule route-pending-continuation-stale
   (declare (salience 95))
   (mcp_tool_request (tool_name ?tool)
                     (trace_id ?trace)
@@ -36,10 +36,10 @@
     (target ?tool)
     (decision "route")
     (verification "not_verified")
-    (reason_code "pending_continuation_context_mismatch")
+    (reason_code "continuation_stale")
     (route_target ?expected)
     (next_action "tool_call_only: this is the expected tool but the saved continuation context is missing or changed; call route_arguments_json exactly")
-    (matched_rule "route-pending-continuation-same-tool-missing-context"))))
+    (matched_rule "route-pending-continuation-stale"))))
 
 (defrule allow-single-file-patch-preview
   (declare (salience 80))
@@ -182,8 +182,7 @@
 
 (defrule route-file-text-operations-to-probe-first
   (declare (salience 84))
-  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
-                                          (eq ?tool "lan_agent_find_line_metadata")
+  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_find_line_metadata")
                                           (eq ?tool "lan_agent_find_content_matches")
                                           (eq ?tool "lan_agent_locate_text_lines")
                                           (eq ?tool "lan_agent_scan_text_ranges")
@@ -194,7 +193,6 @@
                                           (eq ?tool "lan_agent_delete_text_range_window_atomic")
                                           (eq ?tool "lan_agent_insert_after_anchor_atomic")
                                           (eq ?tool "lan_agent_replace_line_range_atomic")
-                                          (eq ?tool "lan_agent_write_text_file")
                                           (eq ?tool "lan_agent_apply_single_file_patch")
                                           (eq ?tool "lan_agent_apply_diff_patch")))
                     (file_path ?file_path&:(neq ?file_path ""))
@@ -208,7 +206,7 @@
     (verification "not_verified")
     (reason_code "missing_probe_preflight")
     (route_target "lan_agent_probe_text_file")
-    (next_action "call lan_agent_probe_text_file first and continue only with the emitted next_call_json/probe_ref chain before any text read, scan, write, or patch step")
+    (next_action "call lan_agent_probe_text_file first and continue only with the emitted next_call_json/probe_ref chain before any scan, edit, or patch step")
     (matched_rule "route-file-text-operations-to-probe-first"))))
 
 (defrule route-read-text-file-to-window-delete-for-comment-cleanup

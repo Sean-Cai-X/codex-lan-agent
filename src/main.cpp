@@ -302,7 +302,7 @@ void PrintUsage() {
         << "  run-cli-profile <profile> [args]\n"
         << "  run-case <case-path>\n"
         << "  run-rag-flow <query> [mode]\n"
-        << "  serve --machine-code <code>  (exposes async enqueue/task endpoints over HTTP/MCP)\n"
+        << "  serve --machine-code <code> [--agent-server-stdout-log-path <path>] [--no-agent-server-stdout-log]  (exposes async enqueue/task endpoints over HTTP/MCP; stdout log is on by default)\n"
         ;
 }
 
@@ -1516,7 +1516,21 @@ void ApplySupervisionEnvelope(CommandResult * result) {
         return;
     }
 
-    const std::string clamp = GetFieldOrDefault(*result, "semantic_model_clamp", "");
+    std::string clamp = GetFieldOrDefault(*result, "semantic_model_clamp", "");
+    // P0-fix: 如果结果有 next_tool_name 但未设 semantic_model_clamp，
+    // 说明是中间步骤（如 probe_complete），不应进入默认终态路径
+    if (clamp.empty()) {
+        const std::string next_tool = GetFieldOrDefault(*result, "next_tool_name", "");
+        const std::string result_type = GetFieldOrDefault(*result, "result", "");
+        if (!next_tool.empty()
+            && result_type != "delete_complete"
+            && result_type != "directory_cleanup_complete"
+            && result_type != "format_complete"
+            && result_type != "edit_complete") {
+            clamp = "tool_call_only";
+            result->fields["semantic_model_clamp"] = "tool_call_only";
+        }
+    }
     const std::string alarm_code = GetFieldOrDefault(*result, "supervision_alarm_code", "");
     const bool has_alarm = !alarm_code.empty()
         || GetFieldOrDefault(*result, "supervision_status", "") == "alarm";
@@ -1608,8 +1622,8 @@ void ApplySupervisionEnvelope(CommandResult * result) {
             SetClipsSupervisionAlarm(
                 result,
                 safety_class.empty()
-                    ? "NEXT_ACTION_SAFETY_CLASS_MISSING"
-                    : "NEXT_FLOW_SAFETY_CLASS_NOT_READ_ONLY",
+                    ? "safety_class_missing"
+                    : "flow_not_read_only",
                 "CLIPS produced a continuation action without a recognized read-only safety boundary.");
         } else {
             result->fields["next_actions_count"] = "1";
@@ -1633,6 +1647,22 @@ void ApplySupervisionEnvelope(CommandResult * result) {
             result->fields["next_action_0_params_hash"] = StableContentChecksum(next_action_json);
             if (required_tool == "lan_agent_delete_text_range_window_atomic"
                 || required_tool == "lan_agent_delete_next_text_range_atomic") {
+                // long-loop freeze 只在实际执行的工具是 delete 时触发
+                // probe 推荐的 delete（probe→delete 转换）不应触发 freeze
+                const std::string actual_executed_tool = GetFieldOrDefault(*result, "routed_tool_name", "");
+                const std::string current_result = GetFieldOrDefault(*result, "result", "");
+                const bool is_probe_result_probe_complete =
+                    actual_executed_tool == "lan_agent_probe_text_file"
+                    && current_result == "probe_complete";
+                // Auto-Chaining 经过 probe→delete 链后，delete 在窗口中无注释时返回 no_text_range_in_window+has_more=true
+                // 此时 routed_tool_name 仍为 probe（原始链路起点），也应视为 probe→delete 转换阶段，不触发 freeze
+                const bool is_probe_chain_delete_no_text =
+                    actual_executed_tool == "lan_agent_probe_text_file"
+                    && current_result == "no_text_range_in_window"
+                    && GetFieldOrDefault(*result, "has_more", "") == "true"
+                    && GetFieldOrDefault(*result, "probe_ready", "") == "true";
+                const bool is_probe_to_delete_transition =
+                    is_probe_result_probe_complete || is_probe_chain_delete_no_text;
                 const bool budget_internal_step =
                     GetFieldOrDefault(*result, "task_memory_budget_internal_step", "") == "true";
                 const std::string goal_id = FirstNonEmpty(
@@ -1644,6 +1674,14 @@ void ApplySupervisionEnvelope(CommandResult * result) {
                     || GetFieldOrDefault(*result, "continue_required", "") == "true"
                     ? "needs_continue"
                     : GetFieldOrDefault(*result, "status", "");
+                // probe→delete 转换 / Auto-Chaining delete 窗口无注释继续扫描时跳过 freeze，让 LLM 直接调用 delete
+                if (is_probe_to_delete_transition) {
+                    result->fields["long_loop_budget_recommended"] = "deferred";
+                    result->fields["long_loop_budget_deferred_reason"] =
+                        is_probe_result_probe_complete
+                        ? "probe_to_delete_transition: let LLM directly call delete; freeze triggers on delete has_more=true"
+                        : "probe_chain_delete_no_text_window: continue window scan without freeze until after real delete writes";
+                } else {
                 result->fields["long_loop_budget_recommended"] = "true";
                 result->fields["long_loop_freeze_tool_name"] = "lan_agent_task_memory_freeze";
                 result->fields["long_loop_budget_tool_name"] = "lan_agent_task_memory_execute_continuation_budget";
@@ -1704,6 +1742,7 @@ void ApplySupervisionEnvelope(CommandResult * result) {
                     result->fields["next_action_0_reason"] =
                         "long loop must run under MCP task_memory budget instead of model-side repeated calls";
                 }
+                } // end else (not probe_to_delete_transition)
             }
         }
     } else if (GetFieldOrDefault(*result, "next_actions_count", "").empty()) {
@@ -6188,6 +6227,28 @@ int main(int argc, char ** argv) {
         if (command == "serve") {
             std::string provided_machine_code;
             FindArgument(arguments, "--machine-code", &provided_machine_code);
+
+            std::string agent_server_stdout_log_path;
+            const bool agent_server_stdout_log_path_set =
+                FindArgument(arguments, "--agent-server-stdout-log-path", &agent_server_stdout_log_path);
+            const bool agent_server_stdout_log_explicit =
+                std::find(arguments.begin(), arguments.end(), "--agent-server-stdout-log") != arguments.end()
+                || agent_server_stdout_log_path_set;
+            const bool agent_server_stdout_log_disabled =
+                std::find(arguments.begin(), arguments.end(), "--no-agent-server-stdout-log") != arguments.end();
+            const bool agent_server_stdout_log_enabled = !agent_server_stdout_log_disabled;
+            ConfigureAgentServerStdoutFileLog(
+                config,
+                agent_server_stdout_log_enabled,
+                agent_server_stdout_log_path);
+            if (IsAgentServerStdoutFileLogEnabled()) {
+                const std::string log_mode = agent_server_stdout_log_explicit ? "explicit" : "default";
+                LogServerEvent(
+                    config,
+                    "agent_server_stdout_file_log_enabled",
+                    GetAgentServerStdoutFileLogPath(config) + " mode=" + log_mode);
+            }
+
             std::string machine_code_error;
             if (!ValidateRemoteMachineCode(provided_machine_code, &machine_code_error)) {
                 WriteServerStateFile(config, "failed", machine_code_error);

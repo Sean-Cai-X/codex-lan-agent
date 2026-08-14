@@ -208,6 +208,8 @@ void ApplyMcpTransport(HttpResponseSpec * response, McpResponseMode mode) {
 }
 
 bool UseFullMcpToolSurface() {
+    // 默认始终走单网关模式：只暴露 lan_agent_mcp_route
+    // 全量工具暴露仅在显式设置 CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full 时开启（调试用）
     const char * value = std::getenv("CODEX_LAN_AGENT_MCP_TOOL_SURFACE");
     if (value == nullptr || value[0] == '\0') {
         return false;
@@ -215,8 +217,7 @@ bool UseFullMcpToolSurface() {
     const std::string lowered = ToLowerAscii(Trim(value));
     return lowered == "full" ||
            lowered == "all" ||
-           lowered == "legacy" ||
-           lowered == "153";
+           lowered == "legacy";
 }
 
 std::string BuildMcpRouteOnlyToolsListResponse(const std::string & id_raw) {
@@ -227,12 +228,45 @@ std::string BuildMcpRouteOnlyToolsListResponse(const std::string & id_raw) {
            << "\"result\":{\"tools\":["
            << "{"
            << "\"name\":\"lan_agent_mcp_route\","
-           << "\"description\":\"Single chat-facing MCP gateway. Always call this tool for local file/code/task requests instead of saying local files are inaccessible. If mode is omitted but request_text, primary_intent, file_path, or source_file is present, MCP treats the call as mode=route. mode=overview returns guidance only; mode=route returns tool_use_decision, current_tool_chain_node, chain_state, required_tool_name, and required_tool_arguments_json; mode=call executes one internal MCP tool by target_tool_name while the full internal catalog remains hidden. Completion claims must obey terminal_state, completion_claim_allowed, final_answer_allowed, and verification_ok.\","
+           << "\"description\":\"Unified MCP Gateway. Single entry for all local file/code/task operations.\\n"
+           // ── 段1：小模型速查（<200字符，放最前面）──
+           << "Quick start: use mode=route with primary_intent for auto-routing. Common intents: read_file, search_text, write_file, append_text, list_directory, probe_file, replace_lines, delete_lines, optfile_read, optfile_write, run_flow, code_format, comment_cleanup. Gateway auto-resolves and executes the target tool in one call.\\n"
+           // ── 段2：大模型完整工具目录 ──
+           << "Internal Tool Catalog (use as target_tool_name in mode=call for direct execution):\\n"
+           << "[READ-ONLY] lan_agent_probe_text_file (file_path, primary_intent?) - Pre-flight probe before read/write, returns metadata+hash.\\n"
+           << "lan_agent_read_text_file (file_path, start_line?, max_lines?) - Paged file read, returns content between content_begin/content_end.\\n"
+           << "lan_agent_search_text (directory_path, query_text, recursive?) - Recursive bounded text search.\\n"
+           << "lan_agent_list_directory (directory_path, file_extensions_csv?) - List directory contents with file sizes.\\n"
+           << "[WRITE] lan_agent_write_text_file (file_path, content) - Atomic file write with SHA256 hash.\\n"
+           << "lan_agent_append_text_file (file_path, content) - Append text to existing file.\\n"
+           << "lan_agent_insert_after_anchor_atomic (file_path, anchor_text, new_content) - Insert text after first matching anchor line.\\n"
+           << "lan_agent_replace_line_range_atomic (file_path, start_line, end_line, new_content) - Replace lines atomically.\\n"
+           << "lan_agent_delete_text_range_window_atomic (file_path, start_line, max_lines) - Delete lines in a bounded window.\\n"
+           << "[ANALYSIS] lan_agent_run_cxparser_flow (script_path, module_name?) - Execute cxparser script flow.\\n"
+           << "lan_agent_format_code_file (file_path, dry_run) - Format code file with optional dry-run preview.\\n"
+           << "[OPTFILE] lan_agent_optfile_read / lan_agent_optfile_write_preview / lan_agent_optfile_apply_write - Controlled short-link runtime file operations.\\n"
+           << "Safety: existing-file edit and patch tools keep probe pre-flight. New-file writes are path-guarded and verified after write. All paths must be within a configured workspace root. mode=route auto-selects+executes tool by primary_intent and parameter pattern; mode=call is available to both small-llm and large-llm profiles for direct execution.\","
            << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-           << "\"mode\":{\"type\":\"string\",\"description\":\"overview, route, or call. Omit mode for natural-language local tasks; MCP auto-routes when request_text/file_path/primary_intent is present.\"},"
+           << "\"mode\":{\"type\":\"string\",\"description\":\"overview, route, or call. Omit for auto-route when request_text/file_path/primary_intent is present. route: auto-resolve+execute in one call. call: direct execution by target_tool_name.\"},"
            << "\"request_text\":{\"type\":\"string\",\"description\":\"Natural-language request for route mode.\"},"
-           << "\"primary_intent\":{\"type\":\"string\"},"
-           << "\"target_tool_name\":{\"type\":\"string\",\"description\":\"Internal MCP tool name for mode=call.\"},"
+           << "\"primary_intent\":{\"type\":\"string\",\"description\":\"Intent for route mode. Common: read_file, search_text, write_file, append_text, list_directory, probe_file, replace_lines, delete_lines, optfile_read, optfile_write_preview, optfile_apply_write, run_flow, code_format, comment_cleanup.\"},"
+           << "\"model_profile\":{\"type\":\"string\",\"description\":\"small-llm or large-llm. Both support route and call; the profile tunes planning and guard behavior.\"},"
+           << "\"target_tool_name\":{\"type\":\"string\",\"description\":\"Internal tool name for mode=call. See catalog in tool description above.\",\"examples\":[\"lan_agent_probe_text_file\",\"lan_agent_read_text_file\",\"lan_agent_search_text\",\"lan_agent_write_text_file\",\"lan_agent_append_text_file\",\"lan_agent_insert_after_anchor_atomic\",\"lan_agent_replace_line_range_atomic\",\"lan_agent_delete_text_range_window_atomic\",\"lan_agent_list_directory\",\"lan_agent_optfile_read\",\"lan_agent_optfile_write_preview\",\"lan_agent_optfile_apply_write\",\"lan_agent_run_cxparser_flow\",\"lan_agent_format_code_file\"]},"
+           << "\"file_path\":{\"type\":\"string\",\"description\":\"Target file path for file operations.\"},"
+           << "\"directory_path\":{\"type\":\"string\",\"description\":\"Target directory path for listing or recursive search.\"},"
+           << "\"query_text\":{\"type\":\"string\",\"description\":\"Text query for search_text.\"},"
+           << "\"content\":{\"type\":\"string\",\"description\":\"Text content for write/append operations.\"},"
+           << "\"content_base64\":{\"type\":\"string\",\"description\":\"Base64 text payload for write operations.\"},"
+           << "\"target_name\":{\"type\":\"string\",\"description\":\"Short target name for optfile operations.\"},"
+           << "\"data\":{\"type\":\"string\",\"description\":\"Text payload for optfile writes.\"},"
+           << "\"data_base64\":{\"type\":\"string\",\"description\":\"Base64 payload for optfile writes.\"},"
+           << "\"append\":{\"type\":\"boolean\"},"
+           << "\"recursive\":{\"type\":\"boolean\"},"
+           << "\"start_line\":{\"type\":\"integer\",\"description\":\"Starting line number for read/replace/delete operations.\"},"
+           << "\"end_line\":{\"type\":\"integer\",\"description\":\"Ending line number for replace operations.\"},"
+           << "\"max_lines\":{\"type\":\"integer\",\"description\":\"Maximum lines for read/delete window operations.\"},"
+           << "\"max_matches\":{\"type\":\"integer\",\"description\":\"Maximum search matches returned.\"},"
+           << "\"max_bytes\":{\"type\":\"integer\",\"description\":\"Maximum optfile bytes returned.\"},"
            << "\"arguments\":{\"type\":\"object\",\"description\":\"Arguments object passed to target_tool_name when mode=call.\",\"additionalProperties\":true},"
            << "\"arguments_json\":{\"type\":\"string\",\"description\":\"Alternative raw JSON object string passed to target_tool_name when mode=call.\"},"
            << "\"goal_id\":{\"type\":\"string\"},"
@@ -545,8 +579,9 @@ std::string BuildMcpToolsListResponse(
         << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
         << "\"target_name\":{\"type\":\"string\"},"
         << "\"data\":{\"type\":\"string\"},"
+        << "\"data_base64\":{\"type\":\"string\"},"
         << "\"append\":{\"type\":\"boolean\"}"
-        << "},\"required\":[\"data\"],\"additionalProperties\":false}"
+        << "},\"additionalProperties\":false}"
         << "},"
         << "{"
         << "\"name\":\"lan_agent_optfile_apply_write\","
@@ -554,8 +589,9 @@ std::string BuildMcpToolsListResponse(
         << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
         << "\"target_name\":{\"type\":\"string\"},"
         << "\"data\":{\"type\":\"string\"},"
+        << "\"data_base64\":{\"type\":\"string\"},"
         << "\"append\":{\"type\":\"boolean\"}"
-        << "},\"required\":[\"data\"],\"additionalProperties\":false}"
+        << "},\"additionalProperties\":false}"
         << "},"
         << "{"
         << "\"name\":\"lan_agent_record_dialog_slice\","
@@ -1750,6 +1786,19 @@ std::string BuildMcpToolsListResponse(
         << "},\"required\":[\"file_path\"],\"additionalProperties\":false}"
         << "},"
         << "{"
+        << "\"name\":\"lan_agent_search_text\","
+        << "\"description\":\"Search text in one file or recursively under one allowed directory, skipping generated and binary-heavy paths.\","
+        << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+        << "\"directory_path\":{\"type\":\"string\"},"
+        << "\"file_path\":{\"type\":\"string\"},"
+        << "\"query_text\":{\"type\":\"string\"},"
+        << "\"recursive\":{\"type\":\"boolean\"},"
+        << "\"show_preview\":{\"type\":\"boolean\"},"
+        << "\"max_matches\":{\"type\":\"integer\"},"
+        << "\"trace_id\":{\"type\":\"string\"}"
+        << "},\"required\":[\"query_text\"],\"additionalProperties\":false}"
+        << "},"
+        << "{"
         << "\"name\":\"lan_agent_list_directory\","
         << "\"description\":\"List a directory under the remote workspace or codex-lan-agent logs root. The directory listing itself is complete when directory_listing_complete=true. When trace_id is supplied and files are present, the agent also creates a stable directory read manifest and emits next_call_json for lan_agent_read_directory_files; if analysis_allowed=false or batch_completion=incomplete, do not relist the directory and continue that chain until all manifest files are read.\","
         << "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
@@ -2239,12 +2288,16 @@ std::string BuildMcpToolCallResponse(
     const CommandResult decorated = WithComputedOutcome(result);
     const CommandResult projected = BuildPublicResultProjection(decorated);
     std::ostringstream text;
-    const auto content_it = decorated.fields.find("content");
-    const bool has_content_payload =
-        content_it != decorated.fields.end() && !content_it->second.empty();
+    const std::string content_payload = FirstNonEmpty(
+        GetFieldOrDefault(decorated, "content", ""),
+        GetFieldOrDefault(decorated, "content_text", ""),
+        "");
+    const bool has_content_payload = !content_payload.empty();
     for (const auto & entry : projected.fields) {
         if ((entry.first == "content"
              || entry.first == "content_text"
+             || entry.first == "content_begin_marker"
+             || entry.first == "content_end_marker"
              || entry.first == "content_payload_format"
              || entry.first == "content_payload_scope")
             && has_content_payload) {
@@ -2253,11 +2306,15 @@ std::string BuildMcpToolCallResponse(
         text << entry.first << "=" << entry.second << "\n";
     }
     if (has_content_payload) {
-        text << "content_payload_format=plain_text\n";
-        text << "content_payload_scope=file_body_only\n";
+        text << "content_payload_format="
+             << FirstNonEmpty(GetFieldOrDefault(decorated, "content_payload_format", ""), "plain_text")
+             << "\n";
+        text << "content_payload_scope="
+             << FirstNonEmpty(GetFieldOrDefault(decorated, "content_payload_scope", ""), "tool_payload")
+             << "\n";
         text << "content_begin<<<\n";
-        text << content_it->second;
-        if (content_it->second.empty() || content_it->second.back() != '\n') {
+        text << content_payload;
+        if (content_payload.empty() || content_payload.back() != '\n') {
             text << "\n";
         }
         text << ">>>content_end\n";

@@ -115,8 +115,7 @@ std::vector<std::filesystem::path> BuildDirectoryAccessHelperCandidates(const Ag
     const std::string executable_name = "directory_access";
 #endif
     const std::filesystem::path config_dir(config.config_dir);
-    const std::filesystem::path workspace_root(config.workspace_root);
-    return {
+    std::vector<std::filesystem::path> candidates = {
         config_dir / executable_name,
         config_dir / "Release" / executable_name,
         config_dir / "Debug" / executable_name,
@@ -124,16 +123,19 @@ std::vector<std::filesystem::path> BuildDirectoryAccessHelperCandidates(const Ag
         config_dir / "build" / executable_name,
         config_dir / "build" / "Release" / executable_name,
         config_dir / "build" / "Debug" / executable_name,
-        config_dir / "build" / "RelWithDebInfo" / executable_name,
-        workspace_root / "codex-lan-agent" / executable_name,
-        workspace_root / "codex-lan-agent" / "Release" / executable_name,
-        workspace_root / "codex-lan-agent" / "Debug" / executable_name,
-        workspace_root / "codex-lan-agent" / "RelWithDebInfo" / executable_name,
-        workspace_root / "codex-lan-agent" / "build" / executable_name,
-        workspace_root / "codex-lan-agent" / "build" / "Release" / executable_name,
-        workspace_root / "codex-lan-agent" / "build" / "Debug" / executable_name,
-        workspace_root / "codex-lan-agent" / "build" / "RelWithDebInfo" / executable_name
+        config_dir / "build" / "RelWithDebInfo" / executable_name
     };
+    for (const std::filesystem::path & workspace_root : GetWorkspaceRoots(config)) {
+        candidates.push_back(workspace_root / "codex-lan-agent" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "Release" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "Debug" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "RelWithDebInfo" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "build" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "build" / "Release" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "build" / "Debug" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "build" / "RelWithDebInfo" / executable_name);
+    }
+    return candidates;
 }
 
 std::string FindDirectoryAccessHelperPath(
@@ -315,22 +317,24 @@ std::vector<std::filesystem::path> BuildOptfileHelperCandidates(const AgentConfi
     const std::string executable_name = "optfile";
 #endif
     const std::filesystem::path config_dir(config.config_dir);
-    const std::filesystem::path workspace_root(config.workspace_root);
-    return {
+    std::vector<std::filesystem::path> candidates = {
         config_dir / executable_name,
         config_dir / "optfile" / executable_name,
         config_dir / "optfile" / "Release" / executable_name,
         config_dir / "optfile" / "Debug" / executable_name,
         config_dir / "Release" / executable_name,
-        config_dir / "Debug" / executable_name,
-        workspace_root / "codex-lan-agent" / executable_name,
-        workspace_root / "codex-lan-agent" / "optfile" / executable_name,
-        workspace_root / "codex-lan-agent" / "optfile" / "Release" / executable_name,
-        workspace_root / "codex-lan-agent" / "optfile" / "Debug" / executable_name,
-        workspace_root / "optfile" / executable_name,
-        workspace_root / "optfile" / "Release" / executable_name,
-        workspace_root / "optfile" / "Debug" / executable_name
+        config_dir / "Debug" / executable_name
     };
+    for (const std::filesystem::path & workspace_root : GetWorkspaceRoots(config)) {
+        candidates.push_back(workspace_root / "codex-lan-agent" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "optfile" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "optfile" / "Release" / executable_name);
+        candidates.push_back(workspace_root / "codex-lan-agent" / "optfile" / "Debug" / executable_name);
+        candidates.push_back(workspace_root / "optfile" / executable_name);
+        candidates.push_back(workspace_root / "optfile" / "Release" / executable_name);
+        candidates.push_back(workspace_root / "optfile" / "Debug" / executable_name);
+    }
+    return candidates;
 }
 
 std::string FindOptfileHelperPath(
@@ -434,6 +438,23 @@ CommandResult RunOptfileHelper(
     const std::vector<std::string> & arguments,
     const std::string & log_label) {
     CommandResult result;
+    const bool is_mutation =
+        log_label.find("insert") != std::string::npos
+        || log_label.find("replace") != std::string::npos
+        || log_label.find("delete") != std::string::npos
+        || log_label.find("write") != std::string::npos
+        || log_label.find("append") != std::string::npos
+        || log_label.find("apply") != std::string::npos;
+    if (is_mutation && !config.optfile_write_enabled) {
+        result.ok = false;
+        result.exit_code = 97;
+        result.fields["error"] = "optfile write gate is disabled";
+        result.fields["result"] = "optfile_write_gate_disabled";
+        result.fields["optfile_write_enabled"] = "false";
+        result.fields["direct_file_write_enabled"] =
+            config.direct_file_write_enabled ? "true" : "false";
+        return result;
+    }
     std::string searched_paths_json;
     const std::string helper_path = FindOptfileHelperPath(config, &searched_paths_json);
     result.fields["optfile_helper_paths_json"] = searched_paths_json;
@@ -499,6 +520,112 @@ CommandResult RunOptfileHelper(
         result.fields["error"] = "optfile helper did not return structured JSON";
         return result;
     }
+    return result;
+}
+
+CommandResult WriteWholeTextViaOptfileResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & content,
+    bool append,
+    const std::string & expected_file_hash = std::string()) {
+    CommandResult result;
+    result.fields["file_path"] = file_path;
+    result.fields["optfile_write_enabled"] = config.optfile_write_enabled ? "true" : "false";
+    result.fields["direct_file_write_enabled"] = config.direct_file_write_enabled ? "true" : "false";
+    if (!config.optfile_write_enabled) {
+        result.ok = false;
+        result.exit_code = 97;
+        result.fields["error"] = "optfile write gate is disabled";
+        result.fields["result"] = "optfile_write_gate_disabled";
+        return result;
+    }
+
+    std::vector<std::string> arguments;
+    std::string normalized_path;
+    std::string path_error;
+    if (!BuildOptfileTargetArguments(config, file_path, &arguments, &normalized_path, &path_error)) {
+        result.ok = false;
+        result.exit_code = 21;
+        result.fields["error"] = path_error;
+        return result;
+    }
+
+    std::string old_content;
+    std::error_code exists_error;
+    if (std::filesystem::exists(normalized_path, exists_error)) {
+        std::string read_error;
+        if (!ReadWholeFile(normalized_path, &old_content, &read_error)) {
+            result.ok = false;
+            result.exit_code = 22;
+            result.fields["error"] = read_error;
+            return result;
+        }
+    }
+    const std::string expected_content = append ? old_content + content : content;
+    const std::string payload_path = BuildLogPath(
+        config, "optfile_payload_" + StableContentChecksum(normalized_path + IsoTimestampNow()));
+    {
+        std::ofstream payload(payload_path, std::ios::binary | std::ios::trunc);
+        if (!payload.is_open()) {
+            result.ok = false;
+            result.exit_code = 98;
+            result.fields["error"] = "failed to create optfile payload";
+            return result;
+        }
+        payload.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!payload.good()) {
+            result.ok = false;
+            result.exit_code = 98;
+            result.fields["error"] = "failed to write optfile payload";
+            return result;
+        }
+    }
+
+    arguments.push_back("--content-file " + QuoteOptfileArgument(payload_path));
+    if (append) {
+        arguments.push_back("--append-file");
+    }
+    if (!expected_file_hash.empty()) {
+        arguments.push_back("--expected-file-hash " + QuoteOptfileArgument(expected_file_hash));
+    }
+    result = RunOptfileHelper(config, arguments, append ? "optfile_append_file" : "optfile_write_file");
+    std::error_code cleanup_error;
+    std::filesystem::remove(payload_path, cleanup_error);
+    result.fields["file_path"] = file_path;
+    result.fields["normalized_path"] = normalized_path;
+    result.fields["payload_transport"] = "staging_file";
+    result.fields["payload_cleanup_ok"] = cleanup_error ? "false" : "true";
+    result.fields["final_write_tool"] = "optfile.exe";
+    result.fields["write_backend"] = "optfile";
+    result.fields["optfile_write_enabled"] = "true";
+    result.fields["direct_file_write_enabled"] = config.direct_file_write_enabled ? "true" : "false";
+    if (!result.ok) {
+        result.fields["fallback_attempted"] = "false";
+        return result;
+    }
+
+    std::string verified_content;
+    std::string verify_error;
+    if (!ReadWholeFile(normalized_path, &verified_content, &verify_error)
+        || verified_content != expected_content) {
+        result.ok = false;
+        result.exit_code = 99;
+        result.fields["error"] = verify_error.empty()
+            ? "optfile post-write content verification failed"
+            : verify_error;
+        result.fields["write_verified"] = "false";
+        return result;
+    }
+    result.fields["write_verified"] = "true";
+    result.fields["new_hash"] = StableContentChecksum(verified_content);
+    result.fields["bytes_written"] = std::to_string(content.size());
+    result.fields["final_bytes"] = std::to_string(verified_content.size());
+    result.fields["result"] = append ? "append_text_file_complete" : "write_text_file_complete";
+    result.fields["status"] = "success";
+    result.fields["summary"] = append
+        ? "text appended atomically through optfile"
+        : "text written atomically through optfile";
     return result;
 }
 
@@ -612,6 +739,170 @@ CommandResult FindContentMatchesResult(
             GetFieldOrDefault(result, "normalized_path", file_path),
             "match_count=" + GetFieldOrDefault(result, "match_count", "0"));
     }
+    return result;
+}
+
+bool IsSearchTextCandidatePath(const std::filesystem::path & path) {
+    const std::string extension = ToLowerAscii(path.extension().string());
+    return extension == ".cpp"
+        || extension == ".cxx"
+        || extension == ".cc"
+        || extension == ".c"
+        || extension == ".hpp"
+        || extension == ".hh"
+        || extension == ".h"
+        || extension == ".ipp"
+        || extension == ".md"
+        || extension == ".txt"
+        || extension == ".json"
+        || extension == ".cfg"
+        || extension == ".clp"
+        || extension == ".ps1"
+        || extension == ".bat"
+        || extension == ".cmake";
+}
+
+bool SearchTextShouldSkipDirectory(const std::filesystem::path & path) {
+    const std::string name = ToLowerAscii(path.filename().string());
+    return name == ".git"
+        || name == "build"
+        || name.rfind("build_", 0) == 0
+        || name.rfind("build", 0) == 0
+        || name == "aibuild"
+        || name == "logs"
+        || name == "third_party"
+        || name == "cmm";
+}
+
+CommandResult SearchTextResult(
+    const AgentConfig & config,
+    const std::string & path,
+    const std::string & query_text,
+    bool recursive,
+    bool show_preview,
+    int max_matches,
+    const std::string & trace_id) {
+    CommandResult result;
+    result.fields["requested_path"] = path;
+    result.fields["query_text"] = query_text;
+    result.fields["recursive"] = recursive ? "true" : "false";
+    if (!trace_id.empty()) {
+        result.fields["trace_id"] = trace_id;
+    }
+    if (Trim(path).empty()) {
+        result.ok = false;
+        result.exit_code = 20;
+        result.fields["error"] = "file_path or directory_path is required";
+        return result;
+    }
+    if (query_text.empty()) {
+        result.ok = false;
+        result.exit_code = 20;
+        result.fields["error"] = "query_text is required";
+        return result;
+    }
+
+    std::filesystem::path normalized;
+    std::string path_error;
+    if (!TryResolveAllowedPath(config, path, &normalized, &path_error)) {
+        result.ok = false;
+        result.exit_code = 21;
+        result.fields["error"] = path_error;
+        return result;
+    }
+
+    std::error_code status_ec;
+    const bool is_directory = std::filesystem::is_directory(normalized, status_ec);
+    status_ec.clear();
+    const bool is_regular = std::filesystem::is_regular_file(normalized, status_ec);
+    if (!is_directory && !is_regular) {
+        result.ok = false;
+        result.exit_code = 22;
+        result.fields["error"] = "path is not a regular file or directory";
+        result.fields["normalized_path"] = normalized.string();
+        return result;
+    }
+
+    const int bounded_max_matches = std::max(1, std::min(max_matches > 0 ? max_matches : 100, 500));
+    std::vector<std::filesystem::path> candidates;
+    if (is_regular) {
+        candidates.push_back(normalized);
+    } else if (recursive) {
+        std::filesystem::recursive_directory_iterator it(normalized, std::filesystem::directory_options::skip_permission_denied, status_ec);
+        const std::filesystem::recursive_directory_iterator end;
+        for (; it != end && !status_ec; it.increment(status_ec)) {
+            const std::filesystem::path current = it->path();
+            std::error_code entry_ec;
+            if (it->is_directory(entry_ec) && SearchTextShouldSkipDirectory(current)) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            entry_ec.clear();
+            if (it->is_regular_file(entry_ec) && IsSearchTextCandidatePath(current)) {
+                candidates.push_back(current);
+            }
+        }
+    } else {
+        std::filesystem::directory_iterator it(normalized, std::filesystem::directory_options::skip_permission_denied, status_ec);
+        const std::filesystem::directory_iterator end;
+        for (; it != end && !status_ec; it.increment(status_ec)) {
+            std::error_code entry_ec;
+            if (it->is_regular_file(entry_ec) && IsSearchTextCandidatePath(it->path())) {
+                candidates.push_back(it->path());
+            }
+        }
+    }
+
+    std::ostringstream content;
+    int match_count = 0;
+    int searched_file_count = 0;
+    for (const auto & candidate : candidates) {
+        if (match_count >= bounded_max_matches) {
+            break;
+        }
+        std::ifstream input(candidate.string());
+        if (!input.is_open()) {
+            continue;
+        }
+        ++searched_file_count;
+        std::string line;
+        int line_number = 0;
+        while (std::getline(input, line)) {
+            ++line_number;
+            if (line.find(query_text) == std::string::npos) {
+                continue;
+            }
+            content << candidate.string() << ":" << line_number;
+            if (show_preview) {
+                content << ":" << line;
+            }
+            content << "\n";
+            ++match_count;
+            if (match_count >= bounded_max_matches) {
+                break;
+            }
+        }
+    }
+
+    result.fields["normalized_path"] = normalized.string();
+    result.fields["path_type"] = is_directory ? "directory" : "file";
+    result.fields["candidate_file_count"] = std::to_string(candidates.size());
+    result.fields["searched_file_count"] = std::to_string(searched_file_count);
+    result.fields["match_count"] = std::to_string(match_count);
+    result.fields["max_matches"] = std::to_string(bounded_max_matches);
+    result.fields["truncated"] = match_count >= bounded_max_matches ? "true" : "false";
+    result.fields["status"] = "success";
+    result.fields["result"] = "search_text_complete";
+    result.fields["summary"] = "search_text match_count=" + std::to_string(match_count);
+    result.fields["analysis_allowed"] = "true";
+    result.fields["content_payload_format"] = "text";
+    result.fields["content_payload_scope"] = "search_results";
+    result.fields["content_payload_boundary_safe"] = "true";
+    result.fields["content_text"] = content.str();
+    result.fields["content_begin"] = "content_begin<<<";
+    result.fields["content_end"] = ">>>content_end";
+    result.fields["content_begin_marker"] = "content_begin<<<";
+    result.fields["content_end_marker"] = ">>>content_end";
     return result;
 }
 CommandResult LocateTextLinesResult(
@@ -2260,6 +2551,8 @@ CommandResult ReadTextFileResult(
             result_from_helper.fields["content"] = ExtractHelperContentBlock(
                 helper_result.fields.at("directory_access_helper_output"));
             result_from_helper.fields["content_text"] = result_from_helper.fields["content"];
+            result_from_helper.fields["content_begin"] = "content_begin<<<";
+            result_from_helper.fields["content_end"] = ">>>content_end";
             result_from_helper.fields["content_begin_marker"] = "content_begin<<<";
             result_from_helper.fields["content_end_marker"] = ">>>content_end";
             result_from_helper.fields["content_payload_format"] = StructuredPayloadFormatForPath(normalized);
@@ -2405,6 +2698,10 @@ CommandResult ReadTextFileResult(
                 : "file read is complete";
             result.fields["content"] = chunk;
             result.fields["content_text"] = chunk;
+            result.fields["content_begin"] = "content_begin<<<";
+            result.fields["content_end"] = ">>>content_end";
+            result.fields["content_begin_marker"] = "content_begin<<<";
+            result.fields["content_end_marker"] = ">>>content_end";
             result.fields["content_payload_format"] = StructuredPayloadFormatForPath(normalized);
             result.fields["content_payload_scope"] = has_more ? "file_body_chunk" : "file_body_only";
             result.fields["content_payload_boundary_safe"] = "true";
@@ -2537,6 +2834,10 @@ CommandResult ReadTextFileResult(
     result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
     result.fields["content"] = content.str();
     result.fields["content_text"] = result.fields["content"];
+    result.fields["content_begin"] = "content_begin<<<";
+    result.fields["content_end"] = ">>>content_end";
+    result.fields["content_begin_marker"] = "content_begin<<<";
+    result.fields["content_end_marker"] = ">>>content_end";
     result.fields["content_payload_format"] = StructuredPayloadFormatForPath(normalized);
     result.fields["content_payload_scope"] = "file_body_only";
     result.fields["content_payload_boundary_safe"] = "true";

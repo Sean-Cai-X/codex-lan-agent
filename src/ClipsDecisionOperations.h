@@ -191,14 +191,37 @@ std::string NormalizeClipsSlotValue(const char * name, const std::string & value
     return bounded_value;
 }
 
+// 映射链路 trace（thread_local，供观测面板读取）
+struct IntentMappingTrace {
+    std::string raw_input;
+    std::string sanitized;
+    std::string alias_resolved;
+    std::string cilin_resolved;
+    std::string final_tag;
+    std::string source; // "alias" | "cilin_ext" | "supplement" | "lexicon_fallback" | "unresolved"
+};
+thread_local inline IntentMappingTrace g_last_mapping_trace;
+
+const IntentMappingTrace & GetLastIntentMappingTrace() {
+    return g_last_mapping_trace;
+}
+
 std::string NormalizeMcpPrimaryIntentForClips(const std::string & primary_intent) {
+    g_last_mapping_trace = {};
+    g_last_mapping_trace.raw_input = primary_intent;
+
     // 1. 优先走 fact-factory 守卫层，命中标准 tag 直接落地
     const std::string factory_tag = ApplyFactFactoryNormalizePrimaryIntent(primary_intent);
     if (!factory_tag.empty()) {
+        g_last_mapping_trace.final_tag = factory_tag;
+        g_last_mapping_trace.source = "fact_factory";
         return factory_tag;
     }
     // 2. 回退旧的 SemanticIntentLexicon 词典
-    return codex_lan_agent::NormalizeIntentBySemanticLexicon(primary_intent);
+    std::string lexicon_tag = codex_lan_agent::NormalizeIntentBySemanticLexicon(primary_intent);
+    g_last_mapping_trace.final_tag = lexicon_tag;
+    g_last_mapping_trace.source = lexicon_tag.empty() ? "unresolved" : "lexicon_fallback";
+    return lexicon_tag;
 }
 
 std::string ClipsStringSlot(const char * name, const std::string & value) {
@@ -210,12 +233,15 @@ std::string ClipsBoolSlot(const char * name, bool value) {
 }
 
 std::string ResolveClipsRuleRoot(const AgentConfig & config) {
-    const std::vector<std::filesystem::path> candidates = {
+    std::vector<std::filesystem::path> candidates = {
         std::filesystem::path(config.config_dir) / "clips_rules",
-        std::filesystem::path(config.workspace_root) / "src" / "clips_rules",
-        std::filesystem::path(config.workspace_root) / "clips_rules",
-        std::filesystem::path(config.workspace_root) / "codex-lan-agent" / "src" / "clips_rules"
+        std::filesystem::path(config.config_dir) / "src" / "clips_rules"
     };
+    for (const std::filesystem::path & workspace_root : GetWorkspaceRoots(config)) {
+        candidates.push_back(workspace_root / "src" / "clips_rules");
+        candidates.push_back(workspace_root / "clips_rules");
+        candidates.push_back(workspace_root / "codex-lan-agent" / "src" / "clips_rules");
+    }
     for (const auto & candidate : candidates) {
         std::error_code ec;
         if (!candidate.empty() && std::filesystem::exists(candidate, ec) && !ec) {
@@ -278,6 +304,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot session_id (default ""))
               (slot turn_id (default ""))
               (slot reasoning_level (default ""))
+              (slot model_profile (default "small-llm"))
               (slot primary_intent (default ""))
               (slot preflight_status (default "missing"))
               (slot dedup_status (default ""))
@@ -327,6 +354,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot task_id (default ""))
               (slot session_id (default ""))
               (slot turn_id (default ""))
+              (slot model_profile (default "small-llm"))
               (slot direct_answer (default ""))
               (slot summary (default ""))
               (slot assistant_text (default ""))
@@ -387,6 +415,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot tool_name)
               (slot chain_phase (default "pre_call"))
               (slot request_type (default "generic_mcp_tool"))
+              (slot model_profile (default "small-llm"))
               (slot risk (default "medium"))
               (slot safety_class (default "controlled"))
               (slot execution_class (default "unknown"))
@@ -427,6 +456,7 @@ std::vector<std::string> GetEmbeddedClipsTemplateBlocks() {
               (slot next_action (default ""))
               (slot reason_code (default ""))
               (slot matched_rule (default ""))
+              (slot model_profile (default "small-llm"))
               (slot route_target (default ""))
               (slot route_arguments_json (default ""))))",
         R"((deftemplate cmm_project_state
@@ -479,7 +509,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (route_target ?expected)
                       (next_action "tool_call_only: a pending continuation already exists for this trace/goal; call its route_arguments_json exactly before any other tool")
                       (matched_rule "route-mismatched-pending-continuation")))))",
-            R"((defrule route-pending-continuation-same-tool-missing-context
+            R"((defrule route-pending-continuation-stale
               (declare (salience 95))
               (mcp_tool_request (tool_name ?tool)
                                 (trace_id ?trace)
@@ -496,10 +526,10 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (target ?tool)
                       (decision "route")
                       (verification "not_verified")
-                      (reason_code "pending_continuation_context_mismatch")
+                      (reason_code "continuation_stale")
                       (route_target ?expected)
                       (next_action "tool_call_only: this is the expected tool but the saved continuation context is missing or changed; call route_arguments_json exactly")
-                      (matched_rule "route-pending-continuation-same-tool-missing-context")))))",
+                      (matched_rule "route-pending-continuation-stale")))))",
             R"((defrule allow-single-file-patch-preview
                   (declare (salience 80))
                   (mcp_tool_request (tool_name "lan_agent_preview_patch")
@@ -633,8 +663,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (matched_rule "route-code-format-cleanup-to-clang-format")))))",
             R"((defrule route-file-text-operations-to-probe-first
                   (declare (salience 84))
-                  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_read_text_file")
-                                                          (eq ?tool "lan_agent_find_line_metadata")
+                  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_find_line_metadata")
                                                           (eq ?tool "lan_agent_find_content_matches")
                                                           (eq ?tool "lan_agent_locate_text_lines")
                                                           (eq ?tool "lan_agent_scan_text_ranges")
@@ -645,7 +674,6 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                                                           (eq ?tool "lan_agent_delete_text_range_window_atomic")
                                                           (eq ?tool "lan_agent_insert_after_anchor_atomic")
                                                           (eq ?tool "lan_agent_replace_line_range_atomic")
-                                                          (eq ?tool "lan_agent_write_text_file")
                                                           (eq ?tool "lan_agent_apply_single_file_patch")
                                                           (eq ?tool "lan_agent_apply_diff_patch")))
                                     (file_path ?file_path&:(neq ?file_path ""))
@@ -659,7 +687,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (verification "not_verified")
                       (reason_code "missing_probe_preflight")
                       (route_target "lan_agent_probe_text_file")
-                      (next_action "call lan_agent_probe_text_file first and continue only with the emitted next_call_json/probe_ref chain before any text read, scan, write, or patch step")
+                      (next_action "call lan_agent_probe_text_file first and continue only with the emitted next_call_json/probe_ref chain before any scan, edit, or patch step")
                       (matched_rule "route-file-text-operations-to-probe-first")))))",
             R"((defrule route-read-text-file-to-window-delete-for-comment-cleanup
                   (declare (salience 84))
@@ -1625,11 +1653,24 @@ std::string BuildMcpToolChainFact(
     const std::string execution_capability = result == nullptr
         ? (ResolveMcpChainRequestType(tool_name) == "analysis_review" ? "false" : "")
         : GetFieldOrDefault(*result, "execution_capability", "");
+    // ── Phase1-4: 断言链层面注入 model_profile（链式/结果/请求三处保持一致）──
+    const std::string chain_profile = [&]() -> std::string {
+        if (params != nullptr) {
+            const std::string from_params = params->GetString("model_profile");
+            if (!from_params.empty()) { return ResolveModelProfileByName(from_params).name; }
+        }
+        if (result != nullptr) {
+            const std::string from_result = GetFieldOrDefault(*result, "request_model_profile", "");
+            if (!from_result.empty()) { return from_result; }
+        }
+        return "small-llm";
+    }();
     return "(mcp_tool_chain "
         + ClipsStringSlot("chain_template_id", "mcp_tool_chain_v1") + " "
         + ClipsStringSlot("tool_name", tool_name) + " "
         + ClipsStringSlot("chain_phase", phase) + " "
         + ClipsStringSlot("request_type", ResolveMcpChainRequestType(tool_name)) + " "
+        + ClipsStringSlot("model_profile", chain_profile) + " "
         + ClipsStringSlot("risk", ResolveMcpChainRisk(tool_name)) + " "
         + ClipsStringSlot("safety_class", ResolveMcpChainSafetyClass(tool_name)) + " "
         + ClipsStringSlot("execution_class", ResolveMcpChainExecutionClass(tool_name)) + " "
@@ -1752,13 +1793,6 @@ McpPendingContinuationFields LoadMcpPendingContinuationForParams(
     if (LoadMcpPendingContinuationByKey(config, goal_id, &pending)) {
         return pending;
     }
-    const std::string path_key = BuildMcpPendingContinuationPathKey(FirstNonEmpty(
-        params.GetString("file_path"),
-        params.GetString("source_file"),
-        params.GetString("directory_path"),
-        params.GetString("normalized_path"),
-        ""));
-    LoadMcpPendingContinuationByKey(config, path_key, &pending);
     return pending;
 }
 
@@ -1816,25 +1850,6 @@ void PersistMcpPendingContinuation(
     if (!goal_id.empty() && goal_id != trace_id) {
         WriteMcpPendingContinuationByKey(config, goal_id, result, source_tool, continuation_active);
     }
-    const std::string required_arguments_json =
-        GetFieldOrDefault(result, "required_tool_arguments_json", "");
-    const std::vector<std::string> path_values = {
-        GetFieldOrDefault(result, "file_path", ""),
-        GetFieldOrDefault(result, "source_file", ""),
-        GetFieldOrDefault(result, "directory_path", ""),
-        GetFieldOrDefault(result, "normalized_path", ""),
-        GetFieldOrDefault(result, "next_file_path", ""),
-        GetFieldOrDefault(result, "next_batch_file_path", ""),
-        ExtractJsonString(required_arguments_json, "file_path"),
-        ExtractJsonString(required_arguments_json, "source_file"),
-        ExtractJsonString(required_arguments_json, "directory_path")
-    };
-    for (const std::string & path_value : path_values) {
-        const std::string path_key = BuildMcpPendingContinuationPathKey(path_value);
-        if (!path_key.empty()) {
-            WriteMcpPendingContinuationByKey(config, path_key, result, source_tool, continuation_active);
-        }
-    }
 }
 
 std::string BuildMcpToolRequestFact(
@@ -1862,8 +1877,7 @@ std::string BuildMcpToolRequestFact(
     const bool explicit_user_intent =
         !Trim(reason).empty() || !Trim(params.GetString("repair_candidate_id")).empty() || normalized_primary_intent == "refactor_file";
     const bool probe_required =
-        tool_name == "lan_agent_read_text_file"
-        || tool_name == "lan_agent_find_line_metadata"
+        tool_name == "lan_agent_find_line_metadata"
         || tool_name == "lan_agent_find_content_matches"
         || tool_name == "lan_agent_locate_text_lines"
         || tool_name == "lan_agent_scan_text_ranges"
@@ -1874,7 +1888,6 @@ std::string BuildMcpToolRequestFact(
         || tool_name == "lan_agent_delete_text_range_window_atomic"
         || tool_name == "lan_agent_insert_after_anchor_atomic"
         || tool_name == "lan_agent_replace_line_range_atomic"
-        || tool_name == "lan_agent_write_text_file"
         || tool_name == "lan_agent_apply_single_file_patch"
         || tool_name == "lan_agent_apply_diff_patch";
     const bool probe_ready = !Trim(probe_ref).empty() || params.GetBool("probe_ready", false) || recent_probe_ready;
@@ -1946,6 +1959,11 @@ std::string BuildMcpToolRequestFact(
         pending.source_tool = params.GetString("pending_source_tool");
         pending.hash = params.GetString("pending_hash");
     }
+    // ── Phase1-4: 请求Fact注入 model_profile ──
+    const std::string request_profile = [&]() -> std::string {
+        const std::string raw = params.GetString("model_profile");
+        return raw.empty() ? std::string("small-llm") : ResolveModelProfileByName(raw).name;
+    }();
     return "(mcp_tool_request "
         + ClipsStringSlot("tool_name", tool_name) + " "
         + ClipsStringSlot("task_id", params.GetString("task_id")) + " "
@@ -1957,6 +1975,7 @@ std::string BuildMcpToolRequestFact(
         + ClipsStringSlot("session_id", params.GetString("session_id")) + " "
         + ClipsStringSlot("turn_id", params.GetString("turn_id")) + " "
         + ClipsStringSlot("reasoning_level", params.GetString("reasoning_level")) + " "
+        + ClipsStringSlot("model_profile", request_profile) + " "
         + ClipsStringSlot("primary_intent", normalized_primary_intent) + " "
         + ClipsStringSlot("preflight_status", preflight_status) + " "
         + ClipsStringSlot("dedup_status", params.GetString("dedup_status")) + " "
@@ -2086,6 +2105,10 @@ std::string BuildCxparserFact(
 std::string BuildMcpToolResultFact(
     const std::string & tool_name,
     const CommandResult & result) {
+    // ── Phase1-4: 结果Fact注入 model_profile，优先从路由写入的 result 字段取 ──
+    const std::string result_profile = FirstNonEmpty(
+        GetFieldOrDefault(result, "request_model_profile", ""),
+        std::string("small-llm"));
     return "(mcp_tool_result "
         + ClipsStringSlot("tool_name", tool_name) + " "
         + ClipsStringSlot("request_id", GetFieldOrDefault(result, "request_id", "")) + " "
@@ -2096,6 +2119,7 @@ std::string BuildMcpToolResultFact(
         + ClipsStringSlot("task_id", GetFieldOrDefault(result, "task_id", "")) + " "
         + ClipsStringSlot("session_id", GetFieldOrDefault(result, "session_id", "")) + " "
         + ClipsStringSlot("turn_id", GetFieldOrDefault(result, "turn_id", "")) + " "
+        + ClipsStringSlot("model_profile", result_profile) + " "
         + ClipsStringSlot("direct_answer", GetFieldOrDefault(result, "direct_answer", "")) + " "
         + ClipsStringSlot("summary", GetFieldOrDefault(result, "summary", "")) + " "
         + ClipsStringSlot("assistant_text", GetFieldOrDefault(result, "assistant_text", "")) + " "
@@ -2338,7 +2362,7 @@ ClipsDecision EvaluateClipsDecision(
         if (params != nullptr
             && (IsClipsContinuationArgumentsRef(decision.route_arguments_json)
                 || ((decision.reason_code == "pending_continuation_mismatch"
-                        || decision.reason_code == "pending_continuation_context_mismatch")
+                        || decision.reason_code == "continuation_stale")
                     && decision.route_arguments_json.empty()))) {
             McpPendingContinuationFields pending =
                 LoadMcpPendingContinuationForParams(config, *params);
@@ -2868,13 +2892,103 @@ std::string BuildPreGuardRouteCallJson(
     if (route_target == "lan_agent_list_directory") {
         arguments_json = "{";
         first_field = true;
-        AppendJsonStringField(&arguments_json, &first_field, "directory_path", file_path);
+        const std::string dir_path = FirstNonEmpty(file_path, params.GetString("directory_path"));
+        AppendJsonStringField(&arguments_json, &first_field, "directory_path", dir_path);
         if (!first_field) {
             arguments_json += ",";
         }
         arguments_json += "\"max_entries\":200";
         first_field = false;
         AppendJsonStringField(&arguments_json, &first_field, "primary_intent", primary_intent);
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+    }
+
+    if (route_target == "lan_agent_search_text") {
+        arguments_json = "{";
+        first_field = true;
+        const std::string search_path = FirstNonEmpty(
+            params.GetString("directory_path"),
+            file_path);
+        AppendJsonStringField(&arguments_json, &first_field, "directory_path", search_path);
+        AppendJsonStringField(&arguments_json, &first_field, "file_path", file_path);
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "query_text",
+            FirstNonEmpty(
+                params.GetString("query_text"),
+                params.GetString("text"),
+                params.GetString("anchor_text")));
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+        AppendJsonBoolField(&arguments_json, &first_field, "recursive", params.GetBool("recursive", true), true);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += std::string(1, '"') + "max_matches" + std::string(1, '"') + ":"
+            + std::to_string(std::max(1, params.GetInt("max_matches", 100)));
+        first_field = false;
+    }
+
+    if (route_target == "lan_agent_write_text_file"
+        || route_target == "lan_agent_append_text_file") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(&arguments_json, &first_field, "file_path", file_path);
+        AppendJsonStringField(&arguments_json, &first_field, "content", params.GetString("content"));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "content_base64",
+            params.GetString("content_base64"));
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "append",
+            params.GetBool("append", false),
+            true);
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+    }
+
+    if (route_target == "lan_agent_optfile_read") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "target_name",
+            params.GetString("target_name"));
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"max_bytes\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_bytes", 65536)));
+        first_field = false;
+    }
+
+    if (route_target == "lan_agent_optfile_write_preview"
+        || route_target == "lan_agent_optfile_apply_write") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "target_name",
+            params.GetString("target_name"));
+        AppendJsonStringField(&arguments_json, &first_field, "data", params.GetString("data"));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "data_base64",
+            params.GetString("data_base64"));
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "append",
+            params.GetBool("append", false),
+            true);
         AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
         AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
     }
@@ -2886,7 +3000,18 @@ std::string BuildPreGuardRouteCallJson(
         if (!first_field) {
             arguments_json += ",";
         }
-        arguments_json += "\"dry_run\":true";
+        // 尊重 LLM 传入的 dry_run 值，默认 true（先预览）
+        // dry_run 可能在顶层或 arguments 子对象中
+        bool dry_run_param = params.GetBool("dry_run", true);
+        if (dry_run_param) {
+            // 检查 arguments 子对象中的 dry_run
+            const std::string args_json = params.GetRawJson("arguments", "");
+            if (!args_json.empty()) {
+                JsonRequestView args_view(args_json);
+                dry_run_param = args_view.GetBool("dry_run", true);
+            }
+        }
+        arguments_json += dry_run_param ? "\"dry_run\":true" : "\"dry_run\":false";
         first_field = false;
     }
 
@@ -3391,12 +3516,15 @@ void ApplyClipsResultGuard(
 
 // ================================
 // FactFactory 守卫层钩子实现
-//  说明: 钩子独立实现，只依赖 ByteSanitizer 和 BusinessTagRegistry （header-only，无外部 lib）
-//  CppJieba / marisa-trie 属于增强层，通过宏 CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE 控制开关
+//  说明: 钩子独立实现，依赖 ByteSanitizer + BusinessTagRegistry + SemanticNormalizer（均 header-only，无外部 lib）
+//  增强轻量路径(#else)已支持 cilin_ext.txt + business_supplement.txt 同义归一
+//  CppJieba / marisa-trie 属于完整管线增强层，通过宏 CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE 控制
 // ================================
 
 #include "fact_factory/ByteSanitizer.h"
 #include "fact_factory/BusinessTagRegistry.h"
+#include "fact_factory/SemanticNormalizer.h"
+#include <memory>
 
 // 完整4层管线：当前默认关闭（ClipsDecisionOperations.h 中 extern "C" 会污染 CppJieba include）
 // 启用方式：使用独立编译单元 FactFactoryIntegration.cpp 并定义 CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE
@@ -3434,14 +3562,19 @@ inline std::string ApplyFactFactoryNormalizePrimaryIntent(const std::string & ra
     }
     return {};
 #else
-    // 轻量 fast-path：只做字节过滤 + 别名映射 + 大小写折叠
+    // 增强轻量路径：字节过滤 + 别名映射 + 大小写折叠 + cilin_ext 同义归一
+    // 不依赖 CppJieba/marisa-trie，仅用 header-only 的 SemanticNormalizer 加载外部词表
     fact_factory::ByteSanitizerConfig sc;
     sc.max_field_bytes = 128;
     auto sr = fact_factory::SanitizeSlotValue(raw_intent, sc);
     const std::string & clean = sr.sanitized;
     if (clean.empty()) return {};
+
+    // fast-path 1: 直接别名映射
     std::string resolved = fact_factory::ResolveBusinessTag(clean);
     if (!resolved.empty()) return resolved;
+
+    // fast-path 2: 大小写折叠后重试
     std::string lower;
     lower.reserve(clean.size());
     for (unsigned char c : clean) {
@@ -3451,6 +3584,36 @@ inline std::string ApplyFactFactoryNormalizePrimaryIntent(const std::string & ra
         resolved = fact_factory::ResolveBusinessTag(lower);
         if (!resolved.empty()) return resolved;
     }
+
+    // layer 3: cilin_ext + business_supplement 同义归一
+    struct NormalizerHolder {
+        std::unique_ptr<fact_factory::SemanticNormalizer> normalizer;
+        fact_factory::SemanticNormalizer * ensure() {
+            if (normalizer) return normalizer.get();
+            fact_factory::SemanticNormalizerConfig nc;
+            // 词表路径：相对于源码目录的固定位置
+            nc.cilin_ext_path = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/fact_factory/resources/cilin_ext.txt";
+            nc.supplement_path = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/fact_factory/resources/business_supplement.txt";
+            normalizer = std::make_unique<fact_factory::SemanticNormalizer>(nc);
+            return normalizer.get();
+        }
+    };
+    static NormalizerHolder nh;
+    auto * norm = nh.ensure();
+    if (norm != nullptr) {
+        auto tags = norm->ResolveSingle(clean);
+        if (!tags.empty()) {
+            return tags.front();
+        }
+        // 大小写折叠后再试
+        if (lower != clean) {
+            tags = norm->ResolveSingle(lower);
+            if (!tags.empty()) {
+                return tags.front();
+            }
+        }
+    }
+
     return {};
 #endif
 }

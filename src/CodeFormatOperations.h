@@ -150,6 +150,69 @@ inline std::string QuoteProcessArgument(const std::string & value) {
 #endif
 }
 
+inline bool WriteTargetFile(
+    const AgentConfig & config,
+    const std::filesystem::path & target_path,
+    const std::filesystem::path & payload_path,
+    const std::string & direct_content,
+    std::string * backend,
+    std::string * log_path,
+    std::string * error) {
+    if (config.optfile_write_enabled) {
+        const std::filesystem::path helper_path =
+            std::filesystem::path(config.config_dir) / "optfile.exe";
+        if (!std::filesystem::is_regular_file(helper_path)) {
+            if (error) {
+                *error = "optfile helper not found for code format apply";
+            }
+            return false;
+        }
+        const std::string helper_log =
+            CommOperations::BuildLogPath(config, "code_format_optfile_write");
+        const std::string command =
+            QuoteProcessArgument(helper_path.string())
+            + " --target-dir " + QuoteProcessArgument(target_path.parent_path().string())
+            + " --test-file " + QuoteProcessArgument(target_path.filename().string())
+            + " --content-file " + QuoteProcessArgument(payload_path.string());
+        ProcessRunResult run_result;
+        std::string run_error;
+        if (!RunCommandWithLog(
+                command,
+                std::string(),
+                helper_log,
+                120,
+                60,
+                &run_result,
+                &run_error)
+            || run_result.exit_code != 0) {
+            if (error) {
+                *error = run_error.empty() ? "optfile code format write failed" : run_error;
+            }
+            if (log_path) {
+                *log_path = helper_log;
+            }
+            return false;
+        }
+        if (backend) {
+            *backend = "optfile";
+        }
+        if (log_path) {
+            *log_path = helper_log;
+        }
+        return true;
+    }
+    if (!config.direct_file_write_enabled) {
+        if (error) {
+            *error = "both target-file write gates are disabled";
+        }
+        return false;
+    }
+    if (backend) {
+        *backend = "direct";
+    }
+    return WriteFile(target_path, direct_content, error);
+}
+
 inline bool LooksLikeClangFormatExecutable(const std::filesystem::path & path) {
     const std::string filename = ToLowerAsciiLocal(path.filename().string());
 #ifdef _WIN32
@@ -510,13 +573,28 @@ inline CommandResult BuildFormatCodeFileResult(
         return result;
     }
 
-    if (!WriteFile(normalized_source, formatted_content, &io_error)) {
+    std::string write_backend;
+    std::string write_backend_log;
+    if (!WriteTargetFile(
+            config,
+            normalized_source,
+            formatted_path,
+            formatted_content,
+            &write_backend,
+            &write_backend_log,
+            &io_error)) {
         result.ok = false;
         result.exit_code = 38;
         result.fields["error"] = io_error;
         result.fields["semantic_outcome"] = "source_write_failed";
+        result.fields["write_backend"] = write_backend;
+        result.fields["write_backend_log_path"] = write_backend_log;
         return result;
     }
+    result.fields["write_backend"] = write_backend;
+    result.fields["write_backend_log_path"] = write_backend_log;
+    result.fields["final_write_tool"] =
+        write_backend == "optfile" ? "optfile.exe" : "direct_file_write";
 
     std::string final_content;
     if (!ReadFile(normalized_source, &final_content, &io_error)) {

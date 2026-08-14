@@ -138,6 +138,14 @@ CommandResult ApplyDiffPatchResult(
     const std::string & resolved_file_path,
     const std::string & target_resolution_reason,
     bool allow_empty_content);
+CommandResult RevertSingleFilePatchResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & backup_path,
+    const std::string & request_id,
+    const std::string & trace_id,
+    const std::string & patch_id,
+    const std::string & reason);
 CommandResult EnsureDirectoryResult(
     const AgentConfig & config,
     const std::string & directory_path,
@@ -192,6 +200,29 @@ CommandResult FindContentMatchesResult(
     const std::string & anchor_text,
     bool show_preview,
     int fuzzy_threshold);
+CommandResult SearchTextResult(
+    const AgentConfig & config,
+    const std::string & path,
+    const std::string & query_text,
+    bool recursive,
+    bool show_preview,
+    int max_matches,
+    const std::string & trace_id);
+CommandResult OptFileReadResult(
+    const AgentConfig & config,
+    const std::string & target_name,
+    int max_bytes);
+CommandResult OptFileWritePreviewResult(
+    const AgentConfig & config,
+    const std::string & target_name,
+    const std::string & data,
+    bool append);
+CommandResult OptFileApplyWriteResult(
+    const AgentConfig & config,
+    const std::string & target_name,
+    const std::string & data,
+    bool append);
+
 CommandResult LocateTextLinesResult(
     const AgentConfig & config,
     const std::string & file_path,
@@ -523,6 +554,29 @@ std::string InferMcpRoutePrimaryIntent(
     return normalized;
 }
 
+std::string ExtractSearchQueryTextFromRequest(const std::string & request_text) {
+    std::string text = Trim(request_text);
+    const std::string lowered = ToLowerAscii(text);
+    const std::vector<std::string> prefixes = {
+        "search for ",
+        "search text ",
+        "find text ",
+        "grep for ",
+        "look for "
+    };
+    for (const std::string & prefix : prefixes) {
+        const std::size_t pos = lowered.find(prefix);
+        if (pos != std::string::npos) {
+            text = Trim(text.substr(pos + prefix.size()));
+            break;
+        }
+    }
+    while (text.size() >= 2 && ((text.front() == '"' && text.back() == '"') || (text.front() == '\'' && text.back() == '\''))) {
+        text = Trim(text.substr(1, text.size() - 2));
+    }
+    return text;
+}
+
 bool McpRouteRequestMentionsDirectoryListing(const std::string & request_text) {
     const std::string lowered = ToLowerAscii(request_text);
     return lowered.find("list") != std::string::npos
@@ -534,6 +588,20 @@ bool McpRouteRequestMentionsDirectoryListing(const std::string & request_text) {
         || request_text.find("文件夹") != std::string::npos
         || request_text.find("所有文件") != std::string::npos;
 }
+
+bool IsMcpGatewayReadOnlyTool(const std::string & tool_name) {
+    return tool_name == "lan_agent_probe_text_file"
+        || tool_name == "lan_agent_read_text_file"
+        || tool_name == "lan_agent_list_directory"
+        || tool_name == "lan_agent_read_directory_files"
+        || tool_name == "lan_agent_find_line_metadata"
+        || tool_name == "lan_agent_find_content_matches"
+        || tool_name == "lan_agent_locate_text_lines"
+        || tool_name == "lan_agent_search_text"
+        || tool_name == "lan_agent_scan_text_ranges"
+        || tool_name == "lan_agent_prepare_edit_windows";
+}
+
 
 bool McpRoutePathIsDirectory(const std::string & file_path) {
     if (Trim(file_path).empty()) {
@@ -855,44 +923,231 @@ CommandResult BuildMcpGuardRegressionAcceptanceResult(
 
 std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     const std::string request_text = params.GetString("request_text");
-    const std::string file_path = FirstNonEmpty(
+    const std::string explicit_file_path = FirstNonEmpty(
         params.GetString("file_path"),
         params.GetString("source_file"),
-        ExtractMcpRouteWindowsPathFromText(request_text),
+        "");
+    const std::string directory_path = params.GetString("directory_path");
+    const std::string file_path = FirstNonEmpty(
+        explicit_file_path,
+        directory_path.empty() ? ExtractMcpRouteWindowsPathFromText(request_text) : std::string(),
         "");
     const std::string primary_intent =
         InferMcpRoutePrimaryIntent(params.GetString("primary_intent"), request_text);
     std::string json = "{";
     bool first = true;
     AppendJsonStringField(&json, &first, "decision_domain", params.GetString("decision_domain", "mcp_tool_guard"));
+    AppendJsonStringField(&json, &first, "model_profile", params.GetString("model_profile"));
     AppendJsonStringField(&json, &first, "tool_name", params.GetString("tool_name", "lan_agent_clips_decide"));
     AppendJsonStringField(&json, &first, "request_text", request_text);
     AppendJsonStringField(&json, &first, "file_path", file_path);
     AppendJsonStringField(&json, &first, "source_file", file_path);
+    AppendJsonStringField(&json, &first, "directory_path", directory_path);
     AppendJsonStringField(&json, &first, "primary_intent", primary_intent);
+    AppendJsonStringField(
+        &json,
+        &first,
+        "query_text",
+        FirstNonEmpty(
+            params.GetString("query_text"),
+            params.GetString("text"),
+            params.GetString("anchor_text"),
+            ExtractSearchQueryTextFromRequest(request_text)));
+    AppendJsonStringField(&json, &first, "content", params.GetString("content"));
+    AppendJsonStringField(&json, &first, "content_base64", params.GetString("content_base64"));
+    AppendJsonStringField(&json, &first, "target_name", params.GetString("target_name"));
+    AppendJsonStringField(&json, &first, "data", params.GetString("data"));
+    AppendJsonStringField(&json, &first, "data_base64", params.GetString("data_base64"));
+    AppendJsonStringField(&json, &first, "anchor_text", params.GetString("anchor_text"));
     AppendJsonStringField(&json, &first, "scan_mode", params.GetString("scan_mode", primary_intent == "comment_cleanup" ? "comments" : ""));
+
     AppendJsonStringField(&json, &first, "trace_id", params.GetString("trace_id"));
     AppendJsonStringField(&json, &first, "request_id", params.GetString("request_id"));
     AppendJsonStringField(&json, &first, "probe_ref", params.GetString("probe_ref"));
     AppendJsonBoolField(&json, &first, "probe_ready", params.GetBool("probe_ready", false), params.GetBool("probe_ready", false));
+    AppendJsonBoolField(&json, &first, "append", params.GetBool("append", false), true);
+    AppendJsonBoolField(&json, &first, "recursive", params.GetBool("recursive", true), true);
+    AppendJsonBoolField(&json, &first, "show_preview", params.GetBool("show_preview", false), true);
+    const auto append_int_param = [&](const std::string & key, int default_value, int minimum_value) {
+        if (params.GetRawJson(key).empty()) {
+            return;
+        }
+        if (!first) {
+            json += ",";
+        }
+        json += "\"" + codex_lan_agent::JsonEscape(key) + "\":"
+            + std::to_string(std::max(minimum_value, params.GetInt(key, default_value)));
+        first = false;
+    };
+    append_int_param("start_line", 1, 1);
+    append_int_param("end_line", 1, 1);
+    append_int_param("max_lines", 200, 1);
+    append_int_param("max_matches", 100, 1);
+    append_int_param("max_bytes", 65536, 1);
+    // 透传 dry_run（可能在顶层或 arguments 子对象中）
+    bool dry_run_val = params.GetBool("dry_run", true);
+    if (dry_run_val) {
+        const std::string args_json = params.GetRawJson("arguments", "");
+        if (!args_json.empty()) {
+            JsonRequestView args_view(args_json);
+            dry_run_val = args_view.GetBool("dry_run", true);
+        }
+    }
+    AppendJsonBoolField(&json, &first, "dry_run", dry_run_val, true);
     json += "}";
     return json;
+}
+
+// ── 方案B: route 三级匹配 —— 同义词 + 参数模式推断 ──
+std::string ResolveRouteBySynonymAndPattern(
+    const std::string & primary_intent,
+    const JsonRequestView & params) {
+    static const std::unordered_map<std::string, std::string> synonym_map = {
+        {"read_file", "lan_agent_read_text_file"},
+        {"read", "lan_agent_read_text_file"},
+        {"file_read", "lan_agent_read_text_file"},
+        {"search_text", "lan_agent_search_text"},
+        {"search", "lan_agent_search_text"},
+        {"grep", "lan_agent_search_text"},
+        {"find_text", "lan_agent_search_text"},
+        {"text_search", "lan_agent_search_text"},
+        {"write_file", "lan_agent_write_text_file"},
+        {"write", "lan_agent_write_text_file"},
+        {"file_write", "lan_agent_write_text_file"},
+        {"save_file", "lan_agent_write_text_file"},
+        {"create_file", "lan_agent_write_text_file"},
+        {"append_text", "lan_agent_append_text_file"},
+        {"append", "lan_agent_append_text_file"},
+        {"append_file", "lan_agent_append_text_file"},
+        {"list_directory", "lan_agent_list_directory"},
+        {"list_dir", "lan_agent_list_directory"},
+        {"ls", "lan_agent_list_directory"},
+        {"dir", "lan_agent_list_directory"},
+        {"probe_file", "lan_agent_probe_text_file"},
+        {"probe", "lan_agent_probe_text_file"},
+        {"file_probe", "lan_agent_probe_text_file"},
+        {"replace_lines", "lan_agent_replace_line_range_atomic"},
+        {"replace", "lan_agent_replace_line_range_atomic"},
+        {"replace_text", "lan_agent_replace_line_range_atomic"},
+        {"delete_lines", "lan_agent_delete_text_range_window_atomic"},
+        {"delete", "lan_agent_delete_text_range_window_atomic"},
+        {"delete_text", "lan_agent_delete_text_range_window_atomic"},
+        {"insert", "lan_agent_insert_after_anchor_atomic"},
+        {"insert_after_anchor", "lan_agent_insert_after_anchor_atomic"},
+        {"insert_text", "lan_agent_insert_after_anchor_atomic"},
+        {"code_format", "lan_agent_format_code_file"},
+        {"format", "lan_agent_format_code_file"},
+        {"format_code", "lan_agent_format_code_file"},
+        {"optfile_read", "lan_agent_optfile_read"},
+        {"read_optfile", "lan_agent_optfile_read"},
+        {"optfile_write_preview", "lan_agent_optfile_write_preview"},
+        {"preview_optfile_write", "lan_agent_optfile_write_preview"},
+        {"optfile_apply_write", "lan_agent_optfile_apply_write"},
+        {"optfile_write", "lan_agent_optfile_apply_write"},
+        {"write_optfile", "lan_agent_optfile_apply_write"},
+        {"run_flow", "lan_agent_run_cxparser_flow"},
+        {"run_script", "lan_agent_run_cxparser_flow"},
+        {"execute_flow", "lan_agent_run_cxparser_flow"},
+    };
+    const std::string intent_lower = ToLowerAscii(Trim(primary_intent));
+    {
+        auto it = synonym_map.find(intent_lower);
+        if (it != synonym_map.end()) {
+            return it->second;
+        }
+    }
+    // 参数模式推断
+    const bool has_file_path = !Trim(params.GetString("file_path")).empty();
+    const bool has_content = !Trim(params.GetString("content")).empty();
+    const bool has_content_base64 = !Trim(params.GetString("content_base64")).empty();
+    const bool has_directory = !Trim(params.GetString("directory_path")).empty();
+    const bool has_query = !Trim(FirstNonEmpty(
+        params.GetString("query_text"),
+        params.GetString("text"),
+        params.GetString("anchor_text"))).empty();
+    const bool has_start_line = !Trim(params.GetString("start_line")).empty();
+    const bool has_end_line = !Trim(params.GetString("end_line")).empty();
+    const bool has_anchor = !Trim(params.GetString("anchor_text")).empty();
+    if (has_directory && has_query) return "lan_agent_search_text";
+    if (has_directory) return "lan_agent_list_directory";
+    if (has_file_path && has_anchor) return "lan_agent_insert_after_anchor_atomic";
+    if (has_file_path && has_start_line && has_end_line) return "lan_agent_replace_line_range_atomic";
+    if (has_file_path && (has_content || has_content_base64)) return "lan_agent_write_text_file";
+    if (has_file_path && has_start_line) return "lan_agent_read_text_file";
+    if (has_file_path) return "lan_agent_probe_text_file";
+    return "";
+}
+
+// ── 方案B: route 候选工具列表（route 未命中时返回给 LLM）──
+std::string BuildCandidateToolsJson(const std::string & primary_intent) {
+    static const std::vector<std::pair<std::string, std::string>> catalog = {
+        {"lan_agent_probe_text_file", "read_file, probe, file_probe"},
+        {"lan_agent_read_text_file", "read_file, read, file_read, get_file, view_file, cat"},
+        {"lan_agent_search_text", "search_text, search, grep, find_text, text_search"},
+        {"lan_agent_list_directory", "list_directory, list_dir, ls, dir"},
+        {"lan_agent_write_text_file", "write_file, write, file_write, save_file, create_file"},
+        {"lan_agent_append_text_file", "append_text, append, append_file"},
+        {"lan_agent_insert_after_anchor_atomic", "insert, insert_after_anchor, insert_text"},
+        {"lan_agent_replace_line_range_atomic", "replace_lines, replace, replace_text"},
+        {"lan_agent_delete_text_range_window_atomic", "delete_lines, delete, delete_text"},
+        {"lan_agent_format_code_file", "code_format, format, format_code"},
+        {"lan_agent_optfile_read", "optfile_read, read_optfile"},
+        {"lan_agent_optfile_write_preview", "optfile_write_preview, preview_optfile_write"},
+        {"lan_agent_optfile_apply_write", "optfile_apply_write, optfile_write, write_optfile"},
+        {"lan_agent_run_cxparser_flow", "run_flow, run_script, execute_flow"},
+    };
+    std::ostringstream json;
+    json << "[";
+    bool first = true;
+    for (const auto & entry : catalog) {
+        if (!first) { json << ","; }
+        json << "{\"name\":\"" << entry.first << "\",\"aliases\":\"" << entry.second << "\"}";
+        first = false;
+    }
+    json << "]";
+    return json.str();
 }
 
 const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegistry() {
     static const std::unordered_map<std::string, McpToolHandler> handlers = {
         {"lan_agent_mcp_route", [](const AgentConfig & config, const JsonRequestView & params) {
+            // ── Phase1-3: 入口首先解析 Model-Profile（必须所有模式分支都共享）──
+            const std::string explicit_profile_name = params.GetString("model_profile");
+            const bool has_explicit_profile = !Trim(explicit_profile_name).empty();
+            const std::string raw_profile_name = explicit_profile_name;
+            const std::string profile_source = has_explicit_profile
+                ? std::string("explicit")
+                : std::string("default_small_chain");
+            const ModelProfileConfig profile = ResolveModelProfileByName(raw_profile_name);
+            const bool profile_valid = profile.IsValid();
+            auto InjectProfileMeta = [&profile, &profile_valid, &profile_source](CommandResult & r) {
+                r.fields["request_model_profile"] = profile.name;
+                r.fields["request_model_profile_valid"] = profile_valid ? "true" : "false";
+                r.fields["request_model_profile_source"] = profile_source;
+                r.fields["profile_allow_direct_call_mode"] = profile.allow_direct_call_mode ? "true" : "false";
+                r.fields["profile_route_aggressiveness"] = RouteAggressivenessToString(profile.route_aggressiveness);
+                r.fields["profile_gate_strictness_level"] = GateStrictnessToString(profile.gate_strictness);
+                r.fields["profile_semantic_bundle_max_chars"] = std::to_string(profile.semantic_bundle_max_chars);
+                r.fields["profile_semantic_bundle_max_nodes"] = std::to_string(profile.semantic_bundle_max_nodes);
+                r.fields["profile_max_concurrent_tools_per_turn"] = std::to_string(profile.max_concurrent_tools_per_turn);
+                r.fields["profile_snapshot_merge_every_n_steps"] = std::to_string(profile.snapshot_merge_every_n_steps);
+                r.fields["profile_lenient_json_parsing"] = profile.lenient_json_parsing ? "true" : "false";
+                r.fields["profile_max_repeated_verification_calls"] = std::to_string(profile.max_repeated_verification_calls);
+            };
+
             const std::string requested_mode = ToLowerAscii(params.GetString("mode"));
             const bool has_routable_request =
                 !Trim(params.GetString("request_text")).empty()
                 || !Trim(params.GetString("primary_intent")).empty()
                 || !Trim(params.GetString("file_path")).empty()
-                || !Trim(params.GetString("source_file")).empty();
+                || !Trim(params.GetString("source_file")).empty()
+                || !Trim(params.GetString("directory_path")).empty();
             const std::string mode = requested_mode.empty()
                 ? (has_routable_request ? std::string("route") : std::string("overview"))
                 : requested_mode;
             if (mode.empty() || mode == "overview" || mode == "guide" || mode == "guidance") {
                 CommandResult result = BuildMcpOverviewResult(config);
+                InjectProfileMeta(result);
                 result.fields["mcp_route_mode"] = "overview";
                 result.fields["tool_use_decision"] = "guidance_only";
                 result.fields["current_tool_chain_node"] = "overview";
@@ -910,6 +1165,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 const std::string route_params_json = BuildMcpRouteDecisionParamsJson(params);
                 JsonRequestView route_params(route_params_json);
                 CommandResult result = BuildClipsDecisionResult(config, route_params);
+                InjectProfileMeta(result);
                 result.fields["mcp_route_mode"] = "route";
                 result.fields["tool_surface_policy"] = "chat_layer_single_gateway";
                 result.fields["visible_tool_name"] = "lan_agent_mcp_route";
@@ -917,15 +1173,34 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["current_tool_chain_node"] = "route_decision";
                 const std::string inferred_intent =
                     NormalizeMcpPrimaryIntentForClips(route_params.GetString("primary_intent"));
-                const std::string routed_file_path = route_params.GetString("file_path");
+                const std::string raw_intent = route_params.GetString("primary_intent");
+                // 注入映射 trace 到结果，供观测面板可视化
+                {
+                    const auto & trace = GetLastIntentMappingTrace();
+                    result.fields["intent_mapping_raw"] = trace.raw_input;
+                    result.fields["intent_mapping_final"] = trace.final_tag;
+                    result.fields["intent_mapping_source"] = trace.source;
+                }
+                const std::string routed_file_path = FirstNonEmpty(
+                    route_params.GetString("file_path"),
+                    route_params.GetString("directory_path"),
+                    "");
                 const bool route_is_directory =
                     McpRoutePathIsDirectory(routed_file_path)
                     || McpRouteRequestMentionsDirectoryListing(route_params.GetString("request_text"));
                 const std::string clips_route_target = GetFieldOrDefault(result, "route_target", "");
+                // ── 三级匹配：CLIPS精确 → 已有启发式 → 同义词+参数模式推断 ──
+                const std::string synonym_route_target = FirstNonEmpty(
+                    ResolveRouteBySynonymAndPattern(inferred_intent, route_params),
+                    ResolveRouteBySynonymAndPattern(raw_intent, route_params),
+                    "");
                 const std::string route_target = FirstNonEmpty(
-                    clips_route_target,
-                    route_is_directory ? std::string("lan_agent_list_directory") : std::string(),
+                    clips_route_target == "lan_agent_list_directory" && synonym_route_target == "lan_agent_search_text"
+                        ? std::string()
+                        : clips_route_target,
                     route_params.GetString("route_hint"),
+                    synonym_route_target,
+                    route_is_directory ? std::string("lan_agent_list_directory") : std::string(),
                     routed_file_path.empty()
                         ? std::string()
                         : (route_is_directory
@@ -934,14 +1209,449 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                                 ? std::string("lan_agent_format_code_file")
                                 : std::string("lan_agent_probe_text_file"))),
                     "");
+
                 if (!route_target.empty()) {
                     const std::string next_call_json = FirstNonEmpty(
                         GetFieldOrDefault(result, "route_arguments_json", ""),
                         BuildPreGuardRouteCallJson(route_target, route_params),
                         "");
+                    result.fields["route_target"] = route_target;
+                    result.fields["route_resolution"] = 
+                        !clips_route_target.empty() ? "clips_exact" :
+                        !route_params.GetString("route_hint").empty() ? "route_hint" :
+                        (ResolveRouteBySynonymAndPattern(inferred_intent, route_params) == route_target 
+                         || ResolveRouteBySynonymAndPattern(raw_intent, route_params) == route_target) ? "synonym_or_pattern" : "heuristic";
+
+                    // ── 方案C: route auto_execute —— 命中后直接执行，不要求二次 mode=call ──
+                    const auto & exec_registry = BuildMcpToolHandlerRegistry();
+                    const auto exec_it = exec_registry.find(route_target);
+                    if (exec_it != exec_registry.end() && route_target != "lan_agent_mcp_route") {
+                        JsonRequestView exec_params(next_call_json);
+                        // CLIPS pre-guard 仍然执行（安全不降级）
+                        CommandResult preflight_result;
+                        bool pending_was_resolved = false;
+                        if (MaybeApplyClipsPreflightBlock(config, route_target, exec_params, &preflight_result)) {
+                            LanResultBuilder(&preflight_result).Finalize(config, route_target);
+                            InjectProfileMeta(preflight_result);
+                            preflight_result.fields["mcp_route_mode"] = "route_auto_execute";
+                            preflight_result.fields["routed_tool_name"] = route_target;
+                            preflight_result.fields["internal_execution_performed"] = "false";
+                            preflight_result.fields["auto_execute"] = "true";
+                            preflight_result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                            preflight_result.fields["tool_use_decision"] =
+                                preflight_result.ok ? "pre_guard_rerouted" : "pre_guard_blocked";
+                            preflight_result.fields["current_tool_chain_node"] = route_target;
+                            // 保留意图映射 trace
+                            preflight_result.fields["intent_mapping_raw"] = GetFieldOrDefault(result, "intent_mapping_raw", "");
+                            preflight_result.fields["intent_mapping_final"] = GetFieldOrDefault(result, "intent_mapping_final", "");
+                            preflight_result.fields["intent_mapping_source"] = GetFieldOrDefault(result, "intent_mapping_source", "");
+
+                            // ── P2-fix: pending continuation 自动代偿执行 ──
+                            // 问题: probe 创建 pending continuation 后，小模型不知道如何执行续行，
+                            //       导致所有新请求被 pending_continuation_mismatch 拦截，形成死锁。
+                            // 修复: 当检测到 pending_continuation_mismatch 时，自动加载并执行
+                            //       pending continuation 中的工具，清除 pending 状态，
+                            //       然后继续执行当前请求的目标工具。
+                            // 注意: MaybeApplyClipsPreflightBlock 路径中 reason_code 存储在
+                            //       clips_pre_call_tool_reason_code 字段（由 ApplyClipsDecisionFields 设置），
+                            //       而非 pre_guard_reason_code（后者仅在 PatchOperations 路径中设置）
+                            const std::string pre_guard_reason = FirstNonEmpty(
+                                GetFieldOrDefault(preflight_result, "clips_pre_call_tool_reason_code", ""),
+                                GetFieldOrDefault(preflight_result, "pre_guard_reason_code", ""),
+                                GetFieldOrDefault(preflight_result, "clips_pre_call_tool_decision_reason_code", ""));
+                            if (IsMcpGatewayReadOnlyTool(route_target)
+                                && (pre_guard_reason == "pending_continuation_mismatch"
+                                    || pre_guard_reason == "continuation_stale")) {
+                                pending_was_resolved = true;
+                                preflight_result.fields["read_only_pending_bypass"] = "true";
+                                preflight_result.fields["read_only_pending_bypass_reason"] = pre_guard_reason;
+                            } else if (pre_guard_reason == "pending_continuation_mismatch") {
+
+                                // 1. 加载 pending continuation
+                                McpPendingContinuationFields pending =
+                                    LoadMcpPendingContinuationForParams(config, exec_params);
+                                if (pending.active && !pending.required_tool.empty()) {
+                                    // 2. 执行 pending continuation 中的工具
+                                    const auto & pending_registry = BuildMcpToolHandlerRegistry();
+                                    const auto pending_it = pending_registry.find(pending.required_tool);
+                                    if (pending_it != pending_registry.end()) {
+                                        JsonRequestView pending_params(pending.required_arguments_json);
+                                        CommandResult pending_result = pending_it->second(config, pending_params);
+                                        LanResultBuilder(&pending_result).Finalize(config, pending.required_tool);
+
+                                        // 3. 清除 pending continuation 文件
+                                        WriteMcpPendingContinuationByKey(
+                                            config, pending.trace_id, CommandResult(),
+                                            "auto_pending_resolver", false);
+                                        if (!pending.goal_id.empty() && pending.goal_id != pending.trace_id) {
+                                            WriteMcpPendingContinuationByKey(
+                                                config, pending.goal_id, CommandResult(),
+                                                "auto_pending_resolver", false);
+                                        }
+                                        const std::string pending_path_key = BuildMcpPendingContinuationPathKey(
+                                            GetFieldOrDefault(pending_result, "file_path", ""));
+                                        if (!pending_path_key.empty()) {
+                                            WriteMcpPendingContinuationByKey(
+                                                config, pending_path_key, CommandResult(),
+                                                "auto_pending_resolver", false);
+                                        }
+
+                                        // 4. 标记 pending 已解决，跳过 return，走正常执行路径
+                                        pending_was_resolved = true;
+                                        preflight_result.fields["auto_pending_resolved"] = "true";
+                                        preflight_result.fields["auto_pending_tool"] = pending.required_tool;
+                                        preflight_result.fields["auto_pending_ok"] = pending_result.ok ? "true" : "false";
+                                    }
+                                }
+                            }
+
+                            if (!pending_was_resolved) {
+                                return preflight_result;
+                            }
+                        }
+                        // 直接执行目标工具（pending 已解决时也走这里）
+                        CommandResult exec_result = exec_it->second(config, exec_params);
+                        LanResultBuilder(&exec_result).Finalize(config, route_target);
+                        InjectProfileMeta(exec_result);
+                        exec_result.fields["mcp_route_mode"] = "route_auto_execute";
+                        exec_result.fields["routed_tool_name"] = route_target;
+                        exec_result.fields["internal_execution_performed"] = "true";
+                        exec_result.fields["auto_execute"] = "true";
+                        exec_result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                        exec_result.fields["tool_use_decision"] = exec_result.ok ? "used_tool" : "tool_failed";
+                        exec_result.fields["current_tool_chain_node"] = route_target;
+                        exec_result.fields["route_target"] = route_target;
+                        exec_result.fields["route_resolution"] = result.fields["route_resolution"];
+                        // 保留意图映射 trace（供观测面板）
+                        exec_result.fields["intent_mapping_raw"] = GetFieldOrDefault(result, "intent_mapping_raw", "");
+                        exec_result.fields["intent_mapping_final"] = GetFieldOrDefault(result, "intent_mapping_final", "");
+                        exec_result.fields["intent_mapping_source"] = GetFieldOrDefault(result, "intent_mapping_source", "");
+                        // 如果 pending continuation 被自动解决，保留标记
+                        if (pending_was_resolved) {
+                            exec_result.fields["auto_pending_resolved"] = "true";
+                            exec_result.fields["auto_pending_tool"] = GetFieldOrDefault(preflight_result, "auto_pending_tool", "");
+                            exec_result.fields["auto_pending_ok"] = GetFieldOrDefault(preflight_result, "auto_pending_ok", "");
+                        }
+                        // 保留 CLIPS 决策元数据
+                        exec_result.fields["route_params_enriched"] = "true";
+                        exec_result.fields["route_pipeline"] =
+                            inferred_intent == "comment_cleanup"
+                                ? "comment_cleanup_then_optional_code_format"
+                                : inferred_intent;
+
+                        // ── P1b: auto_continue 只读链编排 ──
+                        // probe → read 自动续行：当 probe 成功且推荐下一步是 read 时，直接执行
+                        const std::string recommended_next =
+                            GetFieldOrDefault(exec_result, "recommended_next_tool", "");
+                        const std::string next_tool_name =
+                            GetFieldOrDefault(exec_result, "required_tool_name", "");
+                        const std::string actual_tool_used =
+                            GetFieldOrDefault(exec_result, "routed_tool_name", route_target);
+                        const bool is_read_only_probe =
+                            (actual_tool_used == "lan_agent_probe_text_file"
+                             || route_target == "lan_agent_probe_text_file")
+                            && exec_result.ok
+                            && !exec_result.fields.empty()
+                            && (recommended_next == "lan_agent_read_text_file"
+                                || next_tool_name == "lan_agent_read_text_file"
+                                || route_target == "lan_agent_read_text_file");
+                        const bool auto_continue_requested =
+                            params.GetBool("auto_continue", false)
+                            || GetFieldOrDefault(exec_result, "auto_continue_required", "") == "true";
+                        // Debug: 记录 auto_continue 判定条件
+                        exec_result.fields["_debug_is_read_only_probe"] = is_read_only_probe ? "true" : "false";
+                        exec_result.fields["_debug_auto_continue_requested"] = auto_continue_requested ? "true" : "false";
+                        exec_result.fields["_debug_actual_tool_used"] = actual_tool_used;
+                        exec_result.fields["_debug_route_target"] = route_target;
+                        exec_result.fields["_debug_required_tool_name"] = next_tool_name;
+                        exec_result.fields["_debug_recommended_next"] = recommended_next;
+                        exec_result.fields["_debug_auto_continue_param"] =
+                            params.GetBool("auto_continue", false) ? "true" : "false";
+                        if (is_read_only_probe && auto_continue_requested) {
+                            // required_tool_arguments_json 格式: {"name":"tool_name","arguments":{...}}
+                            // 需要从中提取 arguments 部分作为工具的实际参数
+                            const std::string wrapped_json = FirstNonEmpty(
+                                GetFieldOrDefault(exec_result, "next_call_json", ""),
+                                GetFieldOrDefault(exec_result, "required_tool_arguments_json", ""));
+                            if (!wrapped_json.empty()) {
+                                // 解析包装 JSON 并提取 arguments
+                                JsonRequestView wrapped_params(wrapped_json);
+                                std::string tool_args_json = wrapped_params.GetRawJson("arguments", "");
+                                if (tool_args_json.empty()) {
+                                    // 如果没有 arguments 包装，直接用整个 JSON
+                                    tool_args_json = wrapped_json;
+                                }
+                                if (!tool_args_json.empty()) {
+                                    JsonRequestView follow_up_params(tool_args_json);
+                                    CommandResult preflight2;
+                                    if (!MaybeApplyClipsPreflightBlock(
+                                            config,
+                                            "lan_agent_read_text_file",
+                                            follow_up_params,
+                                            &preflight2)) {
+                                        auto read_it = exec_registry.find("lan_agent_read_text_file");
+                                        if (read_it != exec_registry.end()) {
+                                            CommandResult read_result =
+                                                read_it->second(config, follow_up_params);
+                                            LanResultBuilder(&read_result).Finalize(
+                                                config, "lan_agent_read_text_file");
+                                            // 合并 read 结果到 exec_result
+                                            exec_result.fields["auto_continue_executed"] = "true";
+                                            exec_result.fields["auto_continue_chain"] = "probe→read";
+                                            exec_result.fields["auto_continue_tool"] =
+                                                "lan_agent_read_text_file";
+                                            exec_result.fields["auto_continue_ok"] =
+                                                read_result.ok ? "true" : "false";
+                                            exec_result.fields["content"] =
+                                                GetFieldOrDefault(read_result, "content", "");
+                                            exec_result.fields["content_begin"] =
+                                                GetFieldOrDefault(read_result, "content_begin", "");
+                                            exec_result.fields["content_end"] =
+                                                GetFieldOrDefault(read_result, "content_end", "");
+                                            exec_result.fields["total_lines"] =
+                                                GetFieldOrDefault(read_result, "total_lines", "");
+                                            exec_result.fields["returned_lines"] =
+                                                GetFieldOrDefault(read_result, "returned_lines", "");
+                                            exec_result.fields["has_more"] =
+                                                GetFieldOrDefault(read_result, "has_more", "false");
+                                            exec_result.fields["read_complete"] =
+                                                GetFieldOrDefault(read_result, "read_complete", "true");
+                                            exec_result.fields["next_action"] =
+                                                GetFieldOrDefault(read_result, "next_action", "");
+                                            exec_result.fields["required_tool_name"] =
+                                                GetFieldOrDefault(read_result, "required_tool_name", "");
+                                            exec_result.fields["required_tool_arguments_json"] =
+                                                GetFieldOrDefault(read_result, "required_tool_arguments_json", "");
+                                            exec_result.fields["status"] =
+                                                GetFieldOrDefault(read_result, "status", "success");
+                                            exec_result.fields["tool_use_decision"] =
+                                                read_result.ok ? "used_tool" : "tool_failed";
+                                            exec_result.fields["current_tool_chain_node"] =
+                                                "lan_agent_read_text_file";
+                                            // 如果 read 完成，标记终态
+                                            if (GetFieldOrDefault(read_result, "read_complete", "") == "true"
+                                                && GetFieldOrDefault(read_result, "has_more", "false") == "false") {
+                                                exec_result.fields["terminal_state"] = "true";
+                                                exec_result.fields["completion_claim_allowed"] = "true";
+                                                exec_result.fields["final_answer_allowed"] = "true";
+                                                exec_result.fields["verification_ok"] = "true";
+                                                exec_result.fields["chain_state"] = "terminal";
+                                                exec_result.fields["continue_required"] = "false";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── P0-fix: probe/scan 等中间步骤有 next_tool_name 时，强制非终态 ──
+                        // 根因: probe 结果未设 semantic_model_clamp，ApplySupervisionEnvelope
+                        //       默认 terminal_state=true，导致小模型误判任务完成，
+                        //       不执行 next_tool_name 指向的 delete/edit 操作
+                        const std::string exec_next_tool = FirstNonEmpty(
+                            GetFieldOrDefault(exec_result, "next_tool_name", ""),
+                            GetFieldOrDefault(exec_result, "required_tool_name", ""),
+                            GetFieldOrDefault(exec_result, "recommended_next_tool", ""));
+                        const std::string exec_result_type = GetFieldOrDefault(exec_result, "result", "");
+                        const bool is_intermediate_step =
+                            exec_result.ok
+                            && !exec_next_tool.empty()
+                            && exec_result_type != "delete_complete"
+                            && exec_result_type != "directory_cleanup_complete"
+                            && exec_result_type != "format_complete"
+                            && exec_result_type != "edit_complete";
+                        if (is_intermediate_step) {
+                            exec_result.fields["semantic_model_clamp"] = "tool_call_only";
+                            exec_result.fields["terminal_state"] = "false";
+                            exec_result.fields["final_answer_allowed"] = "false";
+                            exec_result.fields["completion_claim_allowed"] = "false";
+                            exec_result.fields["assistant_response_allowed"] = "false";
+                            exec_result.fields["continue_required"] = "true";
+                            exec_result.fields["goal_status"] = "not_complete";
+                            exec_result.fields["task_done"] = "false";
+                            exec_result.fields["chain_state"] = "needs_tool_call";
+                            exec_result.fields["required_next_action_type"] = "mcp_tool_call";
+                            exec_result.fields["verification_ok"] = "false";
+                            if (GetFieldOrDefault(exec_result, "must_continue_until", "").empty()) {
+                                exec_result.fields["must_continue_until"] = "terminal_state=true";
+                            }
+                            if (GetFieldOrDefault(exec_result, "completion_guard", "").empty()) {
+                                exec_result.fields["completion_guard"] =
+                                    "NON_TERMINAL_RESULT: do not claim completion; execute next_tool_name via lan_agent_mcp_route mode=call";
+                            }
+                        }
+
+                        // ── P1-fix: 自动链式执行 (Auto-Chaining) ──
+                        // 问题根源：小模型（如 gemma-4-E4B）无法理解 next_tool_name 是强指令，
+                        //           导致 probe 后停滞（tc=0）。
+                        // 解决方案：在网关层自动代偿执行 next_tool_name 指向的工具，直到链路结束。
+                        {
+                            constexpr int kMaxAutoChainDepth = 5;
+                            int chain_depth = 0;
+                            std::string current_tool = exec_next_tool;
+                            CommandResult current_result = exec_result;
+
+                            while (chain_depth < kMaxAutoChainDepth && !current_tool.empty() && current_result.ok) {
+                                const auto next_it = exec_registry.find(current_tool);
+                                if (next_it == exec_registry.end()) {
+                                    // 找不到工具，跳出循环，交给 LLM
+                                    break;
+                                }
+
+                                // 1. 构造下一个工具的参数字符串
+                                std::string args_json = GetFieldOrDefault(current_result, "required_tool_arguments_json", "");
+                                // 兜底：如果没有参数，传递 file_path
+                                if (args_json.empty()) {
+                                    const std::string fp = GetFieldOrDefault(current_result, "file_path", "");
+                                    if (!fp.empty()) {
+                                        args_json = "{\"file_path\":\"" + fp + "\"";
+                                        // 如果是 delete 操作，补充 default 参数
+                                        if (current_tool.find("delete") != std::string::npos) {
+                                            args_json += ",\"max_lines\":200,\"start_line\":1";
+                                        }
+                                        args_json += "}";
+                                    }
+                                }
+                                // 如果还是空，构造一个默认的空 JSON 对象
+                                if (args_json.empty()) {
+                                    args_json = "{}";
+                                }
+
+                                // 2. 用确定的 args_json 构造 JsonRequestView (无引用悬挂风险)
+                                JsonRequestView next_params(args_json);
+
+                                // 3. CLIPS pre-guard 检查
+                                CommandResult preflight_next;
+                                if (MaybeApplyClipsPreflightBlock(config, current_tool, next_params, &preflight_next)) {
+                                    LanResultBuilder(&preflight_next).Finalize(config, current_tool);
+                                    // 检查是否是 pending_continuation_mismatch，如果是则自动解决
+                                    const std::string chain_guard_reason = FirstNonEmpty(
+                                        GetFieldOrDefault(preflight_next, "clips_pre_call_tool_reason_code", ""),
+                                        GetFieldOrDefault(preflight_next, "pre_guard_reason_code", ""));
+                                    if (chain_guard_reason == "pending_continuation_mismatch") {
+                                        // 自动执行 pending continuation 中的工具
+                                        McpPendingContinuationFields chain_pending =
+                                            LoadMcpPendingContinuationForParams(config, next_params);
+                                        if (chain_pending.active && !chain_pending.required_tool.empty()) {
+                                            const auto & chain_pend_registry = BuildMcpToolHandlerRegistry();
+                                            const auto chain_pend_it = chain_pend_registry.find(chain_pending.required_tool);
+                                            if (chain_pend_it != chain_pend_registry.end()) {
+                                                JsonRequestView chain_pend_params(chain_pending.required_arguments_json);
+                                                CommandResult chain_pend_result = chain_pend_it->second(config, chain_pend_params);
+                                                LanResultBuilder(&chain_pend_result).Finalize(config, chain_pending.required_tool);
+                                                // 清除 pending
+                                                WriteMcpPendingContinuationByKey(
+                                                    config, chain_pending.trace_id, CommandResult(),
+                                                    "auto_chain_pending_resolver", false);
+                                                if (!chain_pending.goal_id.empty() && chain_pending.goal_id != chain_pending.trace_id) {
+                                                    WriteMcpPendingContinuationByKey(
+                                                        config, chain_pending.goal_id, CommandResult(),
+                                                        "auto_chain_pending_resolver", false);
+                                                }
+                                                // 跳过 break，继续执行当前工具
+                                                exec_result.fields["auto_chain_pending_resolved"] = "true";
+                                                // 重新执行当前工具（不再被 pending 阻塞）
+                                                CommandResult reexec_next = next_it->second(config, next_params);
+                                                LanResultBuilder(&reexec_next).Finalize(config, current_tool);
+                                                current_result = reexec_next;
+                                                // 合并结果
+                                                for (const auto & kv : reexec_next.fields) {
+                                                    if (kv.first == "tool_use_decision" || kv.first == "current_tool_chain_node" || kv.first == "route_target") continue;
+                                                    exec_result.fields[kv.first] = kv.second;
+                                                }
+                                                // 检查是否还有下一步
+                                                const std::string reexec_next_tool = FirstNonEmpty(
+                                                    GetFieldOrDefault(reexec_next, "next_tool_name", ""),
+                                                    GetFieldOrDefault(reexec_next, "required_tool_name", ""));
+                                                const std::string reexec_result_type = GetFieldOrDefault(reexec_next, "result", "");
+                                                if (reexec_next_tool.empty() || !reexec_next.ok
+                                                    || reexec_result_type == "delete_complete"
+                                                    || reexec_result_type == "directory_cleanup_complete"
+                                                    || reexec_result_type == "format_complete"
+                                                    || reexec_result_type == "edit_complete") {
+                                                    exec_result.fields["terminal_state"] = "true";
+                                                    exec_result.fields["final_answer_allowed"] = "true";
+                                                    exec_result.fields["auto_chain_completed"] = "true";
+                                                    exec_result.fields["continue_required"] = "false";
+                                                    break;
+                                                }
+                                                current_tool = reexec_next_tool;
+                                                chain_depth++;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    current_result = preflight_next;
+                                    // 被拦截，跳出
+                                    break;
+                                }
+
+                                // 4. 执行工具
+                                CommandResult next_result = next_it->second(config, next_params);
+                                LanResultBuilder(&next_result).Finalize(config, current_tool);
+
+                                // 5. 合并结果回主结果
+                                exec_result.fields["auto_chain_depth"] = std::to_string(chain_depth + 1);
+                                exec_result.fields["auto_chain_step_" + std::to_string(chain_depth + 1) + "_tool"] = current_tool;
+                                exec_result.fields["auto_chain_step_" + std::to_string(chain_depth + 1) + "_ok"] = next_result.ok ? "true" : "false";
+
+                                // 将下一个结果的核心字段覆盖到 exec_result
+                                for (const auto & kv : next_result.fields) {
+                                    const std::string & key = kv.first;
+                                    // 跳过某些内部状态，但保留关键信息
+                                    if (key == "tool_use_decision" || key == "current_tool_chain_node" || key == "route_target") continue;
+                                    exec_result.fields[key] = kv.second;
+                                }
+
+                                // 6. 检查是否还有下一步
+                                const std::string next_next_tool = FirstNonEmpty(
+                                    GetFieldOrDefault(next_result, "next_tool_name", ""),
+                                    GetFieldOrDefault(next_result, "required_tool_name", ""));
+                                const std::string next_result_type = GetFieldOrDefault(next_result, "result", "");
+                                const std::string next_has_more = GetFieldOrDefault(next_result, "has_more", "");
+                                const bool next_terminal = GetFieldOrDefault(next_result, "terminal_state", "") == "true";
+                                // 完成判定：显式完成结果类型 或 terminal_state=true
+                                const bool is_done =
+                                    !next_next_tool.empty()
+                                    && (next_result_type == "delete_complete"
+                                        || next_result_type == "directory_cleanup_complete"
+                                        || next_result_type == "format_complete"
+                                        || next_result_type == "edit_complete"
+                                        || (next_result_type == "no_text_range_in_window"
+                                            && next_has_more == "false")
+                                        || next_terminal);
+
+                                if (next_next_tool.empty() || is_done || !next_result.ok) {
+                                    // 链路结束，设置终态标记
+                                    exec_result.fields["terminal_state"] = "true";
+                                    exec_result.fields["final_answer_allowed"] = "true";
+                                    exec_result.fields["completion_claim_allowed"] = "true";
+                                    exec_result.fields["semantic_model_clamp"] = "final_answer_only";
+                                    exec_result.fields["auto_chain_completed"] = "true";
+                                    exec_result.fields["continue_required"] = "false";
+                                    break;
+                                }
+
+                                // 准备下一轮循环
+                                current_tool = next_next_tool;
+                                current_result = next_result;
+                                chain_depth++;
+                            }
+
+                            // 如果因达到最大深度而退出，标记状态让 LLM 接力
+                            if (chain_depth >= kMaxAutoChainDepth) {
+                                exec_result.fields["auto_chain_max_depth_reached"] = "true";
+                                exec_result.fields["terminal_state"] = "false";
+                                exec_result.fields["continue_required"] = "true";
+                            }
+                        }
+
+                        return exec_result;
+                    }
+
+                    // Fallback: 工具不在 registry 中，返回 CONTINUE 让 LLM 用 mode=call
                     result.fields["tool_use_decision"] = "use_tool";
                     result.fields["chain_state"] = "needs_tool_call";
-                    result.fields["route_target"] = route_target;
                     result.fields["required_next_action_type"] = "mcp_tool_call";
                     result.fields["required_tool_name"] = route_target;
                     result.fields["required_tool_arguments_json"] = next_call_json;
@@ -983,16 +1693,21 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                         result.fields["flow_task_list_md_path"] = GetFieldOrDefault(task_list, "flow_task_list_md_path", "");
                     }
                 } else {
+                    // ── route 未命中：返回候选工具列表 + 建议调用 ──
                     result.fields["tool_use_decision"] = "no_tool_resolved";
                     result.fields["chain_state"] = "needs_user_or_route_detail";
+                    result.fields["route_missing_reason"] = 
+                        "primary_intent '" + inferred_intent + "' did not match any registered tool";
+                    result.fields["candidate_tools"] = BuildCandidateToolsJson(inferred_intent);
                     result.fields["next_action"] =
-                        "route decision did not resolve an internal tool; provide file_path and primary_intent, or call overview for guidance.";
+                        "route did not resolve a tool. Either: (1) provide file_path and primary_intent (e.g. read_file, write_file, list_directory), or (2) call mode=call with target_tool_name from candidate_tools list.";
                 }
                 return result;
             }
 
             if (mode != "call" && mode != "execute") {
                 CommandResult result;
+                InjectProfileMeta(result);
                 result.ok = false;
                 result.exit_code = 400;
                 result.fields["status"] = "failed";
@@ -1005,6 +1720,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             const std::string target_tool_name = params.GetString("target_tool_name");
             if (target_tool_name.empty()) {
                 CommandResult result;
+                InjectProfileMeta(result);
                 result.ok = false;
                 result.exit_code = 400;
                 result.fields["status"] = "failed";
@@ -1015,6 +1731,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             }
             if (target_tool_name == "lan_agent_mcp_route") {
                 CommandResult result;
+                InjectProfileMeta(result);
                 result.ok = false;
                 result.exit_code = 400;
                 result.fields["status"] = "failed";
@@ -1035,11 +1752,29 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             if (arguments_json.empty()) {
                 arguments_json = "{}";
             }
+            if (has_explicit_profile && ExtractJsonString(arguments_json, "model_profile").empty()) {
+                const std::size_t object_end = arguments_json.find_last_of('}');
+                if (object_end != std::string::npos) {
+                    const std::size_t first_value = arguments_json.find_first_not_of(" \t\r\n{");
+                    const bool has_existing_argument_fields =
+                        first_value != std::string::npos && first_value < object_end;
+                    std::string augmented_arguments_json = arguments_json.substr(0, object_end);
+                    if (has_existing_argument_fields) {
+                        augmented_arguments_json += ",";
+                    }
+                    const std::string dq(1, '"');
+                    augmented_arguments_json += dq + "model_profile" + dq + ":" + dq;
+                    augmented_arguments_json += codex_lan_agent::JsonEscape(explicit_profile_name);
+                    augmented_arguments_json += dq;
+                    augmented_arguments_json += arguments_json.substr(object_end);
+                    arguments_json = augmented_arguments_json;
+                }
+            }
             JsonRequestView routed_params(arguments_json);
-
             CommandResult preflight_result;
             if (MaybeApplyClipsPreflightBlock(config, target_tool_name, routed_params, &preflight_result)) {
                 LanResultBuilder(&preflight_result).Finalize(config, target_tool_name);
+                InjectProfileMeta(preflight_result);
                 preflight_result.fields["mcp_route_mode"] = "call";
                 preflight_result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
                 preflight_result.fields["routed_tool_name"] = target_tool_name;
@@ -1051,7 +1786,18 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 preflight_result.fields["current_tool_chain_node"] = target_tool_name;
                 preflight_result.fields["chain_state"] =
                     preflight_result.ok ? "needs_tool_call" : "blocked_before_execution";
-                return preflight_result;
+                const std::string pre_guard_reason = FirstNonEmpty(
+                    GetFieldOrDefault(preflight_result, "clips_pre_call_tool_reason_code", ""),
+                    GetFieldOrDefault(preflight_result, "pre_guard_reason_code", ""),
+                    GetFieldOrDefault(preflight_result, "clips_pre_call_tool_decision_reason_code", ""));
+                if (!(IsMcpGatewayReadOnlyTool(target_tool_name)
+                        && (pre_guard_reason == "pending_continuation_mismatch"
+                            || pre_guard_reason == "continuation_stale"))) {
+                    return preflight_result;
+                }
+                preflight_result.fields["read_only_pending_bypass"] = "true";
+                preflight_result.fields["read_only_pending_bypass_reason"] = pre_guard_reason;
+
             }
 
             const auto & registry = BuildMcpToolHandlerRegistry();
@@ -1064,6 +1810,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                         routed_params,
                         &remote_result)) {
                     LanResultBuilder(&remote_result).Finalize(config, target_tool_name);
+                    InjectProfileMeta(remote_result);
                     remote_result.fields["mcp_route_mode"] = "call";
                     remote_result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
                     remote_result.fields["routed_tool_name"] = target_tool_name;
@@ -1076,6 +1823,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 }
 
                 CommandResult result;
+                InjectProfileMeta(result);
                 result.ok = false;
                 result.exit_code = 404;
                 result.fields["status"] = "failed";
@@ -1083,11 +1831,30 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["mcp_route_mode"] = "call";
                 result.fields["routed_tool_name"] = target_tool_name;
                 result.fields["error"] = "target_tool_name is not registered in the internal MCP registry";
+                // 提供恢复建议：如果 target_tool_name 匹配已知 primary_intent，建议用 mode=route
+                const std::string inferred = InferMcpRoutePrimaryIntent(
+                    target_tool_name, params.GetString("request_text"));
+                if (!inferred.empty()) {
+                    result.fields["suggested_next_call"] = "mode=route";
+                    result.fields["suggested_primary_intent"] = inferred;
+                    result.fields["recovery_hint"] =
+                        "Use mode=route with primary_intent=" + inferred +
+                        " instead of mode=call with target_tool_name=" + target_tool_name;
+                }
+                LanResultBuilder(&result).Finalize(config, target_tool_name);
+                result.fields["mcp_route_mode"] = "call";
+                result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                result.fields["internal_execution_performed"] = "false";
                 return result;
             }
 
             CommandResult result = tool_it->second(config, routed_params);
             LanResultBuilder(&result).Finalize(config, target_tool_name);
+            InjectProfileMeta(result);
+            result.fields["profile_direct_call_policy"] = profile.allow_direct_call_mode
+                ? "profile_allows_direct_call"
+                : "gateway_chain_preflight_controls_direct_call";
             result.fields["mcp_route_mode"] = "call";
             result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
             result.fields["routed_tool_name"] = target_tool_name;
@@ -1754,6 +2521,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("assistant_text"),
                 "");
             const std::string record_business_summary = FirstNonEmpty(
+
                 params.GetString("slice_summary"),
                 params.GetString("summary"),
                 params.GetString("business_summary"));
@@ -1776,7 +2544,73 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("result_ref"),
                 params.GetString("evidence_ref"));
         }},
+        {"lan_agent_search_text", [](const AgentConfig & config, const JsonRequestView & params) {
+            return SearchTextResult(
+                config,
+                FirstNonEmpty(
+                    params.GetString("directory_path"),
+                    params.GetString("file_path"),
+                    std::string()),
+                FirstNonEmpty(
+                    params.GetString("query_text"),
+                    params.GetString("text"),
+                    params.GetString("anchor_text"),
+                    ExtractSearchQueryTextFromRequest(params.GetString("request_text"))),
+                params.GetBool("recursive", true),
+                params.GetBool("show_preview", false),
+                std::max(1, params.GetInt("max_matches", 100)),
+                params.GetString("trace_id"));
+        }},
+        {"lan_agent_optfile_read", [](const AgentConfig & config, const JsonRequestView & params) {
+            return OptFileReadResult(
+                config,
+                params.GetString("target_name"),
+                std::max(1, params.GetInt("max_bytes", 65536)));
+        }},
+        {"lan_agent_optfile_write_preview", [](const AgentConfig & config, const JsonRequestView & params) {
+            CommandResult payload_result;
+            const std::string data = ResolveTextPayloadFromParams(
+                params,
+                "data",
+                "data_base64",
+                &payload_result);
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            CommandResult result = OptFileWritePreviewResult(
+                config,
+                params.GetString("target_name"),
+                data,
+                params.GetBool("append", false));
+            result.fields["content_transport"] = GetFieldOrDefault(
+                payload_result,
+                "content_transport",
+                "json_string");
+            return result;
+        }},
+        {"lan_agent_optfile_apply_write", [](const AgentConfig & config, const JsonRequestView & params) {
+            CommandResult payload_result;
+            const std::string data = ResolveTextPayloadFromParams(
+                params,
+                "data",
+                "data_base64",
+                &payload_result);
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            CommandResult result = OptFileApplyWriteResult(
+                config,
+                params.GetString("target_name"),
+                data,
+                params.GetBool("append", false));
+            result.fields["content_transport"] = GetFieldOrDefault(
+                payload_result,
+                "content_transport",
+                "json_string");
+            return result;
+        }},
         {"lan_agent_find_line_metadata", [](const AgentConfig & config, const JsonRequestView & params) {
+
             return FindLineMetadataResult(
                 config,
                 params.GetString("file_path"),
@@ -1840,9 +2674,49 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             CommandResult payload_result;
             std::string insert_text = ResolveTextPayloadFromParams(
                 params,
-                "line_roi",
-                "line_roi_base64",
+                "insert_text",
+                "insert_text_base64",
                 &payload_result);
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (insert_text.empty()) {
+                insert_text = ResolveTextPayloadFromParams(
+                    params,
+                    "new_content",
+                    "new_content_base64",
+                    &payload_result);
+            }
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (insert_text.empty()) {
+                insert_text = ResolveTextPayloadFromParams(
+                    params,
+                    "content",
+                    "content_base64",
+                    &payload_result);
+            }
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (insert_text.empty()) {
+                insert_text = ResolveTextPayloadFromParams(
+                    params,
+                    "text",
+                    "text_base64",
+                    &payload_result);
+            }
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (insert_text.empty()) {
+                insert_text = ResolveTextPayloadFromParams(
+                    params,
+                    "line_roi",
+                    "line_roi_base64",
+                    &payload_result);
+            }
             if (!payload_result.ok) {
                 return payload_result;
             }
@@ -1876,11 +2750,33 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             return result;
         }},
         {"lan_agent_replace_line_range_atomic", [](const AgentConfig & config, const JsonRequestView & params) {
+            const bool has_supported_payload =
+                !params.GetRawJson("replacement_text").empty()
+                || !params.GetRawJson("replacement_text_base64").empty()
+                || !params.GetRawJson("new_content").empty()
+                || !params.GetRawJson("new_content_base64").empty()
+                || !params.GetRawJson("content").empty()
+                || !params.GetRawJson("content_base64").empty()
+                || !params.GetRawJson("text").empty()
+                || !params.GetRawJson("text_base64").empty()
+                || !params.GetRawJson("line_roi").empty()
+                || !params.GetRawJson("line_roi_base64").empty();
             CommandResult payload_result;
+            if (!has_supported_payload) {
+                payload_result.ok = false;
+                payload_result.exit_code = 400;
+                payload_result.fields["error"] = "replacement payload is required";
+                payload_result.fields["result"] = "missing_replacement_payload";
+                payload_result.fields["accepted_payload_fields"] =
+                    "replacement_text,new_content,content,text,line_roi and matching *_base64 fields";
+                payload_result.fields["destructive_fallback_blocked"] = "true";
+                return payload_result;
+            }
+
             std::string replacement_text = ResolveTextPayloadFromParams(
                 params,
-                "line_roi",
-                "line_roi_base64",
+                "replacement_text",
+                "replacement_text_base64",
                 &payload_result);
             if (!payload_result.ok) {
                 return payload_result;
@@ -1888,13 +2784,55 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             if (replacement_text.empty()) {
                 replacement_text = ResolveTextPayloadFromParams(
                     params,
-                    "replacement_text",
-                    "replacement_text_base64",
+                    "new_content",
+                    "new_content_base64",
                     &payload_result);
             }
             if (!payload_result.ok) {
                 return payload_result;
             }
+            if (replacement_text.empty()) {
+                replacement_text = ResolveTextPayloadFromParams(
+                    params,
+                    "content",
+                    "content_base64",
+                    &payload_result);
+            }
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (replacement_text.empty()) {
+                replacement_text = ResolveTextPayloadFromParams(
+                    params,
+                    "text",
+                    "text_base64",
+                    &payload_result);
+            }
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (replacement_text.empty()) {
+                replacement_text = ResolveTextPayloadFromParams(
+                    params,
+                    "line_roi",
+                    "line_roi_base64",
+                    &payload_result);
+            }
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (replacement_text.empty() && !params.GetBool("allow_empty_content", false)) {
+                payload_result.ok = false;
+                payload_result.exit_code = 400;
+                payload_result.fields["error"] =
+                    "empty replacement payload requires allow_empty_content=true";
+                payload_result.fields["result"] = "empty_replacement_payload_blocked";
+                payload_result.fields["destructive_fallback_blocked"] = "true";
+                payload_result.fields["recommended_delete_tool"] =
+                    "lan_agent_delete_text_range_window_atomic";
+                return payload_result;
+            }
+
             CommandResult result = ReplaceLineRangeAtomicResult(
                 config,
                 params.GetString("file_path"),
@@ -1909,6 +2847,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("trace_id"));
             result.fields["content_transport"] = GetFieldOrDefault(payload_result, "content_transport", "json_string");
             result.fields["content_base64_bytes"] = GetFieldOrDefault(payload_result, "content_base64_bytes", "");
+            result.fields["empty_replacement_explicitly_allowed"] =
+                replacement_text.empty() ? "true" : "false";
             return result;
         }},
         {"lan_agent_write_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
@@ -1926,6 +2866,33 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("file_path"),
                 content,
                 params.GetBool("append", false));
+            result.fields["content_transport"] = GetFieldOrDefault(payload_result, "content_transport", "json_string");
+            result.fields["content_base64_bytes"] = GetFieldOrDefault(payload_result, "content_base64_bytes", "");
+            return result;
+        }},
+        {"lan_agent_append_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
+            CommandResult payload_result;
+            const std::string content = ResolveTextPayloadFromParams(
+                params,
+                "content",
+                "content_base64",
+                &payload_result);
+            if (!payload_result.ok) {
+                return payload_result;
+            }
+            if (content.empty()) {
+                payload_result.ok = false;
+                payload_result.exit_code = 400;
+                payload_result.fields["error"] = "append content is required";
+                payload_result.fields["result"] = "missing_append_payload";
+                payload_result.fields["destructive_fallback_blocked"] = "true";
+                return payload_result;
+            }
+            CommandResult result = WriteTextFileResult(
+                config,
+                params.GetString("file_path"),
+                content,
+                true);
             result.fields["content_transport"] = GetFieldOrDefault(payload_result, "content_transport", "json_string");
             result.fields["content_base64_bytes"] = GetFieldOrDefault(payload_result, "content_base64_bytes", "");
             return result;
@@ -1967,6 +2934,16 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 params.GetString("resolved_file_path"),
                 params.GetString("target_resolution_reason"),
                 params.GetBool("allow_empty_content", false));
+        }},
+        {"lan_agent_revert_single_file_patch", [](const AgentConfig & config, const JsonRequestView & params) {
+            return RevertSingleFilePatchResult(
+                config,
+                params.GetString("file_path"),
+                params.GetString("backup_path"),
+                params.GetString("request_id"),
+                params.GetString("trace_id"),
+                params.GetString("patch_id"),
+                params.GetString("reason"));
         }},
         {"lan_agent_format_code_file", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildFormatCodeFileResult(config, params);

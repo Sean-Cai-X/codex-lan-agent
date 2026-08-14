@@ -485,39 +485,41 @@ std::vector<std::string> FindWorkspaceWritablePathCandidates(
         return matches;
     }
 
-    std::error_code iterator_error;
-    std::filesystem::recursive_directory_iterator iterator(
-        config.workspace_root,
-        std::filesystem::directory_options::skip_permission_denied,
-        iterator_error);
-    const std::filesystem::recursive_directory_iterator end;
-    for (; iterator != end; iterator.increment(iterator_error)) {
-        if (iterator_error) {
-            iterator_error.clear();
-            continue;
-        }
-        const std::filesystem::directory_entry & entry = *iterator;
-        if (!entry.is_regular_file(iterator_error)) {
+    for (const std::filesystem::path & workspace_root : GetWorkspaceRoots(config)) {
+        std::error_code iterator_error;
+        std::filesystem::recursive_directory_iterator iterator(
+            workspace_root,
+            std::filesystem::directory_options::skip_permission_denied,
+            iterator_error);
+        const std::filesystem::recursive_directory_iterator end;
+        for (; iterator != end; iterator.increment(iterator_error)) {
             if (iterator_error) {
                 iterator_error.clear();
+                continue;
             }
-            continue;
-        }
+            const std::filesystem::directory_entry & entry = *iterator;
+            if (!entry.is_regular_file(iterator_error)) {
+                if (iterator_error) {
+                    iterator_error.clear();
+                }
+                continue;
+            }
 
-        std::error_code relative_error;
-        const std::filesystem::path relative_path =
-            std::filesystem::relative(entry.path(), config.workspace_root, relative_error);
-        if (relative_error) {
-            continue;
-        }
-        const std::string normalized_relative = NormalizePathForSuffixMatch(relative_path);
-        if (!EndsWithPathSuffix(normalized_relative, requested_suffix)) {
-            continue;
-        }
+            std::error_code relative_error;
+            const std::filesystem::path relative_path =
+                std::filesystem::relative(entry.path(), workspace_root, relative_error);
+            if (relative_error) {
+                continue;
+            }
+            const std::string normalized_relative = NormalizePathForSuffixMatch(relative_path);
+            if (!EndsWithPathSuffix(normalized_relative, requested_suffix)) {
+                continue;
+            }
 
-        const std::string candidate_path = entry.path().lexically_normal().string();
-        if (std::find(matches.begin(), matches.end(), candidate_path) == matches.end()) {
-            matches.push_back(candidate_path);
+            const std::string candidate_path = entry.path().lexically_normal().string();
+            if (std::find(matches.begin(), matches.end(), candidate_path) == matches.end()) {
+                matches.push_back(candidate_path);
+            }
         }
     }
 
@@ -1503,11 +1505,10 @@ bool TryResolveWorkspaceWritableFilePath(
 
     std::filesystem::path requested(raw_path);
     if (requested.is_relative()) {
-        requested = std::filesystem::path(config.workspace_root) / requested;
+        requested = GetPrimaryWorkspaceRoot(config) / requested;
     }
     const std::filesystem::path normalized = requested.lexically_normal();
-    const std::filesystem::path workspace_root = std::filesystem::path(config.workspace_root);
-    if (!StartsWithPath(normalized, workspace_root)) {
+    if (!StartsWithAnyPath(normalized, config.workspace_root)) {
         if (error_message) {
             *error_message = "path is outside workspace_root";
         }
@@ -1659,6 +1660,33 @@ CommandResult ApplySingleFilePatchResult(
         result.exit_code = 52;
         result.fields["error"] = "old_hash mismatch";
         result.fields["result"] = "old_hash_mismatch";
+        return result;
+    }
+    if (config.optfile_write_enabled) {
+        CommandResult write_result =
+            WriteWholeTextViaOptfileResult(config, result.fields["normalized_path"], new_content, false);
+        result.ok = write_result.ok;
+        result.exit_code = write_result.exit_code;
+        for (const auto & field : write_result.fields) {
+            result.fields[field.first] = field.second;
+        }
+        result.fields["patch_execution_mode"] = "single_file_apply";
+        result.fields["final_write_tool"] = "optfile.exe";
+        result.fields["write_applied"] = result.ok ? "true" : "false";
+        result.fields["disk_write_completed"] = result.ok ? "true" : "false";
+        result.fields["applied_hash"] = GetFieldOrDefault(write_result, "new_hash", "");
+        result.fields["applied_hash_match"] =
+            result.fields["applied_hash"] == result.fields["new_hash"] ? "true" : "false";
+        result.fields["result"] = result.ok ? "patch_applied" : GetFieldOrDefault(write_result, "result", "patch_apply_failed");
+        return result;
+    }
+    if (!config.direct_file_write_enabled) {
+        result.ok = false;
+        result.exit_code = 403;
+        result.fields["error"] = "both target-file write gates are disabled";
+        result.fields["result"] = "file_write_gates_disabled";
+        result.fields["optfile_write_enabled"] = "false";
+        result.fields["direct_file_write_enabled"] = "false";
         return result;
     }
     const std::filesystem::path normalized(result.fields["normalized_path"]);
@@ -1953,24 +1981,36 @@ CommandResult ApplyDiffPatchResult(
         }
     }
 
-    GitDiffPatchAttempt git_attempt = TryApplyDiffPatchWithGit(
-        config,
-        file_path,
-        normalized,
-        diff_text,
-        old_hash,
-        request_id,
-        trace_id,
-        patch_id,
-        reason,
-        final_resolved_file_path,
-        final_target_resolution_reason,
-        auto_target_resolution_used,
-        allow_empty_content);
-    if (git_attempt.completed) {
-        return git_attempt.result;
+    GitDiffPatchAttempt git_attempt{};
+    if (!config.optfile_write_enabled) {
+        if (!config.direct_file_write_enabled) {
+            result.ok = false;
+            result.exit_code = 403;
+            result.fields["error"] = "both target-file write gates are disabled";
+            result.fields["result"] = "file_write_gates_disabled";
+            return result;
+        }
+        git_attempt = TryApplyDiffPatchWithGit(
+            config,
+            file_path,
+            normalized,
+            diff_text,
+            old_hash,
+            request_id,
+            trace_id,
+            patch_id,
+            reason,
+            final_resolved_file_path,
+            final_target_resolution_reason,
+            auto_target_resolution_used,
+            allow_empty_content);
+        if (git_attempt.completed) {
+            return git_attempt.result;
+        }
+    } else {
+        git_attempt.result.fields["git_apply_fallback_reason"] =
+            "optfile write gate selected; diff parsed in memory before optfile commit";
     }
-
     std::string old_content;
     std::string read_error;
     if (!ReadWholeFile(normalized, &old_content, &read_error)) {
@@ -2071,6 +2111,26 @@ CommandResult WriteTextFileResult(
     result.fields["append"] = append ? "true" : "false";
     result.fields["action"] = "write_text_file";
     result.fields["write_contract"] = "use this tool for generate/create/write/append text files; do not use local_cli echo or shell redirection";
+    if (config.optfile_write_enabled) {
+        if (!ApplyWriteContentGuards(&result, "lan_agent_write_text_file", file_path, content, true)) {
+            return result;
+        }
+        result = WriteWholeTextViaOptfileResult(config, file_path, content, append);
+        result.fields["file_path"] = file_path;
+        result.fields["append"] = append ? "true" : "false";
+        result.fields["action"] = "write_text_file";
+        result.fields["tool"] = "lan_agent_write_text_file";
+        return result;
+    }
+    if (!config.direct_file_write_enabled) {
+        result.ok = false;
+        result.exit_code = 403;
+        result.fields["error"] = "both target-file write gates are disabled";
+        result.fields["result"] = "file_write_gates_disabled";
+        result.fields["optfile_write_enabled"] = "false";
+        result.fields["direct_file_write_enabled"] = "false";
+        return result;
+    }
     if (!ApplyWriteContentGuards(&result, "lan_agent_write_text_file", file_path, content, true)) {
         return result;
     }
@@ -2221,9 +2281,15 @@ CommandResult EnsureDirectoryResult(
         }
         target = std::filesystem::path(directory_path);
         if (target.is_relative()) {
-            target = std::filesystem::path(config.workspace_root) / target;
+            target = GetPrimaryWorkspaceRoot(config) / target;
         }
         target = target.lexically_normal();
+        if (!StartsWithAnyPath(target, config.workspace_root)) {
+            result.ok = false;
+            result.exit_code = 45;
+            result.fields["error"] = "path is outside workspace_root";
+            return result;
+        }
         result.fields["resolved_from"] = "directory_path";
     }
 
@@ -2315,6 +2381,37 @@ CommandResult RevertSingleFilePatchResult(
         return result;
     }
 
+    if (config.optfile_write_enabled) {
+        CommandResult write_result =
+            WriteWholeTextViaOptfileResult(config, normalized.string(), backup_content, false);
+        result = write_result;
+        PopulatePatchResultFields(
+            &result,
+            patch_request,
+            normalized.string(),
+            std::string(),
+            backup_content,
+            std::string(),
+            patch_request.patch_id + ":revert");
+        result.fields["backup_path"] = backup_path;
+        result.fields["final_write_tool"] = "optfile.exe";
+        result.fields["write_applied"] = result.ok ? "true" : "false";
+        result.fields["disk_write_completed"] = result.ok ? "true" : "false";
+        result.fields["applied_hash"] = GetFieldOrDefault(write_result, "new_hash", "");
+        result.fields["applied_hash_match"] =
+            result.fields["applied_hash"] == StableContentChecksum(backup_content) ? "true" : "false";
+        result.fields["write_verified"] =
+            result.ok && result.fields["applied_hash_match"] == "true" ? "true" : "false";
+        result.fields["result"] = result.ok ? "reverted" : GetFieldOrDefault(write_result, "result", "revert_failed");
+        return result;
+    }
+    if (!config.direct_file_write_enabled) {
+        result.ok = false;
+        result.exit_code = 403;
+        result.fields["error"] = "both target-file write gates are disabled";
+        result.fields["result"] = "file_write_gates_disabled";
+        return result;
+    }
     const std::string resource_key = "file:" + normalized.string();
     ScopedResourceLock resource_lock(resource_key);
     if (!resource_lock.acquired()) {

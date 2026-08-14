@@ -273,6 +273,11 @@ CommandResult OptFileReadResult(
         result.exit_code = 64;
         result.fields["error"] = "optfile target does not exist";
         result.fields["content"] = "";
+        result.fields["content_text"] = "";
+        result.fields["content_begin"] = "content_begin<<<";
+        result.fields["content_end"] = ">>>content_end";
+        result.fields["content_begin_marker"] = "content_begin<<<";
+        result.fields["content_end_marker"] = ">>>content_end";
         result.fields["bytes"] = "0";
         result.fields["checksum"] = StableContentChecksum("");
         result.fields["next_action"] = "call lan_agent_optfile_apply_write to create the runtime optfile";
@@ -293,6 +298,11 @@ CommandResult OptFileReadResult(
     result.fields["checksum"] = StableContentChecksum(content);
     result.fields["truncated"] = content.size() > bounded_max ? "true" : "false";
     result.fields["content"] = content.substr(0, std::min<std::size_t>(content.size(), bounded_max));
+    result.fields["content_text"] = result.fields["content"];
+    result.fields["content_begin"] = "content_begin<<<";
+    result.fields["content_end"] = ">>>content_end";
+    result.fields["content_begin_marker"] = "content_begin<<<";
+    result.fields["content_end_marker"] = ">>>content_end";
     result.fields["result"] = "read";
     return result;
 }

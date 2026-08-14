@@ -1,8 +1,9 @@
 #pragma once
 
-CommandResult BuildHealthResult(const AgentConfig & config) {
-    std::filesystem::create_directories(config.log_root);
-
+struct RuntimeEndpointHealthSnapshot {
+    bool generation_ready = false;
+    bool embedding_ready = false;
+    bool local_chat_ready = false;
     std::string generation_detail = "not configured";
     std::string embedding_detail = "not configured";
     std::string local_chat_detail = "not configured";
@@ -10,23 +11,89 @@ CommandResult BuildHealthResult(const AgentConfig & config) {
     std::string effective_local_chat_endpoint;
     std::string embedding_endpoint_source = "unreachable";
     std::string local_chat_endpoint_source = "unreachable";
-    const bool generation_ready = !config.generation_endpoint.empty()
-        && codex_lan_agent::CheckTcpEndpoint(config.generation_endpoint, 2000, &generation_detail);
-    const bool embedding_ready = ResolveReachableEndpoint(
+};
+
+RuntimeEndpointHealthSnapshot ResolveRuntimeEndpointHealth(
+    const AgentConfig & config,
+    bool * cache_hit,
+    long long * probe_duration_ms) {
+    static std::mutex cache_mutex;
+    static bool cache_valid = false;
+    static std::string cache_key;
+    static RuntimeEndpointHealthSnapshot cached;
+    static std::chrono::steady_clock::time_point cache_expires_at;
+
+    const std::string current_key = config.generation_endpoint + "\n"
+        + config.embedding_endpoint + "\n"
+        + config.local_chat_endpoint;
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (cache_valid && cache_key == current_key && now < cache_expires_at) {
+        if (cache_hit != nullptr) {
+            *cache_hit = true;
+        }
+        if (probe_duration_ms != nullptr) {
+            *probe_duration_ms = 0;
+        }
+        return cached;
+    }
+
+    if (cache_hit != nullptr) {
+        *cache_hit = false;
+    }
+    const auto probe_started = std::chrono::steady_clock::now();
+
+    RuntimeEndpointHealthSnapshot refreshed;
+    refreshed.generation_ready = !config.generation_endpoint.empty()
+        && codex_lan_agent::CheckTcpEndpoint(config.generation_endpoint, 2000, &refreshed.generation_detail);
+    refreshed.embedding_ready = ResolveReachableEndpoint(
         config.embedding_endpoint,
         DeriveEmbeddingFallbackEndpoint(config),
         2000,
-        &effective_embedding_endpoint,
-        &embedding_detail,
-        &embedding_endpoint_source);
-    const bool local_chat_ready = ResolveReachableEndpoint(
+        &refreshed.effective_embedding_endpoint,
+        &refreshed.embedding_detail,
+        &refreshed.embedding_endpoint_source);
+    refreshed.local_chat_ready = ResolveReachableEndpoint(
         config.local_chat_endpoint,
         DeriveLocalChatFallbackEndpoint(config),
         2000,
-        &effective_local_chat_endpoint,
-        &local_chat_detail,
-        &local_chat_endpoint_source);
+        &refreshed.effective_local_chat_endpoint,
+        &refreshed.local_chat_detail,
+        &refreshed.local_chat_endpoint_source);
 
+    const auto probe_finished = std::chrono::steady_clock::now();
+    if (probe_duration_ms != nullptr) {
+        *probe_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            probe_finished - probe_started).count();
+    }
+
+    cached = refreshed;
+    cache_key = current_key;
+    cache_valid = true;
+    cache_expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    return refreshed;
+}
+
+CommandResult BuildHealthResult(const AgentConfig & config) {
+    std::filesystem::create_directories(config.log_root);
+
+    bool endpoint_probe_cache_hit = false;
+    long long endpoint_probe_duration_ms = 0;
+    const RuntimeEndpointHealthSnapshot endpoint_health = ResolveRuntimeEndpointHealth(
+        config,
+        &endpoint_probe_cache_hit,
+        &endpoint_probe_duration_ms);
+    const bool generation_ready = endpoint_health.generation_ready;
+    const bool embedding_ready = endpoint_health.embedding_ready;
+    const bool local_chat_ready = endpoint_health.local_chat_ready;
+    const std::string & generation_detail = endpoint_health.generation_detail;
+    const std::string & embedding_detail = endpoint_health.embedding_detail;
+    const std::string & local_chat_detail = endpoint_health.local_chat_detail;
+    const std::string & effective_embedding_endpoint = endpoint_health.effective_embedding_endpoint;
+    const std::string & effective_local_chat_endpoint = endpoint_health.effective_local_chat_endpoint;
+    const std::string & embedding_endpoint_source = endpoint_health.embedding_endpoint_source;
+    const std::string & local_chat_endpoint_source = endpoint_health.local_chat_endpoint_source;
     CommandResult result;
     result.fields["status"] = "ok";
     result.fields["platform"] = CurrentPlatformName();
@@ -41,6 +108,9 @@ CommandResult BuildHealthResult(const AgentConfig & config) {
     result.fields["storage_root_mode"] = "config_resolved_absolute";
     result.fields["remote_timestamp"] = IsoTimestampNow();
     result.fields["observed_at"] = result.fields["remote_timestamp"];
+    result.fields["health_endpoint_probe_cache_hit"] = endpoint_probe_cache_hit ? "true" : "false";
+    result.fields["health_endpoint_probe_cache_ttl_ms"] = "5000";
+    result.fields["health_endpoint_probe_duration_ms"] = std::to_string(endpoint_probe_duration_ms);
     result.fields["remote_control_events_path"] = BuildRemoteControlEventsPath(config);
     result.fields["generation_endpoint"] = config.generation_endpoint;
     result.fields["generation_ready"] = generation_ready ? "true" : "false";

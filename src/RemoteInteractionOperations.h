@@ -390,7 +390,7 @@ bool IsObservationNoiseCommandName(const std::string & command_name) {
 }
 
 std::string ClassifyRemoteCommandName(const HttpRequest & request) {
-    if (request.path == "/mcp") {
+    if (request.path == "/mcp" || request.path == "/tools") {
         const std::string tool_name = ExtractJsonString(request.body, "name");
         if (!tool_name.empty()) {
             if (tool_name == "local_cli" || tool_name == "codex_local_cli") {
@@ -423,7 +423,7 @@ std::string ClassifyRemoteRequestType(const HttpRequest & request) {
     if (request.path == "/health" || request.path == "/healthz" || request.path == "/runtime-overview") {
         return "health";
     }
-    if (request.path == "/mcp") {
+    if (request.path == "/mcp" || request.path == "/tools") {
         const std::string tool_name = ExtractJsonString(request.body, "name");
         if (tool_name == "local_cli" || tool_name == "codex_local_cli") {
             return "local_cli";
@@ -467,6 +467,57 @@ std::string BuildRemoteControlEventJson(
     }
     output << "}";
     return output.str();
+}
+
+void WriteToolUseStdoutEvent(
+    const AgentConfig & config,
+    const HttpRequest & request,
+    const HttpResponseSpec & response,
+    const std::string & request_finished_at,
+    const std::string & command_name,
+    const std::string & status,
+    long long duration_ms) {
+    if (!IsAgentServerStdoutFileLogEnabled()) {
+        return;
+    }
+    std::unordered_map<std::string, std::string> event;
+    const std::string result_tool_name = ExtractResultField(response.body, "tool_name");
+    const std::string visible_tool_name = ExtractResultField(response.body, "visible_tool_name");
+    event["timestamp"] = request_finished_at;
+    event["record_model"] = "agent_server_stdout_tool_event_v1";
+    event["event_type"] = "tool_call";
+    event["tool_name"] = FirstNonEmpty(visible_tool_name, result_tool_name, command_name);
+    event["command_name"] = command_name;
+    event["routed_tool_name"] = ExtractResultField(response.body, "routed_tool_name");
+    event["required_tool_name"] = ExtractResultField(response.body, "required_tool_name");
+    event["mcp_route_mode"] = ExtractResultField(response.body, "mcp_route_mode");
+    event["entry_name"] = request.method + " " + request.path;
+    event["method"] = request.method;
+    event["path"] = request.path;
+    event["status"] = status;
+    event["http_status"] = std::to_string(response.status_code);
+    event["duration_ms"] = std::to_string(duration_ms);
+    event["trace_id"] = ExtractResultField(response.body, "trace_id");
+    event["goal_id"] = ExtractResultField(response.body, "goal_id");
+    event["result"] = ExtractResultField(response.body, "result");
+    event["request_id"] = FirstNonEmpty(
+        ExtractResultField(response.body, "request_id"),
+        ExtractJsonString(request.body, "request_id"));
+    event["primary_intent"] = FirstNonEmpty(
+        ExtractResultField(response.body, "primary_intent"),
+        ExtractJsonString(request.body, "primary_intent"));
+    event["request_target"] = FirstNonEmpty(
+        ExtractJsonString(request.body, "file_path"),
+        ExtractJsonString(request.body, "directory_path"),
+        ExtractJsonString(request.body, "target_name"));
+    event["resolved_target"] = FirstNonEmpty(
+        ExtractResultField(response.body, "normalized_path"),
+        ExtractResultField(response.body, "file_path"),
+        ExtractResultField(response.body, "target_path"),
+        ExtractResultField(response.body, "requested_path"));
+    AppendAgentServerStdoutFileLogLine(
+        config,
+        std::string("[tool_event] ") + BuildRemoteControlEventJson(event));
 }
 
 void AppendRemoteControlEvent(
@@ -594,6 +645,14 @@ void AppendRemoteControlEvent(
         }
         g_last_remote_control_event = event;
     }
+    WriteToolUseStdoutEvent(
+        config,
+        request,
+        response,
+        request_finished_at,
+        command_name,
+        status,
+        duration_ms);
 }
 
 std::string BuildMcpSessionId() {

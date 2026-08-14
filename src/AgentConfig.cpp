@@ -121,7 +121,6 @@ std::string NormalizePathListValue(
     }
     return output.str();
 }
-
 bool ParseInt(
     const std::string & text,
     int * parsed_value) {
@@ -133,6 +132,25 @@ bool ParseInt(
     }
     *parsed_value = value;
     return true;
+}
+
+bool ParseBool(
+    const std::string & text,
+    bool * parsed_value) {
+    std::string lowered;
+    lowered.reserve(text.size());
+    for (unsigned char ch : text) {
+        lowered.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    if (lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on") {
+        *parsed_value = true;
+        return true;
+    }
+    if (lowered == "false" || lowered == "0" || lowered == "no" || lowered == "off") {
+        *parsed_value = false;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -221,6 +239,20 @@ bool LoadAgentConfig(
             loaded.cmm_store_path = value;
         } else if (key == "clang_indexer_binary_path") {
             loaded.clang_indexer_binary_path = value;
+        } else if (key == "optfile_write_enabled") {
+            if (!ParseBool(value, &loaded.optfile_write_enabled)) {
+                if (error_message) {
+                    *error_message = "invalid optfile_write_enabled on line " + std::to_string(line_number);
+                }
+                return false;
+            }
+        } else if (key == "direct_file_write_enabled") {
+            if (!ParseBool(value, &loaded.direct_file_write_enabled)) {
+                if (error_message) {
+                    *error_message = "invalid direct_file_write_enabled on line " + std::to_string(line_number);
+                }
+                return false;
+            }
         } else if (key == "task_timeout_sec") {
             if (!ParseInt(value, &loaded.task_timeout_sec)) {
                 if (error_message) {
