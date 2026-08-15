@@ -1,0 +1,225 @@
+name: release-windows-x64-clangcl-gn
+
+# GN/clang-cl validation release.
+# Repo policy: GN itself, LLVM source, RocksDB source, and generated GN files are
+# runtime/network/cache artifacts only. They are not committed to this repo.
+
+on:
+  push:
+    tags:
+      - "v*-clangcl-gn"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to create release for (e.g. v2026.08.14-clangcl-gn)"
+        required: false
+        default: ""
+        type: string
+      force_rebuild_llvm:
+        description: "Force rebuild LLVM/Clang toolchain cache"
+        required: false
+        default: false
+        type: boolean
+      gn_url:
+        description: "GN zip URL. Default uses Chrome Infra Packages latest Windows amd64 GN."
+        required: false
+        default: "https://chrome-infra-packages.appspot.com/dl/gn/gn/windows-amd64/+/latest"
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  LLVM_VERSION: 18.1.8
+  LLVM_CACHE_KEY: llvm-18.1.8-static-flat-with-clangcl-msvc-ninja-x64-v1
+  ARCH: x64
+
+jobs:
+  llvm-clangcl-toolchain:
+    name: "Layer 1 · LLVM/Clang 18.1.8 + clang-cl.exe (cached)"
+    runs-on: windows-latest
+    outputs:
+      cache_hit: ${{ steps.cache-llvm.outputs.cache-hit }}
+
+    steps:
+      - name: Probe MSVC (vcvars64 path)
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $VS_INSTALL) { throw "Visual Studio C++ tools not found" }
+          $vcvars = Join-Path $VS_INSTALL "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "vcvars: $vcvars"
+
+      - name: Cache flat LLVM_ROOT with clang-cl
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/llvm_root_clangcl
+          key: ${{ env.LLVM_CACHE_KEY }}
+          save-always: true
+
+      - name: Build LLVM/Clang from official source and assemble LLVM_ROOT
+        if: |
+          steps.cache-llvm.outputs.cache-hit != 'true' ||
+          github.event.inputs.force_rebuild_llvm == 'true'
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          set LLVM_SRC=%RUNNER_WORKSPACE%\llvm-project-src-clangcl
+          set LLVM_BUILD=%RUNNER_WORKSPACE%\llvm-project-build-clangcl
+          set LLVM_ROOT_FLAT=%RUNNER_WORKSPACE%\llvm_root_clangcl
+          if exist %LLVM_SRC% rmdir /s /q %LLVM_SRC%
+          if exist %LLVM_BUILD% rmdir /s /q %LLVM_BUILD%
+          if exist %LLVM_ROOT_FLAT% rmdir /s /q %LLVM_ROOT_FLAT%
+          git clone --depth 1 --branch llvmorg-%LLVM_VERSION% https://github.com/llvm/llvm-project.git %LLVM_SRC%
+          if errorlevel 1 exit /b 1
+          cmake -G Ninja -S %LLVM_SRC%\llvm -B %LLVM_BUILD% ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLVM_ENABLE_PROJECTS=clang ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DLLVM_TARGETS_TO_BUILD=X86 ^
+            -DLLVM_INCLUDE_TESTS=OFF ^
+            -DLLVM_INCLUDE_EXAMPLES=OFF ^
+            -DLLVM_INCLUDE_BENCHMARKS=OFF ^
+            -DLLVM_INCLUDE_DOCS=OFF ^
+            -DCLANG_INCLUDE_TESTS=OFF ^
+            -DCLANG_INCLUDE_DOCS=OFF ^
+            -DLLVM_BUILD_TOOLS=ON ^
+            -DCLANG_BUILD_TOOLS=ON ^
+            -DLLVM_ENABLE_DIA_SDK=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build %LLVM_BUILD% --config Release --parallel %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+          mkdir %LLVM_ROOT_FLAT%\include
+          mkdir %LLVM_ROOT_FLAT%\lib
+          mkdir %LLVM_ROOT_FLAT%\bin
+          xcopy /y /e /i %LLVM_SRC%\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          if exist %LLVM_SRC%\clang\include\clang-c xcopy /y /e /i %LLVM_SRC%\clang\include\clang-c %LLVM_ROOT_FLAT%\include\clang-c >nul
+          xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
+          if exist %LLVM_SRC%\llvm\include\llvm-c xcopy /y /e /i %LLVM_SRC%\llvm\include\llvm-c %LLVM_ROOT_FLAT%\include\llvm-c >nul
+          xcopy /y /e /i %LLVM_BUILD%\include\llvm %LLVM_ROOT_FLAT%\include\llvm >nul
+          if exist %LLVM_BUILD%\tools\clang\include\clang xcopy /y /e /i %LLVM_BUILD%\tools\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          if exist %LLVM_BUILD%\projects\clang\include\clang xcopy /y /e /i %LLVM_BUILD%\projects\clang\include\clang %LLVM_ROOT_FLAT%\include\clang >nul
+          copy /y %LLVM_BUILD%\lib\*.lib %LLVM_ROOT_FLAT%\lib\ >nul
+          if exist %LLVM_BUILD%\bin\clang-cl.exe copy /y %LLVM_BUILD%\bin\clang-cl.exe %LLVM_ROOT_FLAT%\bin\clang-cl.exe >nul
+          if exist %LLVM_BUILD%\bin\clang.exe copy /y %LLVM_BUILD%\bin\clang.exe %LLVM_ROOT_FLAT%\bin\clang.exe >nul
+          if not exist %LLVM_ROOT_FLAT%\include\clang\AST\ASTConsumer.h ( echo ERROR: ASTConsumer.h missing & exit /b 1 )
+          if not exist %LLVM_ROOT_FLAT%\include\clang\Basic\DiagnosticCommonKinds.inc ( echo ERROR: DiagnosticCommonKinds.inc missing & exit /b 1 )
+          if not exist %LLVM_ROOT_FLAT%\include\llvm\Frontend\OpenMP\OMP.inc ( echo ERROR: OMP.inc missing & exit /b 1 )
+          if not exist %LLVM_ROOT_FLAT%\lib\clangTooling.lib ( echo ERROR: clangTooling.lib missing & exit /b 1 )
+          if not exist %LLVM_ROOT_FLAT%\bin\clang-cl.exe ( echo ERROR: clang-cl.exe missing & exit /b 1 )
+
+      - name: Verify LLVM_ROOT with clang-cl
+        shell: pwsh
+        run: |
+          $Root = Join-Path "${{ runner.workspace }}" "llvm_root_clangcl"
+          foreach ($p in @(
+            "include\clang\AST\ASTConsumer.h",
+            "include\clang\Basic\DiagnosticCommonKinds.inc",
+            "include\llvm\Frontend\OpenMP\OMP.inc",
+            "lib\clangTooling.lib",
+            "bin\clang-cl.exe")) {
+            $full = Join-Path $Root $p
+            if (-not (Test-Path $full)) { throw "Missing $full" }
+          }
+          Write-Host "LLVM_ROOT=$Root"
+          & (Join-Path $Root "bin\clang-cl.exe") --version
+
+  codex-gn-clangcl-release:
+    name: "Layer 2 · GN + clang-cl build + GitHub Release"
+    runs-on: windows-latest
+    needs: llvm-clangcl-toolchain
+
+    steps:
+      - name: Checkout codex-lan-agent sources
+        uses: actions/checkout@v4
+
+      - name: Enforce repo upload policy
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/verify_repo_upload_policy.ps1
+
+      - name: Probe MSVC (vcvars64 path)
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $VS_INSTALL = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $VS_INSTALL) { throw "Visual Studio C++ tools not found" }
+          $vcvars = Join-Path $VS_INSTALL "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "vcvars: $vcvars"
+
+      - name: Restore cached LLVM_ROOT with clang-cl
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/llvm_root_clangcl
+          key: ${{ env.LLVM_CACHE_KEY }}
+          fail-on-cache-miss: true
+
+      - name: GN generate + clang-cl build + package
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          set REPO=%CD%
+          set LLVM_ROOT=%RUNNER_WORKSPACE%\llvm_root_clangcl
+          set PATH=%LLVM_ROOT%\bin;%PATH%
+          set CODEX_LLVM_ROOT=%LLVM_ROOT%
+          clang-cl.exe --version
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build_gn_clangcl_release.ps1 ^
+            -RepoRoot "%CD%" ^
+            -BuildDir "%CD%\build_gn_clangcl_x64" ^
+            -LlvmRoot "%LLVM_ROOT%" ^
+            -GnUrl "${{ github.event.inputs.gn_url }}" ^
+            -TargetCpu x64
+          if errorlevel 1 exit /b 1
+
+      - name: Create GitHub Release and upload GN clang-cl artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $Zip = Join-Path (Get-Location) "build_gn_clangcl_x64\codex_lan_agent-windows-x64-clangcl-gn.zip"
+          if (-not (Test-Path $Zip)) { throw "zip missing: $Zip" }
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ github.event.inputs.tag }}' -ne '') {
+            $Tag = '${{ github.event.inputs.tag }}'
+          } elseif ('${{ github.ref_type }}' -eq 'tag') {
+            $Tag = '${{ github.ref_name }}'
+          } else {
+            $Tag = 'v' + (Get-Date -Format 'yyyy.MM.dd') + '-clangcl-gn'
+          }
+          $Sha = (git rev-parse HEAD).Substring(0,7)
+          $Layer1Hit = '${{ needs.llvm-clangcl-toolchain.outputs.cache_hit }}'
+          $NotesLines = @(
+            "## codex_lan_agent $Tag (Windows x64 · GN + clang-cl)",
+            "",
+            "### Build path",
+            "- GN is downloaded at workflow runtime from the configured network source and is not committed.",
+            "- ``.gn``, ``BUILD.gn``, and ``.gn_bootstrap_codex/`` are generated temporarily by ``scripts/build_gn_clangcl_release.ps1`` and removed after packaging.",
+            "- LLVM/Clang 18.1.8 is built from official source and cached as ``LLVM_ROOT`` with ``bin/clang-cl.exe``, ``include/``, and ``lib/``.",
+            "- The final binary is compiled through GN-generated Ninja using ``clang-cl.exe``.",
+            "",
+            "### Cache and provenance",
+            "- LLVM cache key: ``${{ env.LLVM_CACHE_KEY }}``",
+            "- LLVM cache hit: $Layer1Hit",
+            "- Commit sha: $Sha",
+            "- Release artifact: ``codex_lan_agent-windows-x64-clangcl-gn.zip``",
+            "",
+            "### Repository upload policy",
+            "- Third-party/network sources and generated artifacts are not tracked.",
+            "- The workflow blocks tracked ``third_party/``, ``vendor/``, ``deps/``, ``external/``, binaries, libraries, archives, and installers."
+          )
+          $Notes = $NotesLines -join "`n"
+          $NotesFile = Join-Path $env:RUNNER_TEMP "release_notes_$Tag.md"
+          $Notes | Out-File -FilePath $NotesFile -Encoding utf8
+          gh release view $Tag --repo '${{ github.repository }}' 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Deleting existing GitHub Release $Tag before republish; git tag is preserved."
+            gh release delete $Tag --repo '${{ github.repository }}' --yes
+            if ($LASTEXITCODE -ne 0) { throw "gh release delete failed" }
+          }
+          gh release create $Tag --repo '${{ github.repository }}' --title "codex_lan_agent $Tag · Windows x64 (GN + clang-cl)" --notes-file $NotesFile --target '${{ github.sha }}' $Zip
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
