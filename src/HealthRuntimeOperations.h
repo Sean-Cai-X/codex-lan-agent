@@ -12,7 +12,6 @@ struct RuntimeEndpointHealthSnapshot {
     std::string embedding_endpoint_source = "unreachable";
     std::string local_chat_endpoint_source = "unreachable";
 };
-
 RuntimeEndpointHealthSnapshot ResolveRuntimeEndpointHealth(
     const AgentConfig & config,
     bool * cache_hit,
@@ -28,36 +27,44 @@ RuntimeEndpointHealthSnapshot ResolveRuntimeEndpointHealth(
         + config.local_chat_endpoint;
     const auto now = std::chrono::steady_clock::now();
 
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    if (cache_valid && cache_key == current_key && now < cache_expires_at) {
-        if (cache_hit != nullptr) {
-            *cache_hit = true;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (cache_valid && cache_key == current_key && now < cache_expires_at) {
+            if (cache_hit != nullptr) {
+                *cache_hit = true;
+            }
+            if (probe_duration_ms != nullptr) {
+                *probe_duration_ms = 0;
+            }
+            return cached;
         }
-        if (probe_duration_ms != nullptr) {
-            *probe_duration_ms = 0;
-        }
-        return cached;
     }
 
     if (cache_hit != nullptr) {
         *cache_hit = false;
     }
     const auto probe_started = std::chrono::steady_clock::now();
+    constexpr int kHealthProbeTimeoutMs = 500;
 
+    // Network probes intentionally run without the cache mutex. A slow or unreachable
+    // optional endpoint must not serialize every health request behind one probe.
     RuntimeEndpointHealthSnapshot refreshed;
     refreshed.generation_ready = !config.generation_endpoint.empty()
-        && codex_lan_agent::CheckTcpEndpoint(config.generation_endpoint, 2000, &refreshed.generation_detail);
+        && codex_lan_agent::CheckTcpEndpoint(
+            config.generation_endpoint,
+            kHealthProbeTimeoutMs,
+            &refreshed.generation_detail);
     refreshed.embedding_ready = ResolveReachableEndpoint(
         config.embedding_endpoint,
         DeriveEmbeddingFallbackEndpoint(config),
-        2000,
+        kHealthProbeTimeoutMs,
         &refreshed.effective_embedding_endpoint,
         &refreshed.embedding_detail,
         &refreshed.embedding_endpoint_source);
     refreshed.local_chat_ready = ResolveReachableEndpoint(
         config.local_chat_endpoint,
         DeriveLocalChatFallbackEndpoint(config),
-        2000,
+        kHealthProbeTimeoutMs,
         &refreshed.effective_local_chat_endpoint,
         &refreshed.local_chat_detail,
         &refreshed.local_chat_endpoint_source);
@@ -68,10 +75,13 @@ RuntimeEndpointHealthSnapshot ResolveRuntimeEndpointHealth(
             probe_finished - probe_started).count();
     }
 
-    cached = refreshed;
-    cache_key = current_key;
-    cache_valid = true;
-    cache_expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cached = refreshed;
+        cache_key = current_key;
+        cache_valid = true;
+        cache_expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    }
     return refreshed;
 }
 

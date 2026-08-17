@@ -1090,10 +1090,24 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
     }
     if (domain == "cxparser_preflight_guard") {
         return {
-            R"((defrule block-build-without-preflight
+            R"((defrule allow-build-target-auto-preflight
+                  (declare (salience 80))
+                  (mcp_tool_request (tool_name "lan_agent_build_target")
+                                    (build_dir ?build_dir&:(neq ?build_dir ""))
+                                    (preflight_status ?status&:(or (eq ?status "missing")
+                                                                   (eq ?status "false"))))
+                  =>
+                  (assert (clips_decision
+                      (domain "cxparser_preflight_guard")
+                      (target "lan_agent_build_target")
+                      (decision "allow")
+                      (verification "verified")
+                      (reason_code "auto_preflight_allowed")
+                      (next_action "lan_agent_build_target will perform internal auto-preflight before executing")
+                      (matched_rule "allow-build-target-auto-preflight")))))",
+            R"((defrule block-ctest-without-preflight
                   (declare (salience 70))
-                  (mcp_tool_request (tool_name ?tool&:(or (eq ?tool "lan_agent_build_target")
-                                                          (eq ?tool "lan_agent_run_ctest_target")))
+                  (mcp_tool_request (tool_name ?tool&:(eq ?tool "lan_agent_run_ctest_target"))
                                     (preflight_status ?status&:(or (eq ?status "missing")
                                                                    (eq ?status "false")
                                                                    (eq ?status "blocked"))))
@@ -1105,7 +1119,7 @@ std::vector<std::string> GetEmbeddedClipsRuleBlocks(const std::string & domain) 
                       (verification "not_verified")
                       (reason_code "missing_cxparser_preflight")
                       (next_action "call lan_agent_preflight_build_target or lan_agent_preflight_run_ctest_target first, then pass the returned preflight_ref")
-                      (matched_rule "block-build-without-preflight")))))",
+                      (matched_rule "block-ctest-without-preflight")))))",
             R"((defrule default-preflight-allow
                   (declare (salience -100))
                   (mcp_tool_request (tool_name ?tool))
@@ -1512,7 +1526,8 @@ std::string ResolveMcpChainRequestType(const std::string & tool_name) {
         || tool_name == "lan_agent_cmm_delete_project"
         || tool_name == "lan_agent_cmm_detect_changes"
         || tool_name == "local_cli"
-        || tool_name == "codex_local_cli") {
+        || tool_name == "codex_local_cli"
+        || tool_name == "lan_agent_run_command") {
         return "execution_task";
     }
     if (tool_name == "lan_agent_run_cxparser_flow") {
@@ -2942,6 +2957,11 @@ std::string BuildPreGuardRouteCallJson(
             &first_field,
             "content_base64",
             params.GetString("content_base64"));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "expected_file_hash",
+            params.GetString("expected_file_hash"));
         AppendJsonBoolField(
             &arguments_json,
             &first_field,
@@ -3015,6 +3035,67 @@ std::string BuildPreGuardRouteCallJson(
         first_field = false;
     }
 
+    if (route_target == "lan_agent_build_target") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(&arguments_json, &first_field, "build_dir", params.GetString("build_dir"));
+        AppendJsonStringField(&arguments_json, &first_field, "target", params.GetString("target"));
+        AppendJsonStringField(&arguments_json, &first_field, "config", params.GetString("config", "Release"));
+        AppendJsonStringField(&arguments_json, &first_field, "codex_llvm_root", params.GetString("codex_llvm_root"));
+        AppendJsonStringField(&arguments_json, &first_field, "preflight_ref", params.GetString("preflight_ref"));
+        AppendJsonStringField(&arguments_json, &first_field, "preflight_status", params.GetString("preflight_status"));
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "dry_run",
+            params.GetBool("dry_run", false),
+            true);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"timeout_sec\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("timeout_sec", 1800)));
+        arguments_json += ",\"stall_timeout_sec\":";
+        arguments_json += std::to_string(std::max(0, params.GetInt("stall_timeout_sec", 0)));
+        first_field = false;
+    }
+
+    if (route_target == "local_cli"
+        || route_target == "codex_local_cli"
+        || route_target == "lan_agent_run_command") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(&arguments_json, &first_field, "command", params.GetString("command"));
+        AppendJsonStringField(&arguments_json, &first_field, "task_id", params.GetString("task_id"));
+        AppendJsonStringField(&arguments_json, &first_field, "repo_root", params.GetString("repo_root"));
+        AppendJsonStringField(&arguments_json, &first_field, "action_id", params.GetString("action_id"));
+        AppendJsonStringField(&arguments_json, &first_field, "build_dir", params.GetString("build_dir"));
+        AppendJsonStringField(&arguments_json, &first_field, "target", params.GetString("target"));
+        AppendJsonStringField(&arguments_json, &first_field, "config", params.GetString("config", "Release"));
+        AppendJsonStringField(&arguments_json, &first_field, "log_path", params.GetString("log_path"));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "args_text",
+            FirstNonEmpty(
+                params.GetString("args_text"),
+                params.GetString("directory_path"),
+                params.GetString("path")));
+        AppendJsonStringField(&arguments_json, &first_field, "directory_path", params.GetString("directory_path"));
+        AppendJsonStringField(&arguments_json, &first_field, "path", params.GetString("path"));
+        AppendJsonStringField(&arguments_json, &first_field, "primary_intent", primary_intent);
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "dry_run",
+            params.GetBool("dry_run", false),
+            true);
+    }
+
     if (route_target == "lan_agent_scan_text_ranges") {
         AppendJsonStringField(
             &arguments_json,
@@ -3057,6 +3138,50 @@ std::string BuildPreGuardRouteCallJson(
             !Trim(probe_ref).empty() || params.GetBool("probe_ready", false));
     }
 
+    if (route_target == "lan_agent_replace_line_range_atomic") {
+        const int start_line = std::max(1, params.GetInt("start_line", 1));
+        const int end_line = std::max(start_line, params.GetInt("end_line", start_line));
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += std::string(1, '"') + "start_line" + std::string(1, '"') + ":" + std::to_string(start_line);
+        arguments_json += "," + std::string(1, '"') + "end_line" + std::string(1, '"') + ":" + std::to_string(end_line);
+        first_field = false;
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "new_content",
+            FirstNonEmpty(params.GetString("new_content"), params.GetString("content"), ""));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "new_content_base64",
+            FirstNonEmpty(params.GetString("new_content_base64"), params.GetString("content_base64"), ""));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "expected_range_hash",
+            params.GetString("expected_range_hash"));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "expected_anchor_text",
+            params.GetString("expected_anchor_text"));
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "allow_empty_content",
+            params.GetBool("allow_empty_content", primary_intent == "delete_lines"),
+            true);
+        AppendJsonStringField(&arguments_json, &first_field, "probe_ref", probe_ref);
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "probe_ready",
+            !Trim(probe_ref).empty() || params.GetBool("probe_ready", false),
+            !Trim(probe_ref).empty() || params.GetBool("probe_ready", false));
+    }
+
     if (route_target == "lan_agent_read_text_file") {
         const int start_line = params.GetInt("start_line", 1);
         const int max_lines = params.GetInt("max_lines", 500);
@@ -3068,6 +3193,12 @@ std::string BuildPreGuardRouteCallJson(
         arguments_json += ",\"max_lines\":";
         arguments_json += std::to_string(max_lines);
         first_field = false;
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "read_to_eof",
+            params.GetBool("read_to_eof", false),
+            true);
         AppendJsonStringField(&arguments_json, &first_field, "probe_ref", probe_ref);
         AppendJsonBoolField(
             &arguments_json,

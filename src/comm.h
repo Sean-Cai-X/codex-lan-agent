@@ -1233,7 +1233,7 @@ struct CommOperations final {
         if (request.path == "/mcp") {
             const std::string tool_name = ExtractJsonStringValue(request.body, "name");
             if (!tool_name.empty()) {
-                if (tool_name == "local_cli" || tool_name == "codex_local_cli") {
+                if (tool_name == "local_cli" || tool_name == "codex_local_cli" || tool_name == "lan_agent_run_command") {
                     const std::string local_command = ExtractJsonStringValue(request.body, "command");
                     if (!local_command.empty()) {
                         return tool_name + ":" + local_command;
@@ -1265,7 +1265,7 @@ struct CommOperations final {
         }
         if (request.path == "/mcp") {
             const std::string tool_name = ExtractJsonStringValue(request.body, "name");
-            if (tool_name == "local_cli" || tool_name == "codex_local_cli") {
+            if (tool_name == "local_cli" || tool_name == "codex_local_cli" || tool_name == "lan_agent_run_command") {
                 return "local_cli";
             }
             return "mcp";

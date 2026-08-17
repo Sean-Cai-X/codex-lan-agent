@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -1273,7 +1274,10 @@ std::string ResolveEffectiveTraceIdForToolCall(
     if (!trace_id.empty()) {
         return trace_id;
     }
-    return "trace-" + SanitizeDispatchToken(tool_name, "tool") + "-" + BuildRequestTimestampToken();
+    static std::atomic<unsigned long long> trace_sequence{0};
+    const auto sequence = trace_sequence.fetch_add(1, std::memory_order_relaxed);
+    return "trace-" + SanitizeDispatchToken(tool_name, "tool") + "-"
+        + BuildRequestTimestampToken() + "-" + std::to_string(sequence);
 }
 
 CommandResult ExecuteReadOnlyMcpToolForClipsContinuation(
@@ -4941,7 +4945,7 @@ bool HandleMcpRoute(
                 ExtractJsonString(request.body, "evidence_required"),
                 ExtractJsonString(request.body, "writeback_required"),
                 ExtractJsonString(request.body, "next_action_if_blocked"));
-        } else if (tool_name == "local_cli" || tool_name == "codex_local_cli") {
+        } else if (tool_name == "local_cli" || tool_name == "codex_local_cli" || tool_name == "lan_agent_run_command") {
             std::string cli_args_text = ExtractJsonString(request.body, "args_text");
             if (cli_args_text.empty()) {
                 cli_args_text = ExtractJsonString(request.body, "directory_path");

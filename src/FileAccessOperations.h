@@ -7,12 +7,16 @@
 #include "SemanticIntentLexicon.h"
 #include "types.h"
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <list>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 std::vector<std::string> SplitLinesPreserveText(const std::string & text);
@@ -107,6 +111,9 @@ std::string BuildJsonStringArrayFromStrings(const std::vector<std::string> & val
 }
 
 constexpr std::size_t kStructuredBodyPageByteLimit = 64 * 1024;
+constexpr std::size_t kReadTextFileCacheMaxEntries = 128;
+constexpr std::size_t kSearchCandidateCacheMaxEntries = 64;
+constexpr long long kSearchCandidateCacheTtlMs = 30000;
 
 std::vector<std::filesystem::path> BuildDirectoryAccessHelperCandidates(const AgentConfig & config) {
 #ifdef _WIN32
@@ -774,6 +781,338 @@ bool SearchTextShouldSkipDirectory(const std::filesystem::path & path) {
         || name == "cmm";
 }
 
+bool IsHeavyGeneratedDirectoryRoot(const std::filesystem::path & path) {
+    const std::string name = ToLowerAscii(path.filename().string());
+    return SearchTextShouldSkipDirectory(path)
+        || name == ".vs"
+        || name == ".vscode"
+        || name == ".idea"
+        || name == "node_modules"
+        || name == "out"
+        || name == "dist";
+}
+
+struct SearchCandidateCacheEntry {
+    std::vector<std::filesystem::path> candidates;
+    std::chrono::steady_clock::time_point stored_at;
+    std::list<std::string>::iterator lru_position;
+};
+
+std::mutex & SearchCandidateCacheMutex() {
+    static std::mutex cache_mutex;
+    return cache_mutex;
+}
+
+std::unordered_map<std::string, SearchCandidateCacheEntry> & SearchCandidateCache() {
+    static std::unordered_map<std::string, SearchCandidateCacheEntry> cache;
+    return cache;
+}
+
+std::list<std::string> & SearchCandidateCacheLru() {
+    static std::list<std::string> lru;
+    return lru;
+}
+
+std::string BuildSearchCandidateCacheKey(
+    const std::filesystem::path & normalized,
+    bool recursive) {
+    return normalized.string() + "|recursive=" + (recursive ? "true" : "false");
+}
+
+bool LookupSearchCandidateCache(
+    const std::string & cache_key,
+    std::vector<std::filesystem::path> * candidates) {
+    std::lock_guard<std::mutex> lock(SearchCandidateCacheMutex());
+    auto & cache = SearchCandidateCache();
+    auto found = cache.find(cache_key);
+    if (found == cache.end()) {
+        return false;
+    }
+    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - found->second.stored_at).count();
+    if (age_ms > kSearchCandidateCacheTtlMs) {
+        auto & lru = SearchCandidateCacheLru();
+        lru.erase(found->second.lru_position);
+        cache.erase(found);
+        return false;
+    }
+    auto & lru = SearchCandidateCacheLru();
+    lru.erase(found->second.lru_position);
+    lru.push_front(cache_key);
+    found->second.lru_position = lru.begin();
+    if (candidates != nullptr) {
+        *candidates = found->second.candidates;
+    }
+    return true;
+}
+
+void StoreSearchCandidateCache(
+    const std::string & cache_key,
+    const std::vector<std::filesystem::path> & candidates) {
+    std::lock_guard<std::mutex> lock(SearchCandidateCacheMutex());
+    auto & cache = SearchCandidateCache();
+    auto & lru = SearchCandidateCacheLru();
+    auto found = cache.find(cache_key);
+    if (found != cache.end()) {
+        lru.erase(found->second.lru_position);
+        lru.push_front(cache_key);
+        found->second.candidates = candidates;
+        found->second.stored_at = std::chrono::steady_clock::now();
+        found->second.lru_position = lru.begin();
+        return;
+    }
+    lru.push_front(cache_key);
+    cache.emplace(
+        cache_key,
+        SearchCandidateCacheEntry{candidates, std::chrono::steady_clock::now(), lru.begin()});
+    while (cache.size() > kSearchCandidateCacheMaxEntries && !lru.empty()) {
+        cache.erase(lru.back());
+        lru.pop_back();
+    }
+}
+
+CommandResult BuildHeavyDirectorySearchGuardResult(
+    const std::filesystem::path & normalized,
+    const std::string & path,
+    const std::string & query_text,
+    bool recursive,
+    int bounded_max_matches,
+    const std::string & trace_id) {
+    CommandResult result;
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["requested_path"] = path;
+    result.fields["normalized_path"] = normalized.string();
+    result.fields["path_type"] = "directory";
+    result.fields["query_text"] = query_text;
+    result.fields["recursive"] = recursive ? "true" : "false";
+    result.fields["candidate_file_count"] = "0";
+    result.fields["searched_file_count"] = "0";
+    result.fields["match_count"] = "0";
+    result.fields["max_matches"] = std::to_string(bounded_max_matches);
+    result.fields["truncated"] = "true";
+    result.fields["status"] = "success";
+    result.fields["result"] = "search_text_skipped_heavy_directory";
+    result.fields["summary"] = "search_text skipped heavy/generated directory root";
+    result.fields["analysis_allowed"] = "true";
+    result.fields["heavy_directory_guard_applied"] = "true";
+    result.fields["directory_skip_policy"] = "root_heavy_generated_directory";
+    result.fields["next_action"] = "search a narrower source directory or read a specific known file";
+    result.fields["content_payload_format"] = "text";
+    result.fields["content_payload_scope"] = "search_results";
+    result.fields["content_payload_boundary_safe"] = "true";
+    result.fields["content_text"] = "";
+    result.fields["content_begin"] = "content_begin<<<";
+    result.fields["content_end"] = ">>>content_end";
+    result.fields["content_begin_marker"] = "content_begin<<<";
+    result.fields["content_end_marker"] = ">>>content_end";
+    if (!trace_id.empty()) {
+        result.fields["trace_id"] = trace_id;
+    }
+    return result;
+}
+
+std::string BuildRgSearchCommandLine(
+    const std::filesystem::path & normalized,
+    const std::string & query_text,
+    bool recursive,
+    bool show_preview,
+    int bounded_max_matches) {
+    std::ostringstream command;
+    command << "rg.exe"
+            << " --line-number --no-heading --color never --fixed-strings"
+            << " --max-count " << std::max(1, bounded_max_matches);
+    if (!show_preview) {
+        command << " --only-matching";
+    }
+    if (!recursive) {
+        command << " --max-depth 1";
+    }
+    const std::vector<std::string> include_globs = {
+        "*.cpp", "*.cxx", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp",
+        "*.md", "*.txt", "*.json", "*.cfg", "*.clp", "*.ps1", "*.bat", "*.cmake"
+    };
+    for (const std::string & glob : include_globs) {
+        command << " --glob " << QuoteDirectoryAccessArgument(glob);
+    }
+    const std::vector<std::string> exclude_globs = {
+        "!**/.git/**",
+        "!**/build/**",
+        "!**/build*/**",
+        "!**/AIbuild/**",
+        "!**/logs/**",
+        "!**/third_party/**",
+        "!**/CMM/**",
+        "!**/node_modules/**",
+        "!**/dist/**",
+        "!**/out/**"
+    };
+    for (const std::string & glob : exclude_globs) {
+        command << " --glob " << QuoteDirectoryAccessArgument(glob);
+    }
+    command << " -- "
+            << QuoteDirectoryAccessArgument(query_text)
+            << " "
+            << QuoteDirectoryAccessArgument(normalized.string());
+    return command.str();
+}
+
+bool TryParseRgMatchLine(
+    const std::string & line,
+    std::string * file_path,
+    std::string * line_number,
+    std::string * preview) {
+    for (std::size_t colon = 0; colon < line.size(); ++colon) {
+        if (line[colon] != ':') {
+            continue;
+        }
+        const std::size_t next_colon = line.find(':', colon + 1);
+        if (next_colon == std::string::npos || next_colon == colon + 1) {
+            continue;
+        }
+        bool numeric = true;
+        for (std::size_t index = colon + 1; index < next_colon; ++index) {
+            if (!std::isdigit(static_cast<unsigned char>(line[index]))) {
+                numeric = false;
+                break;
+            }
+        }
+        if (!numeric) {
+            continue;
+        }
+        if (file_path != nullptr) {
+            *file_path = line.substr(0, colon);
+        }
+        if (line_number != nullptr) {
+            *line_number = line.substr(colon + 1, next_colon - colon - 1);
+        }
+        if (preview != nullptr) {
+            *preview = line.substr(next_colon + 1);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool TryRgSearchTextResult(
+    const AgentConfig & config,
+    const std::filesystem::path & normalized,
+    const std::string & path,
+    const std::string & query_text,
+    bool recursive,
+    bool show_preview,
+    int bounded_max_matches,
+    const std::string & trace_id,
+    bool is_directory,
+    CommandResult * rg_result) {
+    if (rg_result == nullptr || query_text.find('\n') != std::string::npos || query_text.find('\r') != std::string::npos) {
+        return false;
+    }
+
+    const std::string command_line =
+        BuildRgSearchCommandLine(normalized, query_text, recursive, show_preview, bounded_max_matches);
+    const std::string log_path = BuildLogPath(config, "search_text_rg");
+    codex_lan_agent::ProcessRunResult run_result;
+    std::string run_error;
+    if (!codex_lan_agent::RunCommandWithLog(
+            command_line,
+            normalized.parent_path().string(),
+            log_path,
+            30,
+            0,
+            &run_result,
+            &run_error)) {
+        return false;
+    }
+
+    std::string rg_output;
+    std::string read_error;
+    if (!ReadWholeFile(log_path, &rg_output, &read_error)) {
+        return false;
+    }
+
+    CommandResult result;
+    result.fields["requested_path"] = path;
+    result.fields["normalized_path"] = normalized.string();
+    result.fields["path_type"] = is_directory ? "directory" : "file";
+    result.fields["query_text"] = query_text;
+    result.fields["recursive"] = recursive ? "true" : "false";
+    result.fields["max_matches"] = std::to_string(bounded_max_matches);
+    result.fields["search_backend"] = "rg";
+    result.fields["rg_command"] = command_line;
+    result.fields["rg_log_path"] = log_path;
+    result.fields["rg_exit_code"] = std::to_string(run_result.exit_code);
+    result.fields["timed_out"] = run_result.timed_out ? "true" : "false";
+    result.fields["stalled"] = run_result.stalled ? "true" : "false";
+    result.fields["result_ref"] = log_path;
+    result.fields["evidence_ref"] = log_path;
+    if (!trace_id.empty()) {
+        result.fields["trace_id"] = trace_id;
+    }
+
+    if (run_result.timed_out || run_result.stalled) {
+        result.ok = false;
+        result.exit_code = run_result.exit_code;
+        result.fields["status"] = "failed";
+        result.fields["result"] = "search_text_rg_interrupted";
+        result.fields["summary"] = "rg search interrupted by timeout or stall guard";
+        result.fields["error"] = "rg search interrupted";
+        result.fields["analysis_allowed"] = "false";
+        *rg_result = result;
+        return true;
+    }
+    if (run_result.exit_code > 1) {
+        return false;
+    }
+
+    std::ostringstream content;
+    std::vector<std::string> matched_files;
+    int match_count = 0;
+    std::istringstream input(rg_output);
+    std::string line;
+    while (std::getline(input, line) && match_count < bounded_max_matches) {
+        if (line.empty()) {
+            continue;
+        }
+        std::string matched_file;
+        std::string line_number;
+        std::string preview;
+        if (!TryParseRgMatchLine(line, &matched_file, &line_number, &preview)) {
+            continue;
+        }
+        if (std::find(matched_files.begin(), matched_files.end(), matched_file) == matched_files.end()) {
+            matched_files.push_back(matched_file);
+        }
+        content << matched_file << ":" << line_number;
+        if (show_preview) {
+            content << ":" << preview;
+        }
+        content << "\n";
+        ++match_count;
+    }
+
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["candidate_file_count"] = std::to_string(matched_files.size());
+    result.fields["searched_file_count"] = std::to_string(matched_files.size());
+    result.fields["match_count"] = std::to_string(match_count);
+    result.fields["truncated"] = match_count >= bounded_max_matches ? "true" : "false";
+    result.fields["status"] = "success";
+    result.fields["result"] = "search_text_complete";
+    result.fields["summary"] = "search_text match_count=" + std::to_string(match_count);
+    result.fields["analysis_allowed"] = "true";
+    result.fields["content_payload_format"] = "text";
+    result.fields["content_payload_scope"] = "search_results";
+    result.fields["content_payload_boundary_safe"] = "true";
+    result.fields["content_text"] = content.str();
+    result.fields["content_begin"] = "content_begin<<<";
+    result.fields["content_end"] = ">>>content_end";
+    result.fields["content_begin_marker"] = "content_begin<<<";
+    result.fields["content_end_marker"] = ">>>content_end";
+    *rg_result = result;
+    return true;
+}
+
 CommandResult SearchTextResult(
     const AgentConfig & config,
     const std::string & path,
@@ -824,8 +1163,39 @@ CommandResult SearchTextResult(
     }
 
     const int bounded_max_matches = std::max(1, std::min(max_matches > 0 ? max_matches : 100, 500));
+    if (is_directory && recursive && IsHeavyGeneratedDirectoryRoot(normalized)) {
+        return BuildHeavyDirectorySearchGuardResult(
+            normalized,
+            path,
+            query_text,
+            recursive,
+            bounded_max_matches,
+            trace_id);
+    }
+
+    CommandResult rg_result;
+    if (TryRgSearchTextResult(
+            config,
+            normalized,
+            path,
+            query_text,
+            recursive,
+            show_preview,
+            bounded_max_matches,
+            trace_id,
+            is_directory,
+            &rg_result)) {
+        return rg_result;
+    }
+
     std::vector<std::filesystem::path> candidates;
-    if (is_regular) {
+    bool search_candidate_cache_hit = false;
+    const std::string search_candidate_cache_key =
+        is_directory ? BuildSearchCandidateCacheKey(normalized, recursive) : std::string();
+    if (is_directory
+        && LookupSearchCandidateCache(search_candidate_cache_key, &candidates)) {
+        search_candidate_cache_hit = true;
+    } else if (is_regular) {
         candidates.push_back(normalized);
     } else if (recursive) {
         std::filesystem::recursive_directory_iterator it(normalized, std::filesystem::directory_options::skip_permission_denied, status_ec);
@@ -851,6 +1221,9 @@ CommandResult SearchTextResult(
                 candidates.push_back(it->path());
             }
         }
+    }
+    if (is_directory && !search_candidate_cache_hit) {
+        StoreSearchCandidateCache(search_candidate_cache_key, candidates);
     }
 
     std::ostringstream content;
@@ -890,6 +1263,9 @@ CommandResult SearchTextResult(
     result.fields["searched_file_count"] = std::to_string(searched_file_count);
     result.fields["match_count"] = std::to_string(match_count);
     result.fields["max_matches"] = std::to_string(bounded_max_matches);
+    result.fields["search_backend"] = "native";
+    result.fields["search_candidate_cache_hit"] = search_candidate_cache_hit ? "true" : "false";
+    result.fields["search_candidate_cache_ttl_ms"] = std::to_string(kSearchCandidateCacheTtlMs);
     result.fields["truncated"] = match_count >= bounded_max_matches ? "true" : "false";
     result.fields["status"] = "success";
     result.fields["result"] = "search_text_complete";
@@ -2445,6 +2821,112 @@ std::string StructuredPayloadFormatForPath(const std::filesystem::path & normali
     return "plain_text";
 }
 
+struct ReadTextFileCacheEntry {
+    CommandResult result;
+    std::list<std::string>::iterator lru_position;
+};
+
+std::mutex & ReadTextFileCacheMutex() {
+    static std::mutex cache_mutex;
+    return cache_mutex;
+}
+
+std::unordered_map<std::string, ReadTextFileCacheEntry> & ReadTextFileCache() {
+    static std::unordered_map<std::string, ReadTextFileCacheEntry> cache;
+    return cache;
+}
+
+std::list<std::string> & ReadTextFileCacheLru() {
+    static std::list<std::string> lru;
+    return lru;
+}
+
+std::string BuildReadTextFileCacheStamp(const std::filesystem::path & normalized_path) {
+    std::error_code size_ec;
+    const std::uintmax_t file_bytes = std::filesystem::file_size(normalized_path, size_ec);
+    std::error_code time_ec;
+    const auto write_time = std::filesystem::last_write_time(normalized_path, time_ec);
+    std::ostringstream stamp;
+    stamp << (size_ec ? 0 : file_bytes)
+          << ":"
+          << (time_ec ? 0 : write_time.time_since_epoch().count());
+    return stamp.str();
+}
+
+std::string BuildReadTextFileCacheKey(
+    const std::filesystem::path & normalized_path,
+    int max_lines,
+    int start_line,
+    std::size_t start_byte_offset) {
+    std::ostringstream key;
+    key << normalized_path.string()
+        << "|stamp=" << BuildReadTextFileCacheStamp(normalized_path)
+        << "|max_lines=" << (max_lines > 0 ? max_lines : 500)
+        << "|start_line=" << (start_line > 0 ? start_line : 1)
+        << "|start_byte_offset=" << start_byte_offset;
+    return key.str();
+}
+
+bool LookupReadTextFileCache(
+    const std::string & cache_key,
+    CommandResult * cached_result) {
+    std::lock_guard<std::mutex> lock(ReadTextFileCacheMutex());
+    auto & cache = ReadTextFileCache();
+    auto found = cache.find(cache_key);
+    if (found == cache.end()) {
+        return false;
+    }
+    auto & lru = ReadTextFileCacheLru();
+    lru.erase(found->second.lru_position);
+    lru.push_front(cache_key);
+    found->second.lru_position = lru.begin();
+    if (cached_result) {
+        *cached_result = found->second.result;
+    }
+    return true;
+}
+
+void StoreReadTextFileCache(const std::string & cache_key, const CommandResult & result) {
+    if (!result.ok) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ReadTextFileCacheMutex());
+    auto & cache = ReadTextFileCache();
+    auto & lru = ReadTextFileCacheLru();
+    auto found = cache.find(cache_key);
+    if (found != cache.end()) {
+        lru.erase(found->second.lru_position);
+        lru.push_front(cache_key);
+        found->second.result = result;
+        found->second.lru_position = lru.begin();
+        return;
+    }
+    lru.push_front(cache_key);
+    cache.emplace(cache_key, ReadTextFileCacheEntry{result, lru.begin()});
+    while (cache.size() > kReadTextFileCacheMaxEntries && !lru.empty()) {
+        cache.erase(lru.back());
+        lru.pop_back();
+    }
+}
+
+CommandResult MarkReadTextFileCacheHit(
+    CommandResult cached,
+    const std::string & cache_key,
+    const std::string & trace_id,
+    const std::string & probe_ref) {
+    cached.fields["cache_hit"] = "true";
+    cached.fields["cache_scope"] = "process_lru";
+    cached.fields["cache_key"] = cache_key;
+    if (!trace_id.empty()) {
+        cached.fields["trace_id"] = trace_id;
+    }
+    if (!probe_ref.empty()) {
+        cached.fields["probe_ref"] = probe_ref;
+        cached.fields["probe_ready"] = "true";
+    }
+    return cached;
+}
+
 CommandResult ReadTextFileResult(
     const AgentConfig & config,
     const std::string & file_path,
@@ -2484,6 +2966,16 @@ CommandResult ReadTextFileResult(
         result.fields["next_action"] = "add the target project root to allowed_roots or retry with a path under an allowed root";
         return result;
     }
+
+    const std::string read_cache_key =
+        BuildReadTextFileCacheKey(normalized, max_lines, start_line, start_byte_offset);
+    CommandResult cached_read_result;
+    if (LookupReadTextFileCache(read_cache_key, &cached_read_result)) {
+        return MarkReadTextFileCacheHit(cached_read_result, read_cache_key, trace_id, probe_ref);
+    }
+    result.fields["cache_hit"] = "false";
+    result.fields["cache_scope"] = "process_lru";
+    result.fields["cache_key"] = read_cache_key;
 
     const bool structured_body_read = IsStructuredBodyReadCandidate(normalized);
     result.fields["structured_body_read_mode"] = structured_body_read ? "native_structured_body" : "disabled";
@@ -2525,6 +3017,10 @@ CommandResult ReadTextFileResult(
             result_from_helper.fields["file_path"] = file_path;
             if (!trace_id.empty()) {
                 result_from_helper.fields["trace_id"] = trace_id;
+            }
+            if (!probe_ref.empty()) {
+                result_from_helper.fields["probe_ref"] = probe_ref;
+                result_from_helper.fields["probe_ready"] = "true";
             }
             result_from_helper.fields["normalized_path"] = normalized.string();
             result_from_helper.fields["current_file_path"] = normalized.string();
@@ -2576,6 +3072,10 @@ CommandResult ReadTextFileResult(
                 result_from_helper.fields["directory_access_helper_log_path"];
             result_from_helper.fields["structured_body_read_mode"] = "helper_line_page";
             result_from_helper.fields["structured_body_helper_bypassed"] = "false";
+            result_from_helper.fields["read_mode"] = "helper_line_page";
+            result_from_helper.fields["cache_hit"] = "false";
+            result_from_helper.fields["cache_scope"] = "process_lru";
+            result_from_helper.fields["cache_key"] = read_cache_key;
             if (has_more) {
             result_from_helper.fields["continue_required"] = "true";
             result_from_helper.fields["auto_continue_required"] = "true";
@@ -2605,6 +3105,7 @@ CommandResult ReadTextFileResult(
             result_from_helper.fields["next_tool_name"] = "";
             result_from_helper.fields["next_call_json"] = "";
             }
+            StoreReadTextFileCache(read_cache_key, result_from_helper);
             return result_from_helper;
         }
     }
@@ -2724,6 +3225,7 @@ CommandResult ReadTextFileResult(
                 : "";
             result.fields["required_tool_name"] = has_more ? "lan_agent_read_text_file" : "";
             result.fields["required_tool_arguments_json"] = result.fields["next_call_json"];
+            StoreReadTextFileCache(read_cache_key, result);
             return result;
         }
     }
@@ -2846,6 +3348,7 @@ CommandResult ReadTextFileResult(
     result.fields["remaining_bytes"] = "0";
     result.fields["next_byte_offset"] = "";
     ApplyDirectoryBatchProgress(config, trace_id, normalized.string(), &result);
+    StoreReadTextFileCache(read_cache_key, result);
     return result;
 }
 
@@ -3125,6 +3628,125 @@ CommandResult TailTextFileResult(
     return result;
 }
 
+CommandResult BuildHeavyDirectoryPreviewResult(
+    const AgentConfig & config,
+    const std::filesystem::path & normalized,
+    const std::string & directory_path,
+    int max_entries,
+    const std::string & trace_id,
+    const std::string & primary_intent) {
+    CommandResult result;
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["task_type"] = "directory_list";
+    result.fields["directory_path"] = directory_path;
+    result.fields["normalized_path"] = normalized.string();
+    if (!primary_intent.empty()) {
+        result.fields["primary_intent"] = NormalizeLocalAiPrimaryIntent(primary_intent);
+    }
+    if (!trace_id.empty()) {
+        result.fields["trace_id"] = trace_id;
+    }
+
+    const int bounded_max_entries = std::max(1, std::min(max_entries > 0 ? max_entries : 200, 200));
+    std::vector<std::string> all_entry_labels;
+    std::vector<std::string> preview_files;
+    std::vector<std::string> preview_file_names;
+    int returned_count = 0;
+    int seen_count = 0;
+    int file_count = 0;
+    int directory_count = 0;
+
+    std::error_code iterate_ec;
+    std::filesystem::directory_iterator it(
+        normalized,
+        std::filesystem::directory_options::skip_permission_denied,
+        iterate_ec);
+    const std::filesystem::directory_iterator end;
+    for (; it != end && !iterate_ec; it.increment(iterate_ec)) {
+        ++seen_count;
+        std::error_code entry_ec;
+        const bool is_directory = it->is_directory(entry_ec);
+        entry_ec.clear();
+        const bool is_file = it->is_regular_file(entry_ec);
+        if (is_directory) {
+            ++directory_count;
+        } else if (is_file) {
+            ++file_count;
+        }
+        if (returned_count >= bounded_max_entries) {
+            continue;
+        }
+        const std::string type = is_directory ? "[dir] " : "[file] ";
+        const std::string label = type + it->path().filename().string();
+        result.fields["entry_" + std::to_string(returned_count)] = label;
+        all_entry_labels.push_back(label);
+        if (is_file) {
+            preview_files.push_back(it->path().string());
+            preview_file_names.push_back(it->path().filename().string());
+        }
+        ++returned_count;
+    }
+
+    const bool truncated = seen_count > returned_count || static_cast<int>(preview_files.size()) < file_count;
+    result.fields["entry_count"] = std::to_string(returned_count);
+    result.fields["returned_count"] = std::to_string(returned_count);
+    result.fields["total_entries"] = std::to_string(seen_count);
+    result.fields["total_entries_lower_bound"] = std::to_string(seen_count);
+    result.fields["file_count"] = std::to_string(file_count);
+    result.fields["directory_count"] = std::to_string(directory_count);
+    result.fields["entry_labels_json"] = BuildJsonStringArrayFromStrings(all_entry_labels);
+    result.fields["file_paths_json"] = BuildJsonStringArrayFromStrings(preview_files);
+    result.fields["file_names_json"] = BuildJsonStringArrayFromStrings(preview_file_names);
+    result.fields["file_paths_total_count"] = std::to_string(file_count);
+    result.fields["file_names_total_count"] = std::to_string(file_count);
+    result.fields["response_preview_truncated"] = truncated ? "true" : "false";
+    result.fields["directory_preview_truncated"] = truncated ? "true" : "false";
+    result.fields["remaining_entries"] = truncated
+        ? std::to_string(std::max(0, seen_count - returned_count))
+        : "0";
+    result.fields["read_mode"] = "directory_preview_guarded";
+    result.fields["directory_listing_mode"] = "fast_heavy_directory_preview";
+    result.fields["heavy_directory_guard_applied"] = "true";
+    result.fields["directory_access_helper_used"] = "false";
+    result.fields["directory_listing_complete"] = truncated ? "false" : "true";
+    result.fields["known_file_list_complete"] = truncated ? "false" : "true";
+    result.fields["batch_manifest_path"] = "";
+    result.fields["batch_manifest_ready"] = "false";
+    result.fields["batch_manifest_complete"] = "false";
+    result.fields["batch_total_files"] = std::to_string(file_count);
+    result.fields["batch_read_file_count"] = "0";
+    result.fields["remaining_batch_file_count"] = "0";
+    result.fields["code_file_count"] = "0";
+    result.fields["remaining_code_file_count"] = "0";
+    result.fields["batch_completion"] = "complete";
+    result.fields["content_read_completion"] = "complete";
+    result.fields["incomplete_scope"] = "";
+    result.fields["next_batch_file_path"] = "";
+    result.fields["next_batch_tool_name"] = "";
+    result.fields["next_tool_name"] = "";
+    result.fields["next_file_path"] = "";
+    result.fields["next_start_line"] = "";
+    result.fields["next_max_lines"] = "";
+    result.fields["next_call_json"] = "";
+    result.fields["required_tool_name"] = "";
+    result.fields["required_tool_arguments_json"] = "";
+    result.fields["continue_required"] = "false";
+    result.fields["auto_continue_required"] = "false";
+    result.fields["user_confirmation_required"] = "false";
+    result.fields["analysis_allowed"] = "true";
+    result.fields["analysis_blocked_reason"] = "";
+    result.fields["task_completion"] = "complete";
+    result.fields["result"] = "directory_list_preview_guarded";
+    result.fields["outcome_hint"] = "PASS";
+    result.fields["summary"] = "directory preview returned with heavy-directory guard";
+    result.fields["next_action"] = "read a specific file or list a narrower subdirectory when more detail is needed";
+    result.fields["result_ref"] = "";
+    result.fields["evidence_ref"] = "";
+    (void)config;
+    return result;
+}
+
 CommandResult ListDirectoryResult(
     const AgentConfig & config,
     const std::string & directory_path,
@@ -3176,6 +3798,16 @@ CommandResult ListDirectoryResult(
         result.exit_code = 34;
         result.fields["error"] = "path is not a directory";
         return result;
+    }
+
+    if (IsHeavyGeneratedDirectoryRoot(normalized)) {
+        return BuildHeavyDirectoryPreviewResult(
+            config,
+            normalized,
+            directory_path,
+            max_entries,
+            effective_trace_id,
+            primary_intent);
     }
 
     const CommandResult helper_result = RunDirectoryAccessHelper(

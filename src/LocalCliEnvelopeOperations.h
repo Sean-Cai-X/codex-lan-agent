@@ -156,6 +156,21 @@ CommandResult LocalCliResult(
     const std::string & log_path,
     const std::string & args_text,
     bool dry_run) {
+    if (Trim(command).empty()) {
+        CommandResult result;
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "local_cli command is required";
+        result.fields["supported_commands"] =
+            "health,chat-status,task-latest,task,log-latest,diff,run-light,build-target,test-result,thread-report,mkdir";
+        result.fields["next_action"] =
+            "provide command from supported_commands, or use a specialized lan_agent_* tool";
+        return BuildLocalCliEnvelope(
+            config,
+            command,
+            result,
+            "{\"command\":\"health\",\"reason\":\"missing local_cli command\"}");
+    }
     if (command == "health") {
         return BuildLocalCliEnvelope(config, command, BuildLivenessResult(config), "null");
     }

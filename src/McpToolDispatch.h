@@ -2,8 +2,13 @@
 
 #include "CmmToolResults.h"
 #include "ClangAstTool.h"
+#include "ProcessRunner.h"
 
 #include <filesystem>
+#include <fstream>
+#include <cctype>
+#include <cstdlib>
+#include <vector>
 
 CommandResult BuildBuildTargetPreflightResult(
     const std::string & build_dir,
@@ -15,6 +20,18 @@ CommandResult BuildRunCtestPreflightResult(
     const std::string & build_dir,
     const std::string & config_name,
     const std::string & test_regex);
+CommandResult LocalCliResult(
+    const AgentConfig & config,
+    const std::string & command,
+    const std::string & task_id,
+    const std::string & repo_root,
+    const std::string & action_id,
+    const std::string & build_dir,
+    const std::string & target,
+    const std::string & config_name,
+    const std::string & log_path,
+    const std::string & args_text,
+    bool dry_run);
 bool TryParsePreflightReference(
     const std::string & preflight_ref,
     const std::string & expected_tool_name,
@@ -116,6 +133,12 @@ CommandResult WriteTextFileResult(
     const std::string & file_path,
     const std::string & content,
     bool append);
+CommandResult WriteWholeTextViaOptfileResult(
+    const AgentConfig & config,
+    const std::string & file_path,
+    const std::string & content,
+    bool append,
+    const std::string & expected_file_hash);
 CommandResult ApplySingleFilePatchResult(
     const AgentConfig & config,
     const std::string & file_path,
@@ -959,11 +982,30 @@ std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     AppendJsonStringField(&json, &first, "data", params.GetString("data"));
     AppendJsonStringField(&json, &first, "data_base64", params.GetString("data_base64"));
     AppendJsonStringField(&json, &first, "anchor_text", params.GetString("anchor_text"));
+    AppendJsonStringField(&json, &first, "build_dir", params.GetString("build_dir"));
+    AppendJsonStringField(&json, &first, "target", params.GetString("target"));
+    AppendJsonStringField(&json, &first, "config", params.GetString("config"));
+    AppendJsonStringField(&json, &first, "command", params.GetString("command"));
+    AppendJsonStringField(&json, &first, "args_text", params.GetString("args_text"));
+    AppendJsonStringField(&json, &first, "path", params.GetString("path"));
+    AppendJsonStringField(&json, &first, "task_id", params.GetString("task_id"));
+    AppendJsonStringField(&json, &first, "repo_root", params.GetString("repo_root"));
+    AppendJsonStringField(&json, &first, "action_id", params.GetString("action_id"));
+    AppendJsonStringField(&json, &first, "log_path", params.GetString("log_path"));
+    AppendJsonStringField(&json, &first, "codex_llvm_root", params.GetString("codex_llvm_root"));
+    AppendJsonStringField(&json, &first, "preflight_ref", params.GetString("preflight_ref"));
+    AppendJsonStringField(&json, &first, "preflight_status", params.GetString("preflight_status"));
     AppendJsonStringField(&json, &first, "scan_mode", params.GetString("scan_mode", primary_intent == "comment_cleanup" ? "comments" : ""));
 
     AppendJsonStringField(&json, &first, "trace_id", params.GetString("trace_id"));
     AppendJsonStringField(&json, &first, "request_id", params.GetString("request_id"));
     AppendJsonStringField(&json, &first, "probe_ref", params.GetString("probe_ref"));
+    AppendJsonStringField(&json, &first, "expected_file_hash", params.GetString("expected_file_hash"));
+    AppendJsonStringField(&json, &first, "expected_range_hash", params.GetString("expected_range_hash"));
+    AppendJsonStringField(&json, &first, "expected_anchor_text", params.GetString("expected_anchor_text"));
+    AppendJsonStringField(&json, &first, "expected_anchor_hash", params.GetString("expected_anchor_hash"));
+    AppendJsonBoolField(&json, &first, "read_to_eof", params.GetBool("read_to_eof", false), true);
+    AppendJsonBoolField(&json, &first, "allow_empty_content", params.GetBool("allow_empty_content", primary_intent == "delete_lines"), true);
     AppendJsonBoolField(&json, &first, "probe_ready", params.GetBool("probe_ready", false), params.GetBool("probe_ready", false));
     AppendJsonBoolField(&json, &first, "append", params.GetBool("append", false), true);
     AppendJsonBoolField(&json, &first, "recursive", params.GetBool("recursive", true), true);
@@ -984,13 +1026,23 @@ std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     append_int_param("max_lines", 200, 1);
     append_int_param("max_matches", 100, 1);
     append_int_param("max_bytes", 65536, 1);
-    // 透传 dry_run（可能在顶层或 arguments 子对象中）
-    bool dry_run_val = params.GetBool("dry_run", true);
+    append_int_param("timeout_sec", 1800, 1);
+    append_int_param("stall_timeout_sec", 0, 0);
+    // 透传 dry_run（可能在顶层或 arguments 子对象中）。
+    // Build routes already require preflight_ref, so their default is execution.
+    const std::string primary_intent_lower = ToLowerAscii(primary_intent);
+    const bool build_route_request =
+        primary_intent_lower == "build"
+        || primary_intent_lower == "build_target"
+        || primary_intent_lower == "compile"
+        || (!Trim(params.GetString("build_dir")).empty()
+            && !Trim(params.GetString("target")).empty());
+    bool dry_run_val = params.GetBool("dry_run", build_route_request ? false : true);
     if (dry_run_val) {
         const std::string args_json = params.GetRawJson("arguments", "");
         if (!args_json.empty()) {
             JsonRequestView args_view(args_json);
-            dry_run_val = args_view.GetBool("dry_run", true);
+            dry_run_val = args_view.GetBool("dry_run", build_route_request ? false : true);
         }
     }
     AppendJsonBoolField(&json, &first, "dry_run", dry_run_val, true);
@@ -1029,9 +1081,9 @@ std::string ResolveRouteBySynonymAndPattern(
         {"replace_lines", "lan_agent_replace_line_range_atomic"},
         {"replace", "lan_agent_replace_line_range_atomic"},
         {"replace_text", "lan_agent_replace_line_range_atomic"},
-        {"delete_lines", "lan_agent_delete_text_range_window_atomic"},
-        {"delete", "lan_agent_delete_text_range_window_atomic"},
-        {"delete_text", "lan_agent_delete_text_range_window_atomic"},
+        {"delete_lines", "lan_agent_replace_line_range_atomic"},
+        {"delete", "lan_agent_replace_line_range_atomic"},
+        {"delete_text", "lan_agent_replace_line_range_atomic"},
         {"insert", "lan_agent_insert_after_anchor_atomic"},
         {"insert_after_anchor", "lan_agent_insert_after_anchor_atomic"},
         {"insert_text", "lan_agent_insert_after_anchor_atomic"},
@@ -1048,6 +1100,20 @@ std::string ResolveRouteBySynonymAndPattern(
         {"run_flow", "lan_agent_run_cxparser_flow"},
         {"run_script", "lan_agent_run_cxparser_flow"},
         {"execute_flow", "lan_agent_run_cxparser_flow"},
+        {"build", "lan_agent_build_target"},
+        {"build_target", "lan_agent_build_target"},
+        {"compile", "lan_agent_build_target"},
+        {"cmake_build", "lan_agent_build_target"},
+        {"run_command", "local_cli"},
+        {"run_cli", "local_cli"},
+        {"local_cli", "local_cli"},
+        {"codex_local_cli", "codex_local_cli"},
+        {"cli", "local_cli"},
+        {"cmd", "local_cli"},
+        {"command", "local_cli"},
+        {"shell", "local_cli"},
+        {"terminal", "local_cli"},
+        {"lan_agent_run_command", "local_cli"},
     };
     const std::string intent_lower = ToLowerAscii(Trim(primary_intent));
     {
@@ -1061,6 +1127,9 @@ std::string ResolveRouteBySynonymAndPattern(
     const bool has_content = !Trim(params.GetString("content")).empty();
     const bool has_content_base64 = !Trim(params.GetString("content_base64")).empty();
     const bool has_directory = !Trim(params.GetString("directory_path")).empty();
+    const bool has_build_dir = !Trim(params.GetString("build_dir")).empty();
+    const bool has_target = !Trim(params.GetString("target")).empty();
+    const bool has_command = !Trim(params.GetString("command")).empty();
     const bool has_query = !Trim(FirstNonEmpty(
         params.GetString("query_text"),
         params.GetString("text"),
@@ -1068,6 +1137,8 @@ std::string ResolveRouteBySynonymAndPattern(
     const bool has_start_line = !Trim(params.GetString("start_line")).empty();
     const bool has_end_line = !Trim(params.GetString("end_line")).empty();
     const bool has_anchor = !Trim(params.GetString("anchor_text")).empty();
+    if (has_build_dir && has_target) return "lan_agent_build_target";
+    if (has_command) return "local_cli";
     if (has_directory && has_query) return "lan_agent_search_text";
     if (has_directory) return "lan_agent_list_directory";
     if (has_file_path && has_anchor) return "lan_agent_insert_after_anchor_atomic";
@@ -1089,12 +1160,15 @@ std::string BuildCandidateToolsJson(const std::string & primary_intent) {
         {"lan_agent_append_text_file", "append_text, append, append_file"},
         {"lan_agent_insert_after_anchor_atomic", "insert, insert_after_anchor, insert_text"},
         {"lan_agent_replace_line_range_atomic", "replace_lines, replace, replace_text"},
-        {"lan_agent_delete_text_range_window_atomic", "delete_lines, delete, delete_text"},
+        {"lan_agent_replace_line_range_atomic", "replace_lines, replace, replace_text, delete_lines, delete, delete_text"},
         {"lan_agent_format_code_file", "code_format, format, format_code"},
         {"lan_agent_optfile_read", "optfile_read, read_optfile"},
         {"lan_agent_optfile_write_preview", "optfile_write_preview, preview_optfile_write"},
         {"lan_agent_optfile_apply_write", "optfile_apply_write, optfile_write, write_optfile"},
         {"lan_agent_run_cxparser_flow", "run_flow, run_script, execute_flow"},
+        {"lan_agent_build_target", "build, build_target, compile, cmake_build"},
+        {"local_cli", "run_command, run_cli, local_cli, cli, cmd, command, shell, terminal"},
+        {"codex_local_cli", "codex_local_cli"},
     };
     std::ostringstream json;
     json << "[";
@@ -1106,6 +1180,369 @@ std::string BuildCandidateToolsJson(const std::string & primary_intent) {
     }
     json << "]";
     return json.str();
+}
+
+std::string NormalizeMcpRouteTargetToolName(const std::string & target_tool_name) {
+    const std::string trimmed = Trim(target_tool_name);
+    const std::string lower = ToLowerAscii(trimmed);
+    if (lower == "lan_agent_run_command"
+        || lower == "run_command"
+        || lower == "run_cli"
+        || lower == "cli"
+        || lower == "cmd"
+        || lower == "command"
+        || lower == "shell"
+        || lower == "terminal") {
+        return "local_cli";
+    }
+    if (lower == "local_cli") {
+        return "local_cli";
+    }
+    if (lower == "codex_local_cli") {
+        return "codex_local_cli";
+    }
+    return trimmed;
+}
+
+struct BuildLogDiagnosticSummary {
+    std::string first_error;
+    std::string first_warning;
+    std::string excerpt;
+    int diagnostic_line_count = 0;
+};
+
+bool LooksLikeBuildErrorLine(const std::string & lower_line) {
+    return lower_line.find(": error ") != std::string::npos
+        || lower_line.find(" error c") != std::string::npos
+        || lower_line.find(" error lnk") != std::string::npos
+        || lower_line.find(" error msb") != std::string::npos
+        || lower_line.find("fatal error") != std::string::npos;
+}
+
+bool LooksLikeBuildWarningLine(const std::string & lower_line) {
+    return lower_line.find(": warning ") != std::string::npos
+        || lower_line.find(" warning c") != std::string::npos
+        || lower_line.find(" warning lnk") != std::string::npos
+        || lower_line.find(" warning msb") != std::string::npos;
+}
+
+std::string ClampDiagnosticLine(const std::string & line) {
+    constexpr std::size_t kMaxDiagnosticLineChars = 800;
+    if (line.size() <= kMaxDiagnosticLineChars) {
+        return line;
+    }
+    return line.substr(0, kMaxDiagnosticLineChars) + "...";
+}
+
+BuildLogDiagnosticSummary ExtractBuildLogDiagnosticSummary(const std::string & log_path) {
+    BuildLogDiagnosticSummary summary;
+    std::ifstream input(log_path, std::ios::binary);
+    if (!input) {
+        return summary;
+    }
+    std::string line;
+    std::vector<std::string> excerpt_lines;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const std::string trimmed = Trim(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        const std::string lower = ToLowerAscii(trimmed);
+        const bool is_error = LooksLikeBuildErrorLine(lower);
+        const bool is_warning = LooksLikeBuildWarningLine(lower);
+        if (!is_error && !is_warning) {
+            continue;
+        }
+        ++summary.diagnostic_line_count;
+        const std::string clamped = ClampDiagnosticLine(trimmed);
+        if (is_error && summary.first_error.empty()) {
+            summary.first_error = clamped;
+        }
+        if (is_warning && summary.first_warning.empty()) {
+            summary.first_warning = clamped;
+        }
+        if (excerpt_lines.size() < 8) {
+            excerpt_lines.push_back(clamped);
+        }
+    }
+    for (std::size_t i = 0; i < excerpt_lines.size(); ++i) {
+        if (i > 0) {
+            summary.excerpt += "\n";
+        }
+        summary.excerpt += excerpt_lines[i];
+    }
+    return summary;
+}
+
+CommandResult BuildLocalCliRegistryResult(
+    const AgentConfig & config,
+    const JsonRequestView & params,
+    const std::string & registry_tool_name) {
+    const std::string args_text = FirstNonEmpty(
+        params.GetString("args_text"),
+        params.GetString("directory_path"),
+        params.GetString("path"));
+    CommandResult result = LocalCliResult(
+        config,
+        params.GetString("command"),
+        params.GetString("task_id"),
+        params.GetString("repo_root"),
+        params.GetString("action_id"),
+        params.GetString("build_dir"),
+        params.GetString("target"),
+        params.GetString("config"),
+        params.GetString("log_path"),
+        args_text,
+        params.GetBool("dry_run", false));
+    result.fields["registry_tool_name"] = registry_tool_name;
+    result.fields["local_cli_route_registry_enabled"] = "true";
+    if (registry_tool_name == "lan_agent_run_command") {
+        result.fields["compat_alias_target"] = "local_cli";
+    }
+    return result;
+}
+
+bool IsSafeBuildToken(const std::string & value) {
+    if (value.empty() || value.size() > 160) {
+        return false;
+    }
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.' || ch == ':') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::string QuoteBuildCommandArgument(const std::string & value) {
+    std::string quoted = "\"";
+    for (const char ch : value) {
+        if (ch == '"') {
+            quoted += "\\\"";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted += "\"";
+    return quoted;
+}
+
+std::string ResolveCmakeCommandFromCache(const std::filesystem::path & cmake_cache_path) {
+    std::ifstream input(cmake_cache_path);
+    if (!input.is_open()) {
+        return "cmake";
+    }
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string prefix = "CMAKE_COMMAND:INTERNAL=";
+        if (line.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        std::string command = Trim(line.substr(prefix.size()));
+        if (command.size() >= 2 && command.front() == '"' && command.back() == '"') {
+            command = command.substr(1, command.size() - 2);
+        }
+        return command.empty() ? std::string("cmake") : command;
+    }
+    return "cmake";
+}
+
+CommandResult BuildLocalCmakeTargetResult(
+    const AgentConfig & config,
+    const std::string & raw_build_dir,
+    const std::string & raw_target,
+    const std::string & raw_config_name,
+    int timeout_sec,
+    int stall_timeout_sec,
+    bool dry_run,
+    const std::string & raw_codex_llvm_root) {
+    CommandResult result;
+    result.fields["result"] = dry_run ? "build_target_dry_run" : "build_target_executed";
+    result.fields["operation"] = "cmake_build_target";
+    result.fields["build_dir"] = raw_build_dir;
+    result.fields["target"] = raw_target;
+    result.fields["config"] = raw_config_name.empty() ? "Release" : raw_config_name;
+    result.fields["build_runner"] = "RunCommandWithLog";
+    result.fields["command_policy"] = "whitelisted_cmake_build_target";
+    result.fields["timeout_sec"] = std::to_string(std::max(1, timeout_sec));
+    result.fields["stall_timeout_sec"] = std::to_string(std::max(0, stall_timeout_sec));
+
+    if (Trim(raw_build_dir).empty() || Trim(raw_target).empty()) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "build_dir and target are required";
+        result.fields["summary"] = "build target request missing required arguments";
+        return result;
+    }
+
+    const std::string config_name = raw_config_name.empty() ? "Release" : raw_config_name;
+    if (!IsSafeBuildToken(raw_target)) {
+        result.ok = false;
+        result.exit_code = 422;
+        result.fields["error"] = "target contains unsupported characters";
+        result.fields["summary"] = "build target rejected by whitelist";
+        return result;
+    }
+    if (!IsSafeBuildToken(config_name)) {
+        result.ok = false;
+        result.exit_code = 422;
+        result.fields["error"] = "config contains unsupported characters";
+        result.fields["summary"] = "build config rejected by whitelist";
+        return result;
+    }
+
+    std::filesystem::path normalized_build_dir;
+    std::string path_error;
+    if (!TryResolveAllowedPath(config, raw_build_dir, &normalized_build_dir, &path_error)) {
+        result.ok = false;
+        result.exit_code = 403;
+        result.fields["error"] = path_error;
+        result.fields["summary"] = "build_dir is outside allowed roots";
+        return result;
+    }
+    result.fields["normalized_build_dir"] = normalized_build_dir.string();
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(normalized_build_dir, ec) || ec) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "build_dir does not exist or is not a directory";
+        result.fields["summary"] = "build directory not found";
+        return result;
+    }
+    const std::filesystem::path cmake_cache = normalized_build_dir / "CMakeCache.txt";
+    result.fields["cmake_cache_path"] = cmake_cache.string();
+    if (!std::filesystem::is_regular_file(cmake_cache, ec) || ec) {
+        result.ok = false;
+        result.exit_code = 409;
+        result.fields["error"] = "CMakeCache.txt not found in build_dir";
+        result.fields["summary"] = "build directory is not configured";
+        result.fields["next_action"] = "run cmake configure for build_dir before lan_agent_build_target";
+        return result;
+    }
+
+    std::string codex_llvm_root = raw_codex_llvm_root;
+    if (codex_llvm_root.empty()) {
+        const char * env_llvm_root = std::getenv("CODEX_LLVM_ROOT");
+        if (env_llvm_root != nullptr) {
+            codex_llvm_root = env_llvm_root;
+        }
+    }
+    std::filesystem::path normalized_llvm_root;
+    if (!codex_llvm_root.empty()) {
+        std::string llvm_error;
+        if (!TryResolveAllowedPath(config, codex_llvm_root, &normalized_llvm_root, &llvm_error)) {
+            result.ok = false;
+            result.exit_code = 403;
+            result.fields["error"] = "codex_llvm_root rejected: " + llvm_error;
+            result.fields["summary"] = "CODEX_LLVM_ROOT is outside allowed roots";
+            return result;
+        }
+        result.fields["codex_llvm_root"] = normalized_llvm_root.string();
+        result.fields["codex_llvm_root_source"] = raw_codex_llvm_root.empty() ? "process_env" : "request";
+    } else {
+        result.fields["codex_llvm_root_source"] = "unset";
+    }
+
+    const std::string cmake_command = ResolveCmakeCommandFromCache(cmake_cache);
+    result.fields["cmake_command"] = cmake_command;
+    result.fields["cmake_command_source"] =
+        cmake_command == "cmake" ? "path_lookup" : "cmake_cache";
+
+    std::ostringstream command;
+    command << QuoteBuildCommandArgument(cmake_command);
+    if (!codex_llvm_root.empty()) {
+        command << " -E env "
+                << QuoteBuildCommandArgument("CODEX_LLVM_ROOT=" + normalized_llvm_root.string())
+                << " "
+                << QuoteBuildCommandArgument(cmake_command);
+    }
+    command << " --build " << QuoteBuildCommandArgument(normalized_build_dir.string())
+            << " --config " << QuoteBuildCommandArgument(config_name)
+            << " --target " << QuoteBuildCommandArgument(raw_target);
+
+    result.fields["command"] = command.str();
+    result.fields["working_directory"] = normalized_build_dir.string();
+    if (dry_run) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["summary"] = "build target dry run returned";
+        result.fields["next_action"] = "call lan_agent_build_target with dry_run=false to execute";
+        return result;
+    }
+
+    const std::string log_path = BuildLogPath(config, "build_target_cmake");
+    codex_lan_agent::ProcessRunResult run_result;
+    std::string run_error;
+    const int effective_timeout = std::max(1, timeout_sec);
+    const int effective_stall_timeout = std::max(0, stall_timeout_sec);
+    if (!codex_lan_agent::RunCommandWithLog(
+            command.str(),
+            normalized_build_dir.string(),
+            log_path,
+            effective_timeout,
+            effective_stall_timeout,
+            &run_result,
+            &run_error)) {
+        result.ok = false;
+        result.exit_code = 500;
+        result.fields["error"] = run_error;
+        result.fields["log_path"] = log_path;
+        result.fields["result_ref"] = log_path;
+        result.fields["evidence_ref"] = log_path;
+        result.fields["summary"] = "failed to start cmake build";
+        return result;
+    }
+
+    result.ok = run_result.exit_code == 0;
+    result.exit_code = run_result.exit_code;
+    result.fields["log_path"] = log_path;
+    result.fields["result_ref"] = log_path;
+    result.fields["evidence_ref"] = log_path;
+    result.fields["resolved_log_path"] = log_path;
+    result.fields["process_id"] = std::to_string(run_result.process_id);
+    result.fields["runtime_sec"] = std::to_string(run_result.runtime_sec);
+    result.fields["timed_out"] = run_result.timed_out ? "true" : "false";
+    result.fields["stalled"] = run_result.stalled ? "true" : "false";
+    result.fields["process_output_observed"] = run_result.process_output_observed ? "true" : "false";
+    result.fields["completion_reason"] = run_result.completion_reason;
+    result.fields["started_at"] = run_result.started_at;
+    result.fields["finished_at"] = run_result.finished_at;
+    result.fields["effective_timeout_sec"] = std::to_string(effective_timeout);
+    result.fields["effective_stall_timeout_sec"] = std::to_string(effective_stall_timeout);
+    if (!result.ok) {
+        const BuildLogDiagnosticSummary diagnostics = ExtractBuildLogDiagnosticSummary(log_path);
+        result.fields["diagnostic_source"] = "build_log";
+        result.fields["build_diagnostic_line_count"] = std::to_string(diagnostics.diagnostic_line_count);
+        result.fields["first_compiler_error"] = diagnostics.first_error;
+        result.fields["first_compiler_warning"] = diagnostics.first_warning;
+        result.fields["build_error_excerpt"] = diagnostics.excerpt;
+        if (run_result.timed_out) {
+            result.fields["failure_mode"] = "build_timeout";
+        } else if (run_result.stalled) {
+            result.fields["failure_mode"] = "build_stalled";
+        } else if (!diagnostics.first_error.empty()) {
+            result.fields["failure_mode"] = "compiler_error";
+        } else {
+            result.fields["failure_mode"] = "build_failed";
+        }
+    }
+    result.fields["summary"] = result.ok
+        ? "cmake build target completed"
+        : (GetFieldOrDefault(result, "first_compiler_error", "").empty()
+            ? "cmake build target failed"
+            : "cmake build target failed: " + GetFieldOrDefault(result, "first_compiler_error", ""));
+    result.fields["semantic_outcome"] = result.ok ? "build_succeeded" : "build_failed";
+    result.fields["next_action"] = result.ok
+        ? "build complete"
+        : (GetFieldOrDefault(result, "first_compiler_error", "").empty()
+            ? "inspect result_ref/evidence_ref build log"
+            : "fix first_compiler_error; full build log is in result_ref/evidence_ref");
+    return result;
 }
 
 const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegistry() {
@@ -1141,7 +1578,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 || !Trim(params.GetString("primary_intent")).empty()
                 || !Trim(params.GetString("file_path")).empty()
                 || !Trim(params.GetString("source_file")).empty()
-                || !Trim(params.GetString("directory_path")).empty();
+                || !Trim(params.GetString("directory_path")).empty()
+                || (!Trim(params.GetString("build_dir")).empty()
+                    && !Trim(params.GetString("target")).empty());
             const std::string mode = requested_mode.empty()
                 ? (has_routable_request ? std::string("route") : std::string("overview"))
                 : requested_mode;
@@ -1189,17 +1628,29 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     McpRoutePathIsDirectory(routed_file_path)
                     || McpRouteRequestMentionsDirectoryListing(route_params.GetString("request_text"));
                 const std::string clips_route_target = GetFieldOrDefault(result, "route_target", "");
-                // ── 三级匹配：CLIPS精确 → 已有启发式 → 同义词+参数模式推断 ──
-                const std::string synonym_route_target = FirstNonEmpty(
-                    ResolveRouteBySynonymAndPattern(inferred_intent, route_params),
-                    ResolveRouteBySynonymAndPattern(raw_intent, route_params),
-                    "");
+                // Deterministic route priority:
+                // target_tool_name > explicit primary_intent > parameter shape > request text/CLIPS.
+                const std::string explicit_target =
+                    NormalizeMcpRouteTargetToolName(params.GetString("target_tool_name"));
+                const std::string explicit_primary_intent = Trim(params.GetString("primary_intent"));
+                const std::string explicit_intent_target = explicit_primary_intent.empty()
+                    ? std::string()
+                    : ResolveRouteBySynonymAndPattern(explicit_primary_intent, route_params);
+                const std::string parameter_shape_target =
+                    ResolveRouteBySynonymAndPattern("", route_params);
+                const std::string request_inferred_target = explicit_primary_intent.empty()
+                    ? FirstNonEmpty(
+                        ResolveRouteBySynonymAndPattern(inferred_intent, route_params),
+                        ResolveRouteBySynonymAndPattern(raw_intent, route_params),
+                        "")
+                    : std::string();
                 const std::string route_target = FirstNonEmpty(
-                    clips_route_target == "lan_agent_list_directory" && synonym_route_target == "lan_agent_search_text"
-                        ? std::string()
-                        : clips_route_target,
+                    explicit_target,
+                    explicit_intent_target,
+                    parameter_shape_target,
                     route_params.GetString("route_hint"),
-                    synonym_route_target,
+                    clips_route_target,
+                    request_inferred_target,
                     route_is_directory ? std::string("lan_agent_list_directory") : std::string(),
                     routed_file_path.empty()
                         ? std::string()
@@ -1211,16 +1662,25 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     "");
 
                 if (!route_target.empty()) {
+                    const bool deterministic_route =
+                        !explicit_target.empty()
+                        || !explicit_intent_target.empty()
+                        || !parameter_shape_target.empty();
                     const std::string next_call_json = FirstNonEmpty(
+                        deterministic_route
+                            ? BuildPreGuardRouteCallJson(route_target, route_params)
+                            : std::string(),
                         GetFieldOrDefault(result, "route_arguments_json", ""),
                         BuildPreGuardRouteCallJson(route_target, route_params),
                         "");
                     result.fields["route_target"] = route_target;
-                    result.fields["route_resolution"] = 
-                        !clips_route_target.empty() ? "clips_exact" :
+                    result.fields["route_resolution"] =
+                        !explicit_target.empty() ? "explicit_target_tool" :
+                        !explicit_intent_target.empty() ? "explicit_primary_intent" :
+                        !parameter_shape_target.empty() ? "parameter_shape" :
                         !route_params.GetString("route_hint").empty() ? "route_hint" :
-                        (ResolveRouteBySynonymAndPattern(inferred_intent, route_params) == route_target 
-                         || ResolveRouteBySynonymAndPattern(raw_intent, route_params) == route_target) ? "synonym_or_pattern" : "heuristic";
+                        !clips_route_target.empty() ? "clips_request_text" :
+                        !request_inferred_target.empty() ? "request_text" : "heuristic";
 
                     // ── 方案C: route auto_execute —— 命中后直接执行，不要求二次 mode=call ──
                     const auto & exec_registry = BuildMcpToolHandlerRegistry();
@@ -1453,8 +1913,39 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                             GetFieldOrDefault(exec_result, "required_tool_name", ""),
                             GetFieldOrDefault(exec_result, "recommended_next_tool", ""));
                         const std::string exec_result_type = GetFieldOrDefault(exec_result, "result", "");
+                        const bool bounded_read_page_terminal =
+                            route_target == "lan_agent_read_text_file"
+                            && !route_params.GetBool("read_to_eof", false);
+                        if (bounded_read_page_terminal) {
+                            exec_result.fields["source_has_more"] = GetFieldOrDefault(exec_result, "has_more", "false");
+                            exec_result.fields["source_next_start_line"] = GetFieldOrDefault(exec_result, "next_start_line", "");
+                            exec_result.fields["bounded_read_complete"] = "true";
+                            exec_result.fields["read_to_eof"] = "false";
+                            exec_result.fields["has_more"] = "false";
+                            exec_result.fields["read_complete"] = "true";
+                            exec_result.fields["file_complete"] = "true";
+                            exec_result.fields["read_status"] = "complete";
+                            exec_result.fields["task_completion"] = "complete";
+                            exec_result.fields["content_read_completion"] = "complete";
+                            exec_result.fields["page_status"] = "bounded_page";
+                            exec_result.fields["requires_followup"] = "false";
+                            exec_result.fields["continue_required"] = "false";
+                            exec_result.fields["auto_continue_required"] = "false";
+                            exec_result.fields["semantic_model_clamp"] = "none";
+                            exec_result.fields["terminal_state"] = "true";
+                            exec_result.fields["final_answer_allowed"] = "true";
+                            exec_result.fields["completion_claim_allowed"] = "true";
+                            exec_result.fields["assistant_response_allowed"] = "true";
+                            exec_result.fields["verification_ok"] = "true";
+                            exec_result.fields["next_start_line"] = "";
+                            exec_result.fields["next_tool_name"] = "";
+                            exec_result.fields["required_tool_name"] = "";
+                            exec_result.fields["next_call_json"] = "";
+                            exec_result.fields["required_tool_arguments_json"] = "";
+                        }
                         const bool is_intermediate_step =
                             exec_result.ok
+                            && !bounded_read_page_terminal
                             && !exec_next_tool.empty()
                             && exec_result_type != "delete_complete"
                             && exec_result_type != "directory_cleanup_complete"
@@ -1488,7 +1979,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                         {
                             constexpr int kMaxAutoChainDepth = 5;
                             int chain_depth = 0;
-                            std::string current_tool = exec_next_tool;
+                            std::string current_tool = bounded_read_page_terminal ? std::string() : exec_next_tool;
                             CommandResult current_result = exec_result;
 
                             while (chain_depth < kMaxAutoChainDepth && !current_tool.empty() && current_result.ok) {
@@ -1717,7 +2208,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 return result;
             }
 
-            const std::string target_tool_name = params.GetString("target_tool_name");
+            const std::string requested_target_tool_name = params.GetString("target_tool_name");
+            const std::string target_tool_name = NormalizeMcpRouteTargetToolName(requested_target_tool_name);
             if (target_tool_name.empty()) {
                 CommandResult result;
                 InjectProfileMeta(result);
@@ -1738,7 +2230,33 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["result"] = "recursive_mcp_route_blocked";
                 result.fields["mcp_route_mode"] = "call";
                 result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["requested_target_tool_name"] = requested_target_tool_name;
+                result.fields["route_compat_canonical_tool_name"] = target_tool_name;
                 result.fields["error"] = "lan_agent_mcp_route cannot call itself";
+                return result;
+            }
+
+            if (!profile.allow_direct_call_mode) {
+                CommandResult result;
+                InjectProfileMeta(result);
+                result.ok = false;
+                result.exit_code = 403;
+                result.fields["status"] = "failed";
+                result.fields["result"] = "direct_call_blocked_by_model_profile";
+                result.fields["mcp_route_mode"] = "call";
+                result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
+                result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["requested_target_tool_name"] = requested_target_tool_name;
+                result.fields["route_compat_canonical_tool_name"] = target_tool_name;
+                result.fields["routed_tool_surface"] = "internal_registry_hidden_from_tools_list";
+                result.fields["internal_execution_performed"] = "false";
+                result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                result.fields["tool_use_decision"] = "blocked_by_profile";
+                result.fields["current_tool_chain_node"] = target_tool_name;
+                result.fields["chain_state"] = "blocked_before_execution";
+                result.fields["error"] = "mode=call is blocked for this model_profile; use mode=route or pass model_profile=large-llm explicitly";
+                result.fields["suggested_next_call"] = "mode=route";
+                result.fields["profile_direct_call_policy"] = "profile_blocks_direct_call";
                 return result;
             }
 
@@ -1778,6 +2296,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 preflight_result.fields["mcp_route_mode"] = "call";
                 preflight_result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
                 preflight_result.fields["routed_tool_name"] = target_tool_name;
+                preflight_result.fields["requested_target_tool_name"] = requested_target_tool_name;
+                preflight_result.fields["route_compat_canonical_tool_name"] = target_tool_name;
                 preflight_result.fields["routed_tool_surface"] = "internal_registry_hidden_from_tools_list";
                 preflight_result.fields["internal_execution_performed"] = "false";
                 preflight_result.fields["visible_tool_name"] = "lan_agent_mcp_route";
@@ -1814,6 +2334,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     remote_result.fields["mcp_route_mode"] = "call";
                     remote_result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
                     remote_result.fields["routed_tool_name"] = target_tool_name;
+                    remote_result.fields["requested_target_tool_name"] = requested_target_tool_name;
+                    remote_result.fields["route_compat_canonical_tool_name"] = target_tool_name;
                     remote_result.fields["routed_tool_surface"] = "remote_mcp_internal_proxy_hidden_from_tools_list";
                     remote_result.fields["internal_execution_performed"] = "true";
                     remote_result.fields["visible_tool_name"] = "lan_agent_mcp_route";
@@ -1830,6 +2352,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["result"] = "internal_tool_not_found";
                 result.fields["mcp_route_mode"] = "call";
                 result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["requested_target_tool_name"] = requested_target_tool_name;
+                result.fields["route_compat_canonical_tool_name"] = target_tool_name;
                 result.fields["error"] = "target_tool_name is not registered in the internal MCP registry";
                 // 提供恢复建议：如果 target_tool_name 匹配已知 primary_intent，建议用 mode=route
                 const std::string inferred = InferMcpRoutePrimaryIntent(
@@ -1844,6 +2368,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 LanResultBuilder(&result).Finalize(config, target_tool_name);
                 result.fields["mcp_route_mode"] = "call";
                 result.fields["routed_tool_name"] = target_tool_name;
+                result.fields["requested_target_tool_name"] = requested_target_tool_name;
+                result.fields["route_compat_canonical_tool_name"] = target_tool_name;
                 result.fields["visible_tool_name"] = "lan_agent_mcp_route";
                 result.fields["internal_execution_performed"] = "false";
                 return result;
@@ -1858,6 +2384,8 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             result.fields["mcp_route_mode"] = "call";
             result.fields["mcp_route_entry_tool"] = "lan_agent_mcp_route";
             result.fields["routed_tool_name"] = target_tool_name;
+            result.fields["requested_target_tool_name"] = requested_target_tool_name;
+            result.fields["route_compat_canonical_tool_name"] = target_tool_name;
             result.fields["routed_tool_surface"] = "internal_registry_hidden_from_tools_list";
             result.fields["internal_execution_performed"] = "true";
             result.fields["visible_tool_name"] = "lan_agent_mcp_route";
@@ -2235,6 +2763,15 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 std::max(0, params.GetInt("start_index", 0)),
                 std::max(1, params.GetInt("max_entries", 200)));
         }},
+        {"local_cli", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildLocalCliRegistryResult(config, params, "local_cli");
+        }},
+        {"codex_local_cli", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildLocalCliRegistryResult(config, params, "codex_local_cli");
+        }},
+        {"lan_agent_run_command", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildLocalCliRegistryResult(config, params, "lan_agent_run_command");
+        }},
         {"lan_agent_preflight_build_target", [](const AgentConfig &, const JsonRequestView & params) {
             std::string config_name = params.GetString("config", "Release");
             if (config_name.empty()) {
@@ -2254,6 +2791,56 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 return result;
             }
             return BuildBuildTargetPreflightResult(build_dir, target, config_name);
+        }},
+        {"lan_agent_build_target", [](const AgentConfig & config, const JsonRequestView & params) {
+            std::string config_name = params.GetString("config", "Release");
+            if (config_name.empty()) {
+                config_name = "Release";
+            }
+            const std::string build_dir = params.GetString("build_dir");
+            const std::string target = params.GetString("target");
+            const bool dry_run = params.GetBool("dry_run", false);
+            std::string preflight_ref = params.GetString("preflight_ref");
+            std::string preflight_status = params.GetString("preflight_status");
+            bool auto_preflight_performed = false;
+            std::string auto_preflight_reason_code;
+            if (!dry_run
+                && preflight_ref.empty()
+                && preflight_status.empty()
+                && !Trim(build_dir).empty()
+                && !Trim(target).empty()) {
+                CommandResult preflight = BuildBuildTargetPreflightResult(build_dir, target, config_name);
+                preflight_ref = GetFieldOrDefault(preflight, "preflight_ref", "");
+                preflight_status = GetFieldOrDefault(preflight, "preflight_status", "");
+                auto_preflight_reason_code = GetFieldOrDefault(preflight, "preflight_reason_code", "");
+                auto_preflight_performed = preflight_status == "ready" && !preflight_ref.empty();
+            }
+            const bool has_stall_timeout = !params.GetRawJson("stall_timeout_sec").empty();
+            const int stall_timeout_sec = params.GetInt(
+                "stall_timeout_sec",
+                config.build_target_stall_timeout_sec);
+            CommandResult result = BuildLocalCmakeTargetResult(
+                config,
+                build_dir,
+                target,
+                config_name,
+                std::max(1, params.GetInt("timeout_sec", 1800)),
+                std::max(0, stall_timeout_sec),
+                dry_run,
+                params.GetString("codex_llvm_root"));
+            result.fields["build_target_stall_timeout_sec"] =
+                std::to_string(std::max(0, stall_timeout_sec));
+            result.fields["build_target_stall_timeout_source"] =
+                has_stall_timeout ? "request" : "config";
+            if (!preflight_ref.empty()) {
+                result.fields["preflight_ref"] = preflight_ref;
+                result.fields["preflight_status"] = "ready";
+            } else if (!preflight_status.empty()) {
+                result.fields["preflight_status"] = preflight_status;
+            }
+            result.fields["preflight_auto_performed"] = auto_preflight_performed ? "true" : "false";
+            result.fields["preflight_auto_reason_code"] = auto_preflight_reason_code;
+            return result;
         }},
         {"lan_agent_preflight_run_ctest_target", [](const AgentConfig & config, const JsonRequestView & params) {
             std::string config_name = params.GetString("config", "Release");
@@ -2468,7 +3055,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_read_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
             const long long raw_start_byte_offset =
                 static_cast<long long>(params.GetInt("start_byte_offset", 0));
-            return ReadTextFileResult(
+            CommandResult result = ReadTextFileResult(
                 config,
                 params.GetString("file_path"),
                 std::max(1, params.GetInt("max_lines", 500)),
@@ -2478,6 +3065,37 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     ? static_cast<std::size_t>(raw_start_byte_offset)
                     : static_cast<std::size_t>(0),
                 params.GetString("probe_ref"));
+            if (!params.GetBool("read_to_eof", false)) {
+                result.fields["source_has_more"] = GetFieldOrDefault(result, "has_more", "false");
+                result.fields["source_next_start_line"] = GetFieldOrDefault(result, "next_start_line", "");
+                result.fields["bounded_read_complete"] = "true";
+                result.fields["read_to_eof"] = "false";
+                result.fields["has_more"] = "false";
+                result.fields["read_complete"] = "true";
+                result.fields["file_complete"] = "true";
+                result.fields["read_status"] = "complete";
+                result.fields["task_completion"] = "complete";
+                result.fields["content_read_completion"] = "complete";
+                result.fields["page_status"] = "bounded_page";
+                result.fields["requires_followup"] = "false";
+                result.fields["continue_required"] = "false";
+                result.fields["auto_continue_required"] = "false";
+                result.fields["semantic_model_clamp"] = "none";
+                result.fields["terminal_state"] = "true";
+                result.fields["final_answer_allowed"] = "true";
+                result.fields["completion_claim_allowed"] = "true";
+                result.fields["assistant_response_allowed"] = "true";
+                result.fields["verification_ok"] = "true";
+                result.fields["analysis_allowed"] = "true";
+                result.fields["analysis_blocked_reason"] = "";
+                result.fields["next_start_line"] = "";
+                result.fields["next_tool_name"] = "";
+                result.fields["required_tool_name"] = "";
+                result.fields["next_call_json"] = "";
+                result.fields["required_tool_arguments_json"] = "";
+                result.fields["next_action"] = "bounded file page read is complete";
+            }
+            return result;
         }},
         {"lan_agent_tail_text_file", [](const AgentConfig & config, const JsonRequestView & params) {
             return TailTextFileResult(
@@ -2861,11 +3479,19 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             if (!payload_result.ok) {
                 return payload_result;
             }
-            CommandResult result = WriteTextFileResult(
-                config,
-                params.GetString("file_path"),
-                content,
-                params.GetBool("append", false));
+            const std::string expected_file_hash = params.GetString("expected_file_hash");
+            CommandResult result = expected_file_hash.empty()
+                ? WriteTextFileResult(
+                    config,
+                    params.GetString("file_path"),
+                    content,
+                    params.GetBool("append", false))
+                : WriteWholeTextViaOptfileResult(
+                    config,
+                    params.GetString("file_path"),
+                    content,
+                    params.GetBool("append", false),
+                    expected_file_hash);
             result.fields["content_transport"] = GetFieldOrDefault(payload_result, "content_transport", "json_string");
             result.fields["content_base64_bytes"] = GetFieldOrDefault(payload_result, "content_base64_bytes", "");
             return result;
@@ -3190,6 +3816,7 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_configure_project", "execution_task", "configure_project", "medium", "cmake,configure,queue"},
         {"local_cli", "local_cli", "cli_command", "medium", "cli,controlled"},
         {"codex_local_cli", "local_cli", "cli_command", "medium", "cli,controlled"},
+        {"lan_agent_run_command", "local_cli", "cli_command", "medium", "cli,controlled,compat_alias"},
         {"lan_agent_cmm_list_projects", "cmm_bridge", "cmm_list_projects", "low", "cmm,bridge,read_only"},
         {"lan_agent_cmm_index_status", "cmm_bridge", "cmm_index_status", "low", "cmm,bridge,read_only"},
         {"lan_agent_cmm_search_code", "cmm_bridge", "cmm_search_code", "low", "cmm,bridge,read_only"},
