@@ -110,6 +110,8 @@ CommandResult BuildHealthResult(const AgentConfig & config) {
     result.fields["listen_host"] = config.listen_host;
     result.fields["listen_port"] = std::to_string(config.listen_port);
     result.fields["workspace_root"] = config.workspace_root;
+    result.fields["manual_workspace_root"] = config.manual_workspace_root;
+    result.fields["allowed_roots"] = config.allowed_roots;
     result.fields["log_root"] = config.log_root;
     result.fields["data_root"] = config.data_root;
     result.fields["dialog_slices_root"] = BuildDialogSlicesDir(config);

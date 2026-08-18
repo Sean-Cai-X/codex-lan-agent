@@ -9,6 +9,7 @@ struct AgentConfig {
     std::string listen_host = "0.0.0.0";
     int listen_port = 18080;
     std::string workspace_root;
+    std::string manual_workspace_root;
     std::string allowed_roots;
     std::string log_root;
     std::string data_root;

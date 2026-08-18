@@ -202,6 +202,8 @@ bool LoadAgentConfig(
 
         if (key == "workspace_root") {
             loaded.workspace_root = value;
+        } else if (key == "manual_workspace_root") {
+            loaded.manual_workspace_root = value;
         } else if (key == "allowed_roots") {
             loaded.allowed_roots = value;
         } else if (key == "listen_host") {
@@ -333,7 +335,8 @@ bool LoadAgentConfig(
         return false;
     }
 
-    loaded.workspace_root = NormalizePathValue(loaded.workspace_root, loaded.config_dir);
+    loaded.workspace_root = NormalizePathListValue(loaded.workspace_root, loaded.config_dir);
+    loaded.manual_workspace_root = NormalizePathListValue(loaded.manual_workspace_root, loaded.config_dir);
     loaded.allowed_roots = NormalizePathListValue(loaded.allowed_roots, loaded.config_dir);
     loaded.log_root = NormalizePathValue(loaded.log_root, loaded.config_dir);
     loaded.data_root = NormalizePathValue(

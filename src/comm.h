@@ -508,13 +508,24 @@ struct CommOperations final {
         return paths;
     }
 
-    static std::filesystem::path GetPrimaryWorkspaceRoot(const AgentConfig & config) {
-        const std::vector<std::filesystem::path> roots = ParsePathList(config.workspace_root);
-        return roots.empty() ? std::filesystem::path() : roots.front();
+    static std::vector<std::filesystem::path> GetManualWorkspaceRoots(const AgentConfig & config) {
+        return ParsePathList(config.manual_workspace_root);
+    }
+
+    static std::vector<std::filesystem::path> GetConfiguredWorkspaceRoots(const AgentConfig & config) {
+        return ParsePathList(config.workspace_root);
     }
 
     static std::vector<std::filesystem::path> GetWorkspaceRoots(const AgentConfig & config) {
-        return ParsePathList(config.workspace_root);
+        std::vector<std::filesystem::path> roots = GetManualWorkspaceRoots(config);
+        const std::vector<std::filesystem::path> configured_roots = GetConfiguredWorkspaceRoots(config);
+        roots.insert(roots.end(), configured_roots.begin(), configured_roots.end());
+        return roots;
+    }
+
+    static std::filesystem::path GetPrimaryWorkspaceRoot(const AgentConfig & config) {
+        const std::vector<std::filesystem::path> roots = GetWorkspaceRoots(config);
+        return roots.empty() ? std::filesystem::path() : roots.front();
     }
 
     static std::filesystem::path RebaseRequestedPath(
@@ -597,6 +608,7 @@ struct CommOperations final {
 
         const std::filesystem::path logs_root(config.log_root);
         const bool is_allowed = StartsWithPath(normalized, logs_root)
+            || StartsWithAnyPath(normalized, config.manual_workspace_root)
             || StartsWithAnyPath(normalized, config.workspace_root)
             || StartsWithAnyPath(normalized, config.allowed_roots);
         if (!is_allowed) {
@@ -620,9 +632,10 @@ struct CommOperations final {
             return false;
         }
         std::error_code ec;
-        if (!StartsWithAnyPath(normalized, config.workspace_root)) {
+        if (!StartsWithAnyPath(normalized, config.manual_workspace_root) &&
+            !StartsWithAnyPath(normalized, config.workspace_root)) {
             if (error_message) {
-                *error_message = "path is outside workspace_root";
+                *error_message = "path is outside workspace_root and manual_workspace_root";
             }
             return false;
         }
