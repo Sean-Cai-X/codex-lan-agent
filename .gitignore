@@ -15,6 +15,32 @@
 !README.md
 !LICENSE
 !src/**
+!webview2/
+!webview2/.gitignore
+!webview2/README.md
+!webview2/readme.md
+!webview2/build.bat
+!webview2/start_clash_native.bat
+!webview2/go.mod
+!webview2/go.sum
+!webview2/main.go
+!webview2/mihomo-http-control.example.yaml
+!webview2/ui/
+!webview2/ui/**
+!linux/
+!linux/readme.md
+!linux/config/
+!linux/config/dnsmasq/
+!linux/config/dnsmasq/*.conf
+!linux/config/mihomo/
+!linux/config/mihomo/*.yaml
+!linux/config/sing-box/
+!linux/config/sing-box/*.json
+!linux/config/publish/
+!linux/config/publish/sing-box/
+!linux/config/publish/sing-box/*.json
+!linux/config/systemd/
+!linux/config/systemd/*.service
 
 # --- Hard deny: executables, binaries, libraries ---
 *.exe
@@ -98,3 +124,29 @@ test_*_output*
 
 # --- Temp trace output ---
 src/temp_trace/
+/src/tmp_logs
+
+# --- Audit gateway / Clash runtime hard-deny ---
+webview2/config.yaml
+webview2/*.local.yaml
+webview2/profiles/
+webview2/providers/
+webview2/cache.db
+webview2/Country.mmdb
+webview2/geoip.dat
+webview2/geosite.dat
+webview2/.tools/
+linux/tmp_mihomo_deploy/
+linux/config/logs/
+linux/config/ssh/
+linux/config/publish/kvm_delivery/
+linux/config/publish/dnsmasq/
+linux/config/publish/mihomo/
+linux/config/**/*.key
+linux/config/**/*_key*
+linux/config/**/id_*
+*.gz
+*.zst
+*.deb
+*.rpm
+*.pkg.tar.zst

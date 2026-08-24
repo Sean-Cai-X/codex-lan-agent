@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clash Native Settings</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --text: #18212f;
+      --muted: #637083;
+      --accent: #1967d2;
+      --ok: #137333;
+      --bad: #b3261e;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 "Segoe UI", Arial, sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    h1 {
+      font-size: 18px;
+      margin: 0;
+      font-weight: 650;
+    }
+
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    h2 {
+      font-size: 15px;
+      margin: 0 0 12px;
+      font-weight: 650;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .field {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    label, .label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input, select, button {
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+      min-width: 0;
+    }
+
+    button {
+      cursor: pointer;
+      background: #eef4ff;
+      border-color: #c7d7f5;
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    button.secondary {
+      background: #fff;
+      color: var(--text);
+    }
+
+    button:disabled {
+      opacity: .55;
+      cursor: default;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      min-height: 64px;
+      background: #fbfcfe;
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 16px;
+      overflow-wrap: anywhere;
+    }
+
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
+
+    pre {
+      margin: 0;
+      padding: 10px;
+      border-radius: 6px;
+      background: #111827;
+      color: #d7e0ef;
+      min-height: 140px;
+      max-height: 260px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+      background: #fff;
+    }
+
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      background: #fbfcfe;
+      position: sticky;
+      top: 0;
+    }
+
+    td.name {
+      max-width: 360px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      font-size: 12px;
+    }
+
+    .pill.ok {
+      border-color: #b7dfc5;
+      background: #eef8f1;
+    }
+
+    .pill.bad {
+      border-color: #f2b8b5;
+      background: #fceeee;
+    }
+
+    .pill.muted {
+      color: var(--muted);
+      background: #f6f7f9;
+    }
+
+    @media (max-width: 820px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 520px) {
+      .grid { grid-template-columns: 1fr; }
+      main { padding: 12px; }
+      section { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Clash Native Settings</h1>
+    <div class="row">
+      <button id="refreshBtn" type="button">Refresh</button>
+      <button id="healthBtn" type="button" class="secondary">Health</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Runtime</h2>
+      <div class="grid">
+        <div class="stat">
+          <span class="label">API</span>
+          <strong id="apiState">Checking</strong>
+        </div>
+        <div class="stat">
+          <span class="label">Version</span>
+          <strong id="versionText">-</strong>
+        </div>
+        <div class="stat">
+          <span class="label">Mode</span>
+          <strong id="modeText">-</strong>
+        </div>
+        <div class="stat">
+          <span class="label">Mixed Port</span>
+          <strong id="mixedPortText">-</strong>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Core Settings</h2>
+      <div class="grid">
+        <div class="field">
+          <label for="modeSelect">Mode</label>
+          <select id="modeSelect">
+            <option value="rule">rule</option>
+            <option value="global">global</option>
+            <option value="direct">direct</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="logLevelSelect">Log Level</label>
+          <select id="logLevelSelect">
+            <option value="silent">silent</option>
+            <option value="error">error</option>
+            <option value="warning">warning</option>
+            <option value="info">info</option>
+            <option value="debug">debug</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="globalSelect">GLOBAL Node</label>
+          <select id="globalSelect"></select>
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button id="applyBtn" type="button">Apply</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Status</h2>
+      <div class="grid">
+        <div class="stat">
+          <span class="label">Proxy Count</span>
+          <strong id="proxyCountText">-</strong>
+        </div>
+        <div class="stat">
+          <span class="label">GLOBAL Now</span>
+          <strong id="globalNowText">-</strong>
+        </div>
+        <div class="stat">
+          <span class="label">GLOBAL Options</span>
+          <strong id="globalOptionsText">-</strong>
+        </div>
+        <div class="stat">
+          <span class="label">Last Update</span>
+          <strong id="lastUpdateText">-</strong>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>GLOBAL Node Status</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>Type</th>
+              <th>Delay</th>
+              <th>Alive</th>
+              <th>UDP</th>
+              <th>Selected</th>
+            </tr>
+          </thead>
+          <tbody id="globalStatusBody">
+            <tr><td colspan="6">Refresh to load nodes</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Events</h2>
+      <pre id="logText"></pre>
+    </section>
+  </main>
+
+  <script>
+    const apiState = document.getElementById("apiState");
+    const versionText = document.getElementById("versionText");
+    const modeText = document.getElementById("modeText");
+    const mixedPortText = document.getElementById("mixedPortText");
+    const proxyCountText = document.getElementById("proxyCountText");
+    const globalNowText = document.getElementById("globalNowText");
+    const globalOptionsText = document.getElementById("globalOptionsText");
+    const lastUpdateText = document.getElementById("lastUpdateText");
+    const modeSelect = document.getElementById("modeSelect");
+    const logLevelSelect = document.getElementById("logLevelSelect");
+    const globalSelect = document.getElementById("globalSelect");
+    const globalStatusBody = document.getElementById("globalStatusBody");
+    const logText = document.getElementById("logText");
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logText.textContent = `[${time}] ${message}\n` + logText.textContent;
+    }
+
+    function latestHistory(proxy) {
+      const history = Array.isArray(proxy && proxy.history) ? proxy.history : [];
+      return history.length ? history[history.length - 1] : null;
+    }
+
+    function delayLabel(proxy) {
+      const item = latestHistory(proxy);
+      if (!item || typeof item.delay !== "number") return "-";
+      if (item.delay < 0) return "failed";
+      return `${item.delay} ms`;
+    }
+
+    function aliveLabel(proxy) {
+      if (!proxy) return "-";
+      if (typeof proxy.alive === "boolean") return proxy.alive ? "alive" : "down";
+      const item = latestHistory(proxy);
+      if (item && typeof item.delay === "number") return item.delay >= 0 ? "alive" : "down";
+      return "unknown";
+    }
+
+    function optionLabel(name, proxy, selectedName) {
+      const selected = name === selectedName ? "* " : "";
+      const type = proxy && proxy.type ? proxy.type : "unknown";
+      return `${selected}${name} | ${type} | ${delayLabel(proxy)} | ${aliveLabel(proxy)}`;
+    }
+
+    function renderGlobalStatus(allNames, proxies, selectedName) {
+      globalStatusBody.innerHTML = "";
+      if (!allNames.length) {
+        globalStatusBody.innerHTML = '<tr><td colspan="6">No GLOBAL options returned by API</td></tr>';
+        return;
+      }
+
+      for (const name of allNames) {
+        const proxy = proxies[name] || {};
+        const alive = aliveLabel(proxy);
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td class="name" title="${escapeHTML(name)}">${escapeHTML(name)}</td>
+          <td>${escapeHTML(proxy.type || "-")}</td>
+          <td>${escapeHTML(delayLabel(proxy))}</td>
+          <td><span class="pill ${alive === "alive" ? "ok" : alive === "down" ? "bad" : "muted"}">${escapeHTML(alive)}</span></td>
+          <td>${proxy.udp === true ? "yes" : proxy.udp === false ? "no" : "-"}</td>
+          <td>${name === selectedName ? '<span class="pill ok">current</span>' : ""}</td>
+        `;
+        globalStatusBody.appendChild(row);
+      }
+    }
+
+    function escapeHTML(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`${res.status} ${res.statusText}${body ? `: ${body}` : ""}`);
+      }
+      if (res.status === 204) return null;
+      const text = await res.text();
+      return text ? JSON.parse(text) : null;
+    }
+
+    async function refresh() {
+      try {
+        const [version, configs, proxies] = await Promise.all([
+          api("/version"),
+          api("/configs"),
+          api("/proxies"),
+        ]);
+
+        apiState.textContent = "OK";
+        apiState.className = "ok";
+        versionText.textContent = version.version || "reachable";
+        modeText.textContent = configs.mode || "-";
+        mixedPortText.textContent = configs["mixed-port"] ?? "-";
+        modeSelect.value = configs.mode || "rule";
+        logLevelSelect.value = configs["log-level"] || "warning";
+
+        const proxyMap = proxies.proxies || {};
+        const entries = Object.entries(proxyMap);
+        const global = proxyMap.GLOBAL;
+        const globalNames = global && global.all ? global.all : [];
+        proxyCountText.textContent = entries.length.toString();
+        globalNowText.textContent = global && global.now ? global.now : "-";
+        globalOptionsText.textContent = globalNames.length.toString();
+
+        globalSelect.innerHTML = "";
+        for (const name of globalNames) {
+          const option = document.createElement("option");
+          option.value = name;
+          option.textContent = optionLabel(name, proxyMap[name], global && global.now);
+          if (name === global.now) option.selected = true;
+          globalSelect.appendChild(option);
+        }
+        renderGlobalStatus(globalNames, proxyMap, global && global.now);
+
+        lastUpdateText.textContent = new Date().toLocaleTimeString();
+        log("refreshed runtime state");
+      } catch (err) {
+        apiState.textContent = "FAIL";
+        apiState.className = "bad";
+        log(`refresh failed: ${err.message}`);
+      }
+    }
+
+    async function applySettings() {
+      try {
+        await api("/configs", {
+          method: "PATCH",
+          body: JSON.stringify({
+            mode: modeSelect.value,
+            "log-level": logLevelSelect.value,
+          }),
+        });
+
+        if (globalSelect.value) {
+          await api("/proxies/GLOBAL", {
+            method: "PUT",
+            body: JSON.stringify({ name: globalSelect.value }),
+          });
+        }
+
+        log("settings applied");
+        await refresh();
+      } catch (err) {
+        log(`apply failed: ${err.message}`);
+      }
+    }
+
+    document.getElementById("refreshBtn").addEventListener("click", refresh);
+    document.getElementById("healthBtn").addEventListener("click", refresh);
+    document.getElementById("applyBtn").addEventListener("click", applySettings);
+
+    refresh();
+  </script>
+</body>
+</html>

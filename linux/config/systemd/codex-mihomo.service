@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex audit gateway mihomo upstream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/codex-mihomo
+ExecStart=/usr/local/bin/mihomo -d /opt/codex-mihomo -f /opt/codex-mihomo/config.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
