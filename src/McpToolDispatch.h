@@ -617,6 +617,7 @@ bool IsMcpGatewayReadOnlyTool(const std::string & tool_name) {
         || tool_name == "lan_agent_read_text_file"
         || tool_name == "lan_agent_list_directory"
         || tool_name == "lan_agent_read_directory_files"
+        || tool_name == "lan_agent_prepare_directory_analysis"
         || tool_name == "lan_agent_find_line_metadata"
         || tool_name == "lan_agent_find_content_matches"
         || tool_name == "lan_agent_locate_text_lines"
@@ -986,6 +987,10 @@ std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     AppendJsonStringField(&json, &first, "target", params.GetString("target"));
     AppendJsonStringField(&json, &first, "config", params.GetString("config"));
     AppendJsonStringField(&json, &first, "command", params.GetString("command"));
+    AppendJsonStringField(&json, &first, "profile", params.GetString("profile"));
+    AppendJsonStringField(&json, &first, "profile_name", params.GetString("profile_name"));
+    AppendJsonStringField(&json, &first, "args", params.GetString("args"));
+    AppendJsonStringField(&json, &first, "arguments_text", params.GetString("arguments_text"));
     AppendJsonStringField(&json, &first, "args_text", params.GetString("args_text"));
     AppendJsonStringField(&json, &first, "path", params.GetString("path"));
     AppendJsonStringField(&json, &first, "task_id", params.GetString("task_id"));
@@ -996,6 +1001,7 @@ std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     AppendJsonStringField(&json, &first, "preflight_ref", params.GetString("preflight_ref"));
     AppendJsonStringField(&json, &first, "preflight_status", params.GetString("preflight_status"));
     AppendJsonStringField(&json, &first, "scan_mode", params.GetString("scan_mode", primary_intent == "comment_cleanup" ? "comments" : ""));
+    AppendJsonStringField(&json, &first, "file_extensions_csv", params.GetString("file_extensions_csv"));
 
     AppendJsonStringField(&json, &first, "trace_id", params.GetString("trace_id"));
     AppendJsonStringField(&json, &first, "request_id", params.GetString("request_id"));
@@ -1026,6 +1032,15 @@ std::string BuildMcpRouteDecisionParamsJson(const JsonRequestView & params) {
     append_int_param("max_lines", 200, 1);
     append_int_param("max_matches", 100, 1);
     append_int_param("max_bytes", 65536, 1);
+    append_int_param("max_files", 200, 1);
+    append_int_param("max_lines_per_file", 500, 1);
+    append_int_param("max_files_per_call", 5, 1);
+    append_int_param("max_total_lines", 2500, 1);
+    append_int_param("file_index", 0, 0);
+    append_int_param("start_byte_offset", 0, 0);
+    append_int_param("max_excerpt_lines_per_file", 80, 1);
+    append_int_param("max_total_excerpt_lines", 1200, 1);
+    append_int_param("max_excerpt_chars", 24000, 1024);
     append_int_param("timeout_sec", 1800, 1);
     append_int_param("stall_timeout_sec", 0, 0);
     // 透传 dry_run（可能在顶层或 arguments 子对象中）。
@@ -1075,6 +1090,10 @@ std::string ResolveRouteBySynonymAndPattern(
         {"list_dir", "lan_agent_list_directory"},
         {"ls", "lan_agent_list_directory"},
         {"dir", "lan_agent_list_directory"},
+        {"analyze_directory", "lan_agent_prepare_directory_analysis"},
+        {"directory_analysis", "lan_agent_prepare_directory_analysis"},
+        {"prepare_directory_analysis", "lan_agent_prepare_directory_analysis"},
+        {"read_directory_files", "lan_agent_read_directory_files"},
         {"probe_file", "lan_agent_probe_text_file"},
         {"probe", "lan_agent_probe_text_file"},
         {"file_probe", "lan_agent_probe_text_file"},
@@ -1104,6 +1123,10 @@ std::string ResolveRouteBySynonymAndPattern(
         {"build_target", "lan_agent_build_target"},
         {"compile", "lan_agent_build_target"},
         {"cmake_build", "lan_agent_build_target"},
+        {"run_cli_profile", "lan_agent_run_cli_profile"},
+        {"cli_profile", "lan_agent_run_cli_profile"},
+        {"run_profile", "lan_agent_run_cli_profile"},
+        {"enqueue_cli_profile", "lan_agent_enqueue_cli_profile"},
         {"run_command", "local_cli"},
         {"run_cli", "local_cli"},
         {"local_cli", "local_cli"},
@@ -1139,7 +1162,12 @@ std::string ResolveRouteBySynonymAndPattern(
     const bool has_anchor = !Trim(params.GetString("anchor_text")).empty();
     if (has_build_dir && has_target) return "lan_agent_build_target";
     if (has_command) return "local_cli";
+    const bool has_extensions = !Trim(params.GetString("file_extensions_csv")).empty();
+    const bool has_analysis_budget = !Trim(params.GetString("max_excerpt_lines_per_file")).empty()
+        || !Trim(params.GetString("max_total_excerpt_lines")).empty()
+        || !Trim(params.GetString("max_excerpt_chars")).empty();
     if (has_directory && has_query) return "lan_agent_search_text";
+    if (has_directory && (has_extensions || has_analysis_budget)) return "lan_agent_prepare_directory_analysis";
     if (has_directory) return "lan_agent_list_directory";
     if (has_file_path && has_anchor) return "lan_agent_insert_after_anchor_atomic";
     if (has_file_path && has_start_line && has_end_line) return "lan_agent_replace_line_range_atomic";
@@ -1156,6 +1184,8 @@ std::string BuildCandidateToolsJson(const std::string & primary_intent) {
         {"lan_agent_read_text_file", "read_file, read, file_read, get_file, view_file, cat"},
         {"lan_agent_search_text", "search_text, search, grep, find_text, text_search"},
         {"lan_agent_list_directory", "list_directory, list_dir, ls, dir"},
+        {"lan_agent_prepare_directory_analysis", "analyze_directory, directory_analysis, prepare_directory_analysis"},
+        {"lan_agent_read_directory_files", "read_directory_files"},
         {"lan_agent_write_text_file", "write_file, write, file_write, save_file, create_file"},
         {"lan_agent_append_text_file", "append_text, append, append_file"},
         {"lan_agent_insert_after_anchor_atomic", "insert, insert_after_anchor, insert_text"},
@@ -1167,6 +1197,8 @@ std::string BuildCandidateToolsJson(const std::string & primary_intent) {
         {"lan_agent_optfile_apply_write", "optfile_apply_write, optfile_write, write_optfile"},
         {"lan_agent_run_cxparser_flow", "run_flow, run_script, execute_flow"},
         {"lan_agent_build_target", "build, build_target, compile, cmake_build"},
+        {"lan_agent_run_cli_profile", "run_cli_profile, cli_profile, run_profile"},
+        {"lan_agent_enqueue_cli_profile", "enqueue_cli_profile"},
         {"local_cli", "run_command, run_cli, local_cli, cli, cmd, command, shell, terminal"},
         {"codex_local_cli", "codex_local_cli"},
     };
@@ -1200,6 +1232,14 @@ std::string NormalizeMcpRouteTargetToolName(const std::string & target_tool_name
     }
     if (lower == "codex_local_cli") {
         return "codex_local_cli";
+    }
+    if (lower == "run_cli_profile"
+        || lower == "cli_profile"
+        || lower == "run_profile") {
+        return "lan_agent_run_cli_profile";
+    }
+    if (lower == "enqueue_cli_profile") {
+        return "lan_agent_enqueue_cli_profile";
     }
     return trimmed;
 }
@@ -1584,6 +1624,42 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             const std::string mode = requested_mode.empty()
                 ? (has_routable_request ? std::string("route") : std::string("overview"))
                 : requested_mode;
+            if (mode == "identity" || mode == "version" || mode == "system") {
+                auto ReadEnvOrDefault = [](const char * name, const std::string & fallback) {
+                    const char * value = std::getenv(name);
+                    return (value == nullptr || value[0] == '\0') ? fallback : std::string(value);
+                };
+                CommandResult result;
+                result.fields["status"] = "success";
+                result.fields["result"] = "mcp_route_identity";
+                result.fields["summary"] = "codex lan agent identity returned";
+                result.fields["agent_name"] = "codex_lan_agent";
+                result.fields["agent_version"] = ReadEnvOrDefault("CODEX_LAN_AGENT_VERSION", "0.1.0");
+                result.fields["build_id"] = ReadEnvOrDefault("CODEX_LAN_AGENT_BUILD_ID", std::string("windows-") + __DATE__ + "-" + __TIME__);
+                result.fields["git_commit"] = ReadEnvOrDefault("CODEX_LAN_AGENT_GIT_COMMIT", "unknown");
+                result.fields["platform"] = CurrentPlatformName();
+                result.fields["host_name"] = GetHostNamePortable();
+                result.fields["system_id"] = ReadEnvOrDefault(
+                    "CODEX_LAN_AGENT_SYSTEM_ID",
+                    CurrentPlatformName() + ":" + GetHostNamePortable());
+                result.fields["environment_name"] = ReadEnvOrDefault(
+                    "CODEX_LAN_AGENT_ENVIRONMENT_NAME",
+                    CurrentPlatformName() + "-local");
+                result.fields["workspace_root"] = config.workspace_root;
+                result.fields["log_root"] = config.log_root;
+                result.fields["data_root"] = config.data_root;
+                result.fields["listen_host"] = config.listen_host;
+                result.fields["listen_port"] = std::to_string(config.listen_port);
+                result.fields["mcp_route_mode"] = "identity";
+                result.fields["tool_surface_policy"] = "chat_layer_single_gateway";
+                result.fields["visible_tool_count"] = "1";
+                result.fields["visible_tool_name"] = "lan_agent_mcp_route";
+                result.fields["internal_tool_surface"] = "full_registry_hidden_from_tools_list";
+                result.fields["internal_execution_performed"] = "false";
+                result.fields["route_contract_version"] = "mcp_route_v1";
+                InjectProfileMeta(result);
+                return result;
+            }
             if (mode.empty() || mode == "overview" || mode == "guide" || mode == "guidance") {
                 CommandResult result = BuildMcpOverviewResult(config);
                 InjectProfileMeta(result);
@@ -2268,7 +2344,34 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 arguments_json = ExtractJsonObjectRaw(params.body(), "params");
             }
             if (arguments_json.empty()) {
-                arguments_json = "{}";
+                const bool has_top_level_tool_args =
+                    !Trim(params.GetString("file_path")).empty()
+                    || !Trim(params.GetString("source_file")).empty()
+                    || !Trim(params.GetString("directory_path")).empty()
+                    || !Trim(params.GetString("query_text")).empty()
+                    || !Trim(params.GetString("text")).empty()
+                    || !Trim(params.GetString("content")).empty()
+                    || !Trim(params.GetString("content_base64")).empty()
+                    || !Trim(params.GetString("build_dir")).empty()
+                    || !Trim(params.GetString("target")).empty()
+                    || !Trim(params.GetString("profile")).empty()
+                    || !Trim(params.GetString("profile_name")).empty()
+                    || !Trim(params.GetString("args")).empty()
+                    || !Trim(params.GetString("arguments_text")).empty()
+                    || !Trim(params.GetString("path")).empty()
+                    || !Trim(params.GetString("task_id")).empty()
+                    || !Trim(params.GetString("repo_root")).empty()
+                    || !Trim(params.GetString("preflight_ref")).empty()
+                    || !Trim(params.GetString("probe_ref")).empty()
+                    || !params.GetRawJson("dry_run").empty()
+                    || !params.GetRawJson("max_lines").empty()
+                    || !params.GetRawJson("start_line").empty()
+                    || !params.GetRawJson("start_byte_offset").empty()
+                    || !params.GetRawJson("timeout_sec").empty()
+                    || !params.GetRawJson("stall_timeout_sec").empty();
+                arguments_json = has_top_level_tool_args
+                    ? BuildMcpRouteDecisionParamsJson(params)
+                    : std::string("{}");
             }
             if (has_explicit_profile && ExtractJsonString(arguments_json, "model_profile").empty()) {
                 const std::size_t object_end = arguments_json.find_last_of('}');
@@ -2842,6 +2945,141 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             result.fields["preflight_auto_reason_code"] = auto_preflight_reason_code;
             return result;
         }},
+        {"lan_agent_run_cli_profile", [](const AgentConfig & config, const JsonRequestView & params) {
+            const std::string profile = FirstNonEmpty(
+                params.GetString("profile"),
+                params.GetString("profile_name"));
+            const std::string args = FirstNonEmpty(
+                params.GetString("args"),
+                params.GetString("arguments_text"));
+            const bool dry_run = params.GetBool("dry_run", false);
+            const bool has_timeout_sec = !params.GetRawJson("timeout_sec").empty();
+            const bool has_stall_timeout_sec = !params.GetRawJson("stall_timeout_sec").empty();
+            const int timeout_sec = has_timeout_sec ? params.GetInt("timeout_sec", -1) : -1;
+            const int stall_timeout_sec =
+                has_stall_timeout_sec ? params.GetInt("stall_timeout_sec", -1) : -1;
+
+            CommandResult result;
+            result.fields["profile"] = profile;
+            result.fields["args"] = args;
+            result.fields["dry_run"] = dry_run ? "true" : "false";
+            result.fields["execution_contract"] = "configured_profile_only";
+            result.fields["arbitrary_shell_allowed"] = "false";
+            result.fields["expected_marker"] = ExpectedMarkerForProfile(profile);
+            if (profile.empty()) {
+                LanResultBuilder(&result).Error(400, "profile is required");
+                result.fields["result"] = "cli_profile_validation_failed";
+                result.fields["error_code"] = "missing_profile";
+                return result;
+            }
+            if (config.profiles.find(profile) == config.profiles.end()) {
+                LanResultBuilder(&result).Error(404, "unknown profile");
+                result.fields["result"] = "cli_profile_validation_failed";
+                result.fields["error_code"] = "unknown_profile";
+                result.fields["next_action"] = "call lan_agent_list_profiles and retry with a configured profile";
+                return result;
+            }
+            if (dry_run) {
+                const auto configured_timeout = config.profile_timeouts_sec.find(profile);
+                const int resolved_timeout_sec = timeout_sec > 0
+                    ? timeout_sec
+                    : (configured_timeout != config.profile_timeouts_sec.end()
+                        ? configured_timeout->second
+                        : config.task_timeout_sec);
+                const auto configured_stall_timeout = config.profile_stall_timeouts_sec.find(profile);
+                const int resolved_stall_timeout_sec = stall_timeout_sec >= 0
+                    ? stall_timeout_sec
+                    : (configured_stall_timeout != config.profile_stall_timeouts_sec.end()
+                        ? configured_stall_timeout->second
+                        : (profile == "build_target"
+                            ? config.build_target_stall_timeout_sec
+                            : (profile == "configure_project"
+                                ? config.configure_project_stall_timeout_sec
+                                : (profile == "run_script" ? 0 : 30))));
+                result.ok = true;
+                result.exit_code = 0;
+                result.fields["status"] = "success";
+                result.fields["result"] = "cli_profile_dry_run_ready";
+                result.fields["summary"] = "CLI profile dry-run validation passed";
+                result.fields["profile_timeout_sec"] = std::to_string(
+                    std::max(0, resolved_timeout_sec));
+                result.fields["profile_stall_timeout_sec"] = std::to_string(
+                    std::max(0, resolved_stall_timeout_sec));
+                return result;
+            }
+            return RunCliProfile(
+                config,
+                profile,
+                args,
+                std::string(),
+                timeout_sec,
+                stall_timeout_sec);
+        }},
+        {"lan_agent_enqueue_cli_profile", [](const AgentConfig & config, const JsonRequestView & params) {
+            const std::string profile = FirstNonEmpty(
+                params.GetString("profile"),
+                params.GetString("profile_name"));
+            const std::string args = FirstNonEmpty(
+                params.GetString("args"),
+                params.GetString("arguments_text"));
+            const bool dry_run = params.GetBool("dry_run", false);
+            const bool has_timeout_sec = !params.GetRawJson("timeout_sec").empty();
+            const bool has_stall_timeout_sec = !params.GetRawJson("stall_timeout_sec").empty();
+            const int timeout_sec = has_timeout_sec ? params.GetInt("timeout_sec", -1) : -1;
+            const int stall_timeout_sec =
+                has_stall_timeout_sec ? params.GetInt("stall_timeout_sec", -1) : -1;
+
+            CommandResult result;
+            result.fields["profile"] = profile;
+            result.fields["args"] = args;
+            result.fields["dry_run"] = dry_run ? "true" : "false";
+            result.fields["execution_contract"] = "configured_profile_only";
+            result.fields["arbitrary_shell_allowed"] = "false";
+            result.fields["expected_marker"] = ExpectedMarkerForProfile(profile);
+            if (profile.empty()) {
+                LanResultBuilder(&result).Error(400, "profile is required");
+                result.fields["result"] = "cli_profile_enqueue_validation_failed";
+                result.fields["error_code"] = "missing_profile";
+                return result;
+            }
+            if (config.profiles.find(profile) == config.profiles.end()) {
+                LanResultBuilder(&result).Error(404, "unknown profile");
+                result.fields["result"] = "cli_profile_enqueue_validation_failed";
+                result.fields["error_code"] = "unknown_profile";
+                result.fields["next_action"] = "call lan_agent_list_profiles and retry with a configured profile";
+                return result;
+            }
+            if (dry_run) {
+                result.ok = true;
+                result.exit_code = 0;
+                result.fields["status"] = "success";
+                result.fields["result"] = "cli_profile_enqueue_dry_run_ready";
+                result.fields["summary"] = "CLI profile enqueue dry-run validation passed";
+                result.fields["queue_depth"] = g_task_manager == nullptr
+                    ? "unavailable"
+                    : std::to_string(g_task_manager->QueueDepth());
+                return result;
+            }
+            if (g_task_manager == nullptr) {
+                LanResultBuilder(&result).Error(41, "task manager is not active");
+                result.fields["result"] = "cli_profile_enqueue_failed";
+                result.fields["error_code"] = "task_manager_inactive";
+                return result;
+            }
+            result.ok = true;
+            result.exit_code = 0;
+            result.fields["status"] = "queued";
+            result.fields["result"] = "cli_profile_queued";
+            result.fields["task_id"] = g_task_manager->EnqueueCliProfile(
+                profile,
+                args,
+                timeout_sec,
+                stall_timeout_sec);
+            result.fields["queue_depth"] = std::to_string(g_task_manager->QueueDepth());
+            result.fields["summary"] = "CLI profile queued";
+            result.fields["next_action"] = "poll lan_agent_get_task with task_id or use task-latest";
+            return result;
+        }},
         {"lan_agent_preflight_run_ctest_target", [](const AgentConfig & config, const JsonRequestView & params) {
             std::string config_name = params.GetString("config", "Release");
             if (config_name.empty()) {
@@ -3065,6 +3303,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                     ? static_cast<std::size_t>(raw_start_byte_offset)
                     : static_cast<std::size_t>(0),
                 params.GetString("probe_ref"));
+            const bool binary_content_omitted =
+                GetFieldOrDefault(result, "content_omitted", "") == "true"
+                && GetFieldOrDefault(result, "content_omitted_reason", "") == "binary_or_control_bytes_detected";
             if (!params.GetBool("read_to_eof", false)) {
                 result.fields["source_has_more"] = GetFieldOrDefault(result, "has_more", "false");
                 result.fields["source_next_start_line"] = GetFieldOrDefault(result, "next_start_line", "");
@@ -3093,7 +3334,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 result.fields["required_tool_name"] = "";
                 result.fields["next_call_json"] = "";
                 result.fields["required_tool_arguments_json"] = "";
-                result.fields["next_action"] = "bounded file page read is complete";
+                result.fields["next_action"] = binary_content_omitted
+                    ? "do not retry lan_agent_read_text_file for raw binary content; use a format-specific analyzer such as SQLite/project metadata inspection"
+                    : "bounded file page read is complete";
             }
             return result;
         }},
@@ -3128,6 +3371,17 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 raw_start_byte_offset > 0
                     ? static_cast<std::size_t>(raw_start_byte_offset)
                     : static_cast<std::size_t>(0));
+        }},
+        {"lan_agent_prepare_directory_analysis", [](const AgentConfig & config, const JsonRequestView & params) {
+            return PrepareDirectoryAnalysisResult(
+                config,
+                params.GetString("directory_path"),
+                params.GetString("file_extensions_csv"),
+                std::max(1, params.GetInt("max_files", 200)),
+                std::max(1, params.GetInt("max_excerpt_lines_per_file", 80)),
+                std::max(1, params.GetInt("max_total_excerpt_lines", 1200)),
+                static_cast<std::size_t>(std::max(1024, params.GetInt("max_excerpt_chars", 24000))),
+                params.GetString("trace_id"));
         }},
         {"lan_agent_record_dialog_slice", [](const AgentConfig & config, const JsonRequestView & params) {
             const std::string record_user_text = FirstNonEmpty(

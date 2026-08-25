@@ -2919,6 +2919,56 @@ std::string BuildPreGuardRouteCallJson(
         AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
     }
 
+    if (route_target == "lan_agent_read_directory_files") {
+        arguments_json = "{";
+        first_field = true;
+        const std::string dir_path = FirstNonEmpty(params.GetString("directory_path"), file_path);
+        AppendJsonStringField(&arguments_json, &first_field, "directory_path", dir_path);
+        AppendJsonStringField(&arguments_json, &first_field, "file_extensions_csv", params.GetString("file_extensions_csv"));
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"max_files\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_files", 200)));
+        arguments_json += ",\"max_lines_per_file\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_lines_per_file", 500)));
+        arguments_json += ",\"max_files_per_call\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_files_per_call", 5)));
+        arguments_json += ",\"max_total_lines\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_total_lines", 2500)));
+        arguments_json += ",\"file_index\":";
+        arguments_json += std::to_string(std::max(0, params.GetInt("file_index", 0)));
+        arguments_json += ",\"start_line\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("start_line", 1)));
+        arguments_json += ",\"start_byte_offset\":";
+        arguments_json += std::to_string(std::max(0, params.GetInt("start_byte_offset", 0)));
+        first_field = false;
+    }
+
+    if (route_target == "lan_agent_prepare_directory_analysis") {
+        arguments_json = "{";
+        first_field = true;
+        const std::string dir_path = FirstNonEmpty(params.GetString("directory_path"), file_path);
+        AppendJsonStringField(&arguments_json, &first_field, "directory_path", dir_path);
+        AppendJsonStringField(&arguments_json, &first_field, "file_extensions_csv", params.GetString("file_extensions_csv"));
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"max_files\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_files", 200)));
+        arguments_json += ",\"max_excerpt_lines_per_file\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_excerpt_lines_per_file", 80)));
+        arguments_json += ",\"max_total_excerpt_lines\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("max_total_excerpt_lines", 1200)));
+        arguments_json += ",\"max_excerpt_chars\":";
+        arguments_json += std::to_string(std::max(1024, params.GetInt("max_excerpt_chars", 24000)));
+        first_field = false;
+    }
+
     if (route_target == "lan_agent_search_text") {
         arguments_json = "{";
         first_field = true;
@@ -3044,6 +3094,38 @@ std::string BuildPreGuardRouteCallJson(
         AppendJsonStringField(&arguments_json, &first_field, "codex_llvm_root", params.GetString("codex_llvm_root"));
         AppendJsonStringField(&arguments_json, &first_field, "preflight_ref", params.GetString("preflight_ref"));
         AppendJsonStringField(&arguments_json, &first_field, "preflight_status", params.GetString("preflight_status"));
+        AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
+        AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
+        AppendJsonBoolField(
+            &arguments_json,
+            &first_field,
+            "dry_run",
+            params.GetBool("dry_run", false),
+            true);
+        if (!first_field) {
+            arguments_json += ",";
+        }
+        arguments_json += "\"timeout_sec\":";
+        arguments_json += std::to_string(std::max(1, params.GetInt("timeout_sec", 1800)));
+        arguments_json += ",\"stall_timeout_sec\":";
+        arguments_json += std::to_string(std::max(0, params.GetInt("stall_timeout_sec", 0)));
+        first_field = false;
+    }
+
+    if (route_target == "lan_agent_run_cli_profile"
+        || route_target == "lan_agent_enqueue_cli_profile") {
+        arguments_json = "{";
+        first_field = true;
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "profile",
+            FirstNonEmpty(params.GetString("profile"), params.GetString("profile_name")));
+        AppendJsonStringField(
+            &arguments_json,
+            &first_field,
+            "args",
+            FirstNonEmpty(params.GetString("args"), params.GetString("arguments_text")));
         AppendJsonStringField(&arguments_json, &first_field, "trace_id", trace_id);
         AppendJsonStringField(&arguments_json, &first_field, "request_id", request_id);
         AppendJsonBoolField(

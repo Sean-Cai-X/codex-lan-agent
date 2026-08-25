@@ -66,10 +66,10 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
             "none"
         },
         {
-            "run_light_command",
-            "Run a known lightweight CLI profile directly; avoid for build/test workloads.",
+            "run_cli_profile",
+            "Run one configured CLI profile through the auditable gateway; profile must exist in config.profiles.",
             "lan_agent_run_cli_profile",
-            "{\"profile\":\"required string\",\"args\":\"optional string\",\"safe_profile_allowlist\":[\"check_build_dir\",\"run_script\",\"run_local_chat\"]}",
+            "{\"profile\":\"required string\",\"profile_name\":\"optional alias\",\"args\":\"optional string\",\"arguments_text\":\"optional alias\",\"dry_run\":\"optional boolean\",\"timeout_sec\":\"optional integer\",\"stall_timeout_sec\":\"optional integer\"}",
             "{\"exit_code\":\"0\",\"semantic_outcome\":\"not_failed\"}",
             "{\"tool\":\"lan_agent_enqueue_cli_profile\",\"reason\":\"command may be long-running\"}",
             "[\"profile\",\"exit_code\",\"log_path\",\"semantic_outcome\",\"expected_marker\"]",

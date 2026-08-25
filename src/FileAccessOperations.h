@@ -211,6 +211,40 @@ std::string ExtractHelperContentBlock(const std::string & text) {
     return text.substr(content_begin, content_end - content_begin);
 }
 
+bool LooksLikeBinaryPayload(const std::string & content) {
+    if (content.empty()) {
+        return false;
+    }
+    std::size_t control_count = 0;
+    const std::size_t sample_size = std::min<std::size_t>(content.size(), 4096);
+    for (std::size_t index = 0; index < sample_size; ++index) {
+        const unsigned char ch = static_cast<unsigned char>(content[index]);
+        if (ch == '\0') {
+            return true;
+        }
+        if (ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t' && ch != '\f' && ch != '\b') {
+            ++control_count;
+        }
+    }
+    return control_count >= 8;
+}
+
+void MarkBinaryReadContentOmitted(CommandResult * result) {
+    if (result == nullptr) {
+        return;
+    }
+    result->fields["content"] = "";
+    result->fields["content_text"] = "";
+    result->fields["content_omitted"] = "true";
+    result->fields["content_omitted_reason"] = "binary_or_control_bytes_detected";
+    result->fields["content_payload_format"] = "binary";
+    result->fields["binary_file_detected"] = "true";
+    result->fields["analysis_allowed"] = "true";
+    result->fields["summary"] = "binary file metadata returned; raw content omitted";
+    result->fields["next_action"] =
+        "do not retry lan_agent_read_text_file for raw binary content; use a format-specific analyzer such as SQLite/project metadata inspection";
+}
+
 std::string QuoteDirectoryAccessArgument(const std::string & value) {
     std::string quoted = "\"";
     for (const char ch : value) {
@@ -3044,14 +3078,18 @@ CommandResult ReadTextFileResult(
             result_from_helper.fields["page_count"] = std::to_string(page_count);
             result_from_helper.fields["requires_followup"] = has_more ? "true" : "false";
             result_from_helper.fields["file_bytes"] = "0";
-            result_from_helper.fields["content"] = ExtractHelperContentBlock(
+            const std::string helper_content = ExtractHelperContentBlock(
                 helper_result.fields.at("directory_access_helper_output"));
-            result_from_helper.fields["content_text"] = result_from_helper.fields["content"];
+            result_from_helper.fields["content"] = helper_content;
+            result_from_helper.fields["content_text"] = helper_content;
             result_from_helper.fields["content_begin"] = "content_begin<<<";
             result_from_helper.fields["content_end"] = ">>>content_end";
             result_from_helper.fields["content_begin_marker"] = "content_begin<<<";
             result_from_helper.fields["content_end_marker"] = ">>>content_end";
             result_from_helper.fields["content_payload_format"] = StructuredPayloadFormatForPath(normalized);
+            if (LooksLikeBinaryPayload(helper_content)) {
+                MarkBinaryReadContentOmitted(&result_from_helper);
+            }
             result_from_helper.fields["pagination_basis"] = "line_based";
             result_from_helper.fields["start_byte_offset"] = "0";
             result_from_helper.fields["returned_bytes"] =

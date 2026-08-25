@@ -42,6 +42,44 @@ inline std::string ToLowerAsciiLocal(std::string value) {
     return value;
 }
 
+inline bool IsSupportedClangFormatSourcePath(const std::filesystem::path & path) {
+    const std::string filename = ToLowerAsciiLocal(path.filename().string());
+    if (filename == "cmakelists.txt"
+        || filename == ".clang-format"
+        || filename == "_clang-format") {
+        return true;
+    }
+
+    const std::string extension = ToLowerAsciiLocal(path.extension().string());
+    static const std::vector<std::string> supported_extensions = {
+        ".c", ".cc", ".cpp", ".cxx", ".c++",
+        ".h", ".hh", ".hpp", ".hxx", ".h++",
+        ".inl", ".ipp", ".tpp",
+        ".m", ".mm",
+        ".cu", ".cuh",
+        ".proto", ".td", ".java", ".js", ".ts", ".cs"
+    };
+    return std::find(
+        supported_extensions.begin(),
+        supported_extensions.end(),
+        extension) != supported_extensions.end();
+}
+
+inline bool LooksLikeBinaryContent(const std::string & content) {
+    const std::size_t sample_size = std::min<std::size_t>(content.size(), 4096);
+    std::size_t control_count = 0;
+    for (std::size_t index = 0; index < sample_size; ++index) {
+        const unsigned char ch = static_cast<unsigned char>(content[index]);
+        if (ch == '\0') {
+            return true;
+        }
+        if (ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t' && ch != '\f' && ch != '\b') {
+            ++control_count;
+        }
+    }
+    return control_count >= 8;
+}
+
 inline std::string StableHash(const std::string & content) {
     std::uint64_t hash = 1469598103934665603ull;
     for (unsigned char ch : content) {
@@ -420,6 +458,24 @@ inline CommandResult BuildFormatCodeFileResult(
     result.fields["normalized_path"] = normalized_source.string();
     result.fields["current_file_path"] = normalized_source.string();
 
+    if (!IsSupportedClangFormatSourcePath(normalized_source)) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["error"] = "clang-format is only allowed for supported source-code file extensions";
+        result.fields["error_code"] = "unsupported_format_extension";
+        result.fields["result"] = "format_rejected";
+        result.fields["status"] = "blocked";
+        result.fields["semantic_outcome"] = "format_rejected";
+        result.fields["format_blocked"] = "true";
+        result.fields["would_change"] = "false";
+        result.fields["changed"] = "false";
+        result.fields["disk_write_completed"] = "false";
+        result.fields["artifact_write_completed"] = "false";
+        result.fields["source_extension"] = ToLowerAsciiLocal(normalized_source.extension().string());
+        result.fields["next_action"] = "do not format this file; use read-only metadata or a format-specific binary analyzer";
+        return result;
+    }
+
     std::string candidates_json;
     std::filesystem::path formatter_path;
     std::string formatter_source;
@@ -452,6 +508,24 @@ inline CommandResult BuildFormatCodeFileResult(
     }
     result.fields["old_hash"] = StableHash(original_content);
     result.fields["source_bytes"] = std::to_string(original_content.size());
+
+    if (LooksLikeBinaryContent(original_content)) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["error"] = "clang-format refused binary or control-byte content";
+        result.fields["error_code"] = "binary_content_rejected";
+        result.fields["result"] = "format_rejected";
+        result.fields["status"] = "blocked";
+        result.fields["semantic_outcome"] = "format_rejected";
+        result.fields["format_blocked"] = "true";
+        result.fields["binary_file_detected"] = "true";
+        result.fields["would_change"] = "false";
+        result.fields["changed"] = "false";
+        result.fields["disk_write_completed"] = "false";
+        result.fields["artifact_write_completed"] = "false";
+        result.fields["next_action"] = "do not format binary/control-byte content; use a format-specific analyzer";
+        return result;
+    }
 
     const std::filesystem::path artifact_dir = BuildArtifactDirectory(config, normalized_source.filename().string());
     const std::filesystem::path backup_path = artifact_dir / (normalized_source.filename().string() + ".before");

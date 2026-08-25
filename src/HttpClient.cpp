@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <cerrno>
+#include <iomanip>
 #include <sstream>
 #include <string>
 
@@ -719,7 +720,7 @@ HttpResponse GetUrl(
 
 std::string JsonEscape(const std::string & value) {
     std::ostringstream buffer;
-    for (char character : value) {
+    for (unsigned char character : value) {
         switch (character) {
         case '\\':
             buffer << "\\\\";
@@ -737,7 +738,14 @@ std::string JsonEscape(const std::string & value) {
             buffer << "\\t";
             break;
         default:
-            buffer << character;
+            if (character < 0x20) {
+                buffer << "\\u"
+                       << std::uppercase << std::hex << std::setw(4) << std::setfill('0')
+                       << static_cast<int>(character)
+                       << std::nouppercase << std::dec;
+            } else {
+                buffer << static_cast<char>(character);
+            }
             break;
         }
     }
