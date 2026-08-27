@@ -144,6 +144,206 @@ CommandResult BuildLocalCliEnvelope(
     return result;
 }
 
+std::string BuildRunLightSafeActionAllowlist(const AgentConfig & config) {
+    std::string allowlist =
+        "check_remote_online,check_local_chat,read_latest_log,get_git_diff,read_test_result";
+    for (const auto & entry : config.local_cli_run_light_profiles) {
+        if (!entry.first.empty()) {
+            allowlist += "," + entry.first;
+        }
+    }
+    return allowlist;
+}
+
+CommandResult BuildRunLightProfileResult(
+    const AgentConfig & config,
+    const std::string & action_id,
+    const std::string & args_text,
+    const std::string & log_path,
+    bool dry_run) {
+    CommandResult result;
+    const auto mapping_it = config.local_cli_run_light_profiles.find(action_id);
+    if (mapping_it == config.local_cli_run_light_profiles.end() || mapping_it->second.empty()) {
+        result.ok = false;
+        result.exit_code = 45;
+        result.fields["error"] = "action_id is not in run-light allowlist";
+        result.fields["action_id"] = action_id;
+        result.fields["safe_action_allowlist"] = BuildRunLightSafeActionAllowlist(config);
+        return result;
+    }
+
+    const std::string profile = mapping_it->second;
+    result.fields["action_id"] = action_id;
+    result.fields["profile"] = profile;
+    result.fields["args"] = args_text;
+    result.fields["execution_backend"] = "configured_run_light_profile";
+    result.fields["config_key"] = "local_cli_run_light." + action_id;
+    result.fields["safe_action_allowlist"] = BuildRunLightSafeActionAllowlist(config);
+
+    if (config.profiles.find(profile) == config.profiles.end()) {
+        result.ok = false;
+        result.exit_code = 46;
+        result.fields["error"] = "run-light action maps to unknown profile";
+        result.fields["next_action"] = "configure profile." + profile + " or change local_cli_run_light." + action_id;
+        return result;
+    }
+
+    if (dry_run) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["status"] = "success";
+        result.fields["result"] = "run_light_profile_dry_run_ready";
+        result.fields["summary"] = "run-light action resolves to configured profile";
+        result.fields["arbitrary_shell_allowed"] = "false";
+        return result;
+    }
+
+    result = RunCliProfile(config, profile, args_text, log_path, -1, -1);
+    result.fields["action_id"] = action_id;
+    result.fields["profile"] = profile;
+    result.fields["args"] = args_text;
+    result.fields["execution_backend"] = "configured_run_light_profile";
+    result.fields["config_key"] = "local_cli_run_light." + action_id;
+    result.fields["safe_action_allowlist"] = BuildRunLightSafeActionAllowlist(config);
+    return result;
+}
+
+bool IsCxvisionUiActionAllowed(const std::string & action) {
+    return action == "list_windows" ||
+           action == "screenshot" ||
+           action == "analyze_image" ||
+           action == "click" ||
+           action == "type_text" ||
+           action == "key";
+}
+
+std::string BuildCxvisionUiDefaultOutputPath(
+    const AgentConfig & config,
+    const std::string & action,
+    const std::string & extension) {
+    const std::filesystem::path output_dir =
+        std::filesystem::path(config.log_root) / "cxvision_ui";
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    return (output_dir / (action + "_" + TimeStampForFileName() + extension)).string();
+}
+
+void AppendCxvisionFlag(
+    std::ostringstream * args,
+    const std::string & name,
+    const std::string & value) {
+    if (args == nullptr || value.empty()) {
+        return;
+    }
+    *args << " --" << name << " " << QuoteProcessArgument(value);
+}
+
+CommandResult BuildCxvisionUiResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    const std::string profile = params.GetString("profile").empty()
+        ? "cxvision_imgui_acceptance"
+        : params.GetString("profile");
+    const std::string action = ToLowerAscii(params.GetString("action"));
+    const bool dry_run = params.GetBool("dry_run", false);
+
+    CommandResult result;
+    result.fields["tool"] = "lan_agent_cxvision_ui";
+    result.fields["profile"] = profile;
+    result.fields["action"] = action;
+    result.fields["dry_run"] = dry_run ? "true" : "false";
+    result.fields["execution_contract"] = "configured_profile_only";
+    result.fields["arbitrary_shell_allowed"] = "false";
+    result.fields["allowed_actions"] = "list_windows,screenshot,analyze_image,click,type_text,key";
+    result.fields["shared_log_path"] =
+        "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxscript_runs/_shared/cxvision_imgui_acceptance.jsonl";
+
+    if (!IsCxvisionUiActionAllowed(action)) {
+        result.ok = false;
+        result.exit_code = 400;
+        result.fields["error"] = "unsupported cxvision ui action";
+        result.fields["next_action"] = "use one of allowed_actions";
+        return result;
+    }
+    if (config.profiles.find(profile) == config.profiles.end()) {
+        result.ok = false;
+        result.exit_code = 404;
+        result.fields["error"] = "cxvision ui profile is not configured";
+        result.fields["next_action"] = "configure profile." + profile + " and restart codex_lan_agent serve";
+        return result;
+    }
+
+    std::string output_path = params.GetString("output_path");
+    if (output_path.empty() && action == "screenshot") {
+        output_path = BuildCxvisionUiDefaultOutputPath(config, action, ".png");
+    }
+    if (output_path.empty() && (action == "list_windows" || action == "analyze_image")) {
+        output_path = BuildCxvisionUiDefaultOutputPath(config, action, ".json");
+    }
+
+    std::ostringstream args;
+    args << "--ui-action " << action;
+    AppendCxvisionFlag(&args, "window-title", params.GetString("window_title"));
+    AppendCxvisionFlag(&args, "window-class", params.GetString("window_class"));
+    AppendCxvisionFlag(&args, "image", params.GetString("image_path"));
+    AppendCxvisionFlag(&args, "text", params.GetString("text"));
+    AppendCxvisionFlag(&args, "key", params.GetString("key"));
+    AppendCxvisionFlag(&args, "button", params.GetString("button"));
+    if (!output_path.empty()) {
+        AppendCxvisionFlag(&args, "out", output_path);
+    }
+    if (!params.GetRawJson("x").empty()) {
+        args << " --x " << params.GetInt("x", 0);
+    }
+    if (!params.GetRawJson("y").empty()) {
+        args << " --y " << params.GetInt("y", 0);
+    }
+    if (!params.GetRawJson("width").empty()) {
+        args << " --width " << params.GetInt("width", 0);
+    }
+    if (!params.GetRawJson("height").empty()) {
+        args << " --height " << params.GetInt("height", 0);
+    }
+    const std::string extra_args = params.GetString("args").empty()
+        ? params.GetString("arguments_text")
+        : params.GetString("args");
+    if (!extra_args.empty()) {
+        args << " " << extra_args;
+    }
+
+    result.fields["args"] = args.str();
+    result.fields["output_path"] = output_path;
+    result.fields["artifact_path"] = output_path;
+    if (action == "screenshot") {
+        result.fields["image_path"] = output_path;
+        result.fields["image_mime"] = "image/png";
+    }
+
+    if (dry_run) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["status"] = "success";
+        result.fields["result"] = "cxvision_ui_dry_run_ready";
+        result.fields["summary"] = "cxvision ui action resolves to configured profile";
+        return result;
+    }
+
+    result = RunCliProfile(config, profile, args.str(), std::string(), -1, -1);
+    result.fields["tool"] = "lan_agent_cxvision_ui";
+    result.fields["profile"] = profile;
+    result.fields["action"] = action;
+    result.fields["args"] = args.str();
+    result.fields["output_path"] = output_path;
+    result.fields["artifact_path"] = output_path;
+    result.fields["shared_log_path"] =
+        "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxscript_runs/_shared/cxvision_imgui_acceptance.jsonl";
+    if (action == "screenshot") {
+        result.fields["image_path"] = output_path;
+        result.fields["image_mime"] = "image/png";
+    }
+    return result;
+}
+
 CommandResult LocalCliResult(
     const AgentConfig & config,
     const std::string & command,
@@ -169,7 +369,7 @@ CommandResult LocalCliResult(
             config,
             command,
             result,
-            "{\"command\":\"health\",\"reason\":\"missing local_cli command\"}");
+            "null");
     }
     if (command == "health") {
         return BuildLocalCliEnvelope(config, command, BuildLivenessResult(config), "null");
@@ -307,17 +507,12 @@ CommandResult LocalCliResult(
         if (action_id == "read_test_result") {
             return LocalCliResult(config, "test-result", task_id, "", "", "", "", "", log_path, args_text, false);
         }
-        result.ok = false;
-        result.exit_code = 45;
-        result.fields["error"] = "action_id is not in run-light allowlist";
-        result.fields["action_id"] = action_id;
-        result.fields["safe_action_allowlist"] =
-            "check_remote_online,check_local_chat,read_latest_log,get_git_diff,read_test_result";
+        result = BuildRunLightProfileResult(config, action_id, args_text, log_path, dry_run);
         return BuildLocalCliEnvelope(
             config,
             command,
             result,
-            "{\"command\":\"health\",\"reason\":\"unsupported run-light action\"}");
+            "null");
     }
 
     const std::string lower_command = ToLowerAscii(command);

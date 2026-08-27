@@ -32,6 +32,7 @@ struct AgentConfig {
     std::unordered_map<std::string, std::string> profiles;
     std::unordered_map<std::string, int> profile_timeouts_sec;
     std::unordered_map<std::string, int> profile_stall_timeouts_sec;
+    std::unordered_map<std::string, std::string> local_cli_run_light_profiles;
     std::unordered_map<std::string, std::string> cxparser_runtime_commands;
     std::unordered_map<std::string, int> cxparser_runtime_timeouts_sec;
     std::unordered_map<std::string, int> cxparser_runtime_stall_timeouts_sec;

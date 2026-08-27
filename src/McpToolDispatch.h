@@ -32,6 +32,9 @@ CommandResult LocalCliResult(
     const std::string & log_path,
     const std::string & args_text,
     bool dry_run);
+CommandResult BuildCxvisionUiResult(
+    const AgentConfig & config,
+    const JsonRequestView & params);
 bool TryParsePreflightReference(
     const std::string & preflight_ref,
     const std::string & expected_tool_name,
@@ -2747,6 +2750,9 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         }},
         {"lan_agent_semantic_grid_incremental_update", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::codex_lan_agent::BuildSemanticGridIncrementalUpdateResult(config, params);
+        }},
+        {"lan_agent_cxvision_ui", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildCxvisionUiResult(config, params);
         }},
         {"lan_agent_list_profiles", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildProfileListResult(config);

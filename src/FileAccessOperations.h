@@ -110,6 +110,102 @@ std::string BuildJsonStringArrayFromStrings(const std::vector<std::string> & val
     return output.str();
 }
 
+std::string NormalizeSuggestionName(const std::filesystem::path & path) {
+    const std::string name = ToLowerAscii(path.filename().string());
+    std::string normalized;
+    for (char ch : name) {
+        if (std::isalnum(static_cast<unsigned char>(ch))) {
+            normalized.push_back(ch);
+        }
+    }
+    return normalized;
+}
+
+int LongestCommonSubstringLength(const std::string & left, const std::string & right) {
+    int best = 0;
+    for (std::size_t left_index = 0; left_index < left.size(); ++left_index) {
+        for (std::size_t right_index = 0; right_index < right.size(); ++right_index) {
+            int current = 0;
+            while (left_index + static_cast<std::size_t>(current) < left.size()
+                   && right_index + static_cast<std::size_t>(current) < right.size()
+                   && left[left_index + static_cast<std::size_t>(current)]
+                       == right[right_index + static_cast<std::size_t>(current)]) {
+                ++current;
+            }
+            best = std::max(best, current);
+        }
+    }
+    return best;
+}
+
+struct NearbyFileSuggestion {
+    std::string path;
+    int score = 0;
+};
+
+std::vector<std::string> BuildNearbyFileSuggestions(
+    const std::filesystem::path & requested_path,
+    std::size_t max_suggestions = 5) {
+    std::vector<std::string> suggestions;
+    const std::filesystem::path parent = requested_path.parent_path();
+    if (parent.empty()) {
+        return suggestions;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(parent, ec) || ec) {
+        return suggestions;
+    }
+
+    const std::string requested_name = NormalizeSuggestionName(requested_path);
+    const std::string requested_extension = ToLowerAscii(requested_path.extension().string());
+    std::vector<NearbyFileSuggestion> ranked;
+    for (const auto & entry : std::filesystem::directory_iterator(parent, ec)) {
+        if (ec || !entry.is_regular_file()) {
+            continue;
+        }
+        const std::string candidate_name = NormalizeSuggestionName(entry.path());
+        if (candidate_name.empty()) {
+            continue;
+        }
+        int score = LongestCommonSubstringLength(requested_name, candidate_name) * 4;
+        if (!requested_extension.empty()
+            && ToLowerAscii(entry.path().extension().string()) == requested_extension) {
+            score += 10;
+        }
+        if (!requested_name.empty() && candidate_name.find(requested_name) != std::string::npos) {
+            score += 25;
+        }
+        if (!candidate_name.empty() && requested_name.find(candidate_name) != std::string::npos) {
+            score += 25;
+        }
+        const std::vector<std::string> common_tokens = {"line", "shape", "circle", "ellipse", "rect", "object"};
+        for (const std::string & token : common_tokens) {
+            if (requested_name.find(token) != std::string::npos
+                && candidate_name.find(token) != std::string::npos) {
+                score += 12;
+            }
+        }
+        if (score <= 12) {
+            continue;
+        }
+        ranked.push_back(NearbyFileSuggestion{entry.path().string(), score});
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const NearbyFileSuggestion & left, const NearbyFileSuggestion & right) {
+        if (left.score != right.score) {
+            return left.score > right.score;
+        }
+        return ToLowerAscii(left.path) < ToLowerAscii(right.path);
+    });
+    for (const NearbyFileSuggestion & suggestion : ranked) {
+        if (suggestions.size() >= max_suggestions) {
+            break;
+        }
+        suggestions.push_back(suggestion.path);
+    }
+    return suggestions;
+}
+
 constexpr std::size_t kStructuredBodyPageByteLimit = 64 * 1024;
 constexpr std::size_t kReadTextFileCacheMaxEntries = 128;
 constexpr std::size_t kSearchCandidateCacheMaxEntries = 64;
@@ -796,8 +892,12 @@ bool IsSearchTextCandidatePath(const std::filesystem::path & path) {
         || extension == ".md"
         || extension == ".txt"
         || extension == ".json"
+        || extension == ".jsonl"
         || extension == ".cfg"
         || extension == ".clp"
+        || extension == ".log"
+        || extension == ".out"
+        || extension == ".err"
         || extension == ".ps1"
         || extension == ".bat"
         || extension == ".cmake";
@@ -805,6 +905,7 @@ bool IsSearchTextCandidatePath(const std::filesystem::path & path) {
 
 bool SearchTextShouldSkipDirectory(const std::filesystem::path & path) {
     const std::string name = ToLowerAscii(path.filename().string());
+
     return name == ".git"
         || name == "build"
         || name.rfind("build_", 0) == 0
@@ -3272,11 +3373,20 @@ CommandResult ReadTextFileResult(
     if (!input.is_open()) {
         result.ok = false;
         result.exit_code = 23;
-        result.fields["error"] = "failed to open file";
-        result.fields["error_code"] = "file_open_failed";
-        result.fields["next_action"] = "verify the file exists, is readable, and is not locked";
+        const bool file_exists = std::filesystem::exists(normalized);
+        const std::vector<std::string> suggestions = BuildNearbyFileSuggestions(normalized);
+        result.fields["error"] = file_exists ? "failed to open file" : "file does not exist";
+        result.fields["error_code"] = file_exists ? "file_open_failed" : "file_not_found";
+        result.fields["file_exists"] = file_exists ? "true" : "false";
+        result.fields["nearby_file_suggestion_count"] = std::to_string(suggestions.size());
+        result.fields["nearby_file_suggestions_json"] = BuildJsonStringArrayFromStrings(suggestions);
+        result.fields["first_suggested_file_path"] = suggestions.empty() ? "" : suggestions.front();
+        result.fields["next_action"] = suggestions.empty()
+            ? "verify the file exists, is readable, and is not locked"
+            : "retry with first_suggested_file_path or another nearby_file_suggestions_json entry if that was intended";
         return result;
     }
+
 
     const int bounded_start_line = start_line > 0 ? start_line : 1;
     const int bounded_max_lines = max_lines > 0 ? max_lines : 500;
@@ -3418,6 +3528,7 @@ CommandResult ProbeTextFileResult(
     std::filesystem::path normalized;
     std::string path_error;
     if (!TryResolveAllowedPath(config, requested.string(), &normalized, &path_error)) {
+
         result.ok = false;
         result.exit_code = 21;
         result.fields["error"] = path_error;
@@ -3438,9 +3549,17 @@ CommandResult ProbeTextFileResult(
     if (!input.is_open()) {
         result.ok = false;
         result.exit_code = 23;
-        result.fields["error"] = "failed to open file";
-        result.fields["error_code"] = "file_open_failed";
-        result.fields["next_action"] = "verify the file exists, is readable, and is not locked";
+        const bool file_exists = std::filesystem::exists(normalized);
+        const std::vector<std::string> suggestions = BuildNearbyFileSuggestions(normalized);
+        result.fields["error"] = file_exists ? "failed to open file" : "file does not exist";
+        result.fields["error_code"] = file_exists ? "file_open_failed" : "file_not_found";
+        result.fields["file_exists"] = file_exists ? "true" : "false";
+        result.fields["nearby_file_suggestion_count"] = std::to_string(suggestions.size());
+        result.fields["nearby_file_suggestions_json"] = BuildJsonStringArrayFromStrings(suggestions);
+        result.fields["first_suggested_file_path"] = suggestions.empty() ? "" : suggestions.front();
+        result.fields["next_action"] = suggestions.empty()
+            ? "verify the file exists, is readable, and is not locked"
+            : "retry with first_suggested_file_path or another nearby_file_suggestions_json entry if that was intended";
         return result;
     }
 

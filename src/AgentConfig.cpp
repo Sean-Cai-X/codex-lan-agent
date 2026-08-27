@@ -316,6 +316,8 @@ bool LoadAgentConfig(
             loaded.cxparser_runtime_stall_timeouts_sec[key.substr(31)] = parsed_value;
         } else if (StartsWith(key, "cxparser_runtime.")) {
             loaded.cxparser_runtime_commands[key.substr(17)] = value;
+        } else if (StartsWith(key, "local_cli_run_light.")) {
+            loaded.local_cli_run_light_profiles[key.substr(20)] = value;
         } else if (StartsWith(key, "profile.")) {
             loaded.profiles[key.substr(8)] = value;
         }
