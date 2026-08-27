@@ -1,4 +1,4 @@
-﻿name: release-windows-x64
+name: release-windows-x64
 
 # ================================================================
 # Fully-online release pipeline (NO local uploads, NO vendored libs).
@@ -202,6 +202,11 @@ jobs:
     steps:
       - name: Checkout codex-lan-agent sources (CMakeLists.txt + src/ only)
         uses: actions/checkout@v4
+
+      - name: Enforce repo upload policy
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/verify_repo_upload_policy.ps1
 
       - name: Probe MSVC (vcvars64 path)
         shell: pwsh
@@ -489,4 +494,3 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
           }
           Write-Host "=== Release completed for tag $Tag ==="
-

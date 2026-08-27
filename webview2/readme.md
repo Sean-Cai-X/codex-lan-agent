@@ -75,13 +75,18 @@ proxies:
   password: CHANGE_ME_AUDIT_GATEWAY_PASSWORD
 
 rules:
+- DOMAIN,localhost,DIRECT
+- DOMAIN-SUFFIX,localhost,DIRECT
+- IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+- IP-CIDR6,::1/128,DIRECT,no-resolve
 - MATCH,codex-audit-gateway
 ```
 
 说明：
 
-- `MATCH,codex-audit-gateway` 必须是规则第一条，确保本机不再按订阅规则自行分流。
-- 文件后续订阅规则可以保留，但会被第一条 `MATCH` 截住。
+- 本地 Codex MCP 例外必须放在任何 `MATCH` 规则之前，确保 `127.0.0.1:18080/mcp` 和 `/tools` 直连本机。
+- `MATCH,codex-audit-gateway` 必须是第一条非本地 MCP 例外规则，确保其它流量不再按订阅规则自行分流。
+- 文件后续订阅规则可以保留，但会被 `MATCH,codex-audit-gateway` 截住。
 - 不要在本机添加 `DOMAIN,fonts.googleapis.com,REJECT`。
 - 不要把 OpenAI / Codex 域名加成本机绕行规则，否则会绕过网关审计。
 
@@ -255,7 +260,7 @@ PUT /proxies/GLOBAL
 
 | 当前 Mode | 选择 `codex-audit-gateway` | 选择其它订阅节点 |
 | --- | --- | --- |
-| `rule` | 如果配置第一条是 `MATCH,codex-audit-gateway`，实际流量仍先走审计网关；`GLOBAL` 选择通常不会改变这条强制规则。 | 由于第一条 `MATCH,codex-audit-gateway` 已经截住流量，其它节点选择通常不会生效。 |
+| `rule` | 如果配置中本地 MCP 例外之后第一条是 `MATCH,codex-audit-gateway`，除本机 MCP 外的实际流量仍先走审计网关；`GLOBAL` 选择通常不会改变这条强制规则。 | 由于 `MATCH,codex-audit-gateway` 已经截住流量，其它节点选择通常不会生效。 |
 | `global` | 所有项目本地 `7890` 流量都走 `192.168.8.123:2080`，由网关审计后再转发到网关内 `codex-mihomo`。这是审计合规选择。 | 所有项目本地 `7890` 流量直接走该订阅节点，绕过审计网关；`fonts.googleapis.com` 不再由网关判断。只允许临时排障，不作为正常运行方式。 |
 | `direct` | 不使用代理节点，直接连接目标。 | 同左，节点选择不生效。 |
 
@@ -263,7 +268,7 @@ PUT /proxies/GLOBAL
 
 ```text
 Mode: rule
-rules 第一条: MATCH,codex-audit-gateway
+rules 首部: local MCP DIRECT 例外，然后 MATCH,codex-audit-gateway
 ```
 
 或在明确测试 `GLOBAL` 行为时使用：

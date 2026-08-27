@@ -150,3 +150,16 @@ linux/config/**/id_*
 *.deb
 *.rpm
 *.pkg.tar.zst
+/src/_doom_fix3.patch
+/src/_doom_fix2.patch
+/src/_doom_fix.patch
+/src/_build_gn_fixed.ps1
+/src/_fix_gn_doom2.py
+/src/_doom_commit_msg.txt
+/src/_doom_fix5.patch
+/src/_gen_patch5.py
+/src/_gn_commit_msg.txt
+/src/_build_gn_full.ps1
+/src/_prep_index.py
+/src/_doom_fix4.patch
+/src/_gen_patch.py

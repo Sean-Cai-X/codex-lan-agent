@@ -155,6 +155,37 @@ std::string BuildRunLightSafeActionAllowlist(const AgentConfig & config) {
     return allowlist;
 }
 
+std::string DefaultArgsForRunLightAction(const std::string & action_id) {
+    if (action_id == "ui_screenshot") return "--action screenshot";
+    if (action_id == "ui_cursor") return "--action cursor";
+    if (action_id == "ui_move") return "--action move";
+    if (action_id == "ui_click") return "--action click";
+    if (action_id == "ui_key") return "--action key";
+    if (action_id == "ui_key_press") return "--action key";
+    if (action_id == "ui_type") return "--action type";
+    if (action_id == "ui_hotkey") return "--action hotkey";
+    if (action_id == "ui_activate_window") return "--action activate-window";
+    if (action_id == "ui_get_focused_control") return "--action focused-control";
+    if (action_id == "ui_analyze") return "--action analyze";
+    if (action_id == "ui_screenshot_analyze") return "--action screenshot-analyze";
+    return std::string();
+}
+
+std::string MergeRunLightArgs(const std::string & action_id, const std::string & args_text) {
+    const std::string default_args = DefaultArgsForRunLightAction(action_id);
+    if (default_args.empty()) {
+        return args_text;
+    }
+    const std::string lower_args = ToLowerAscii(args_text);
+    if (lower_args.find("--action") != std::string::npos || lower_args.find("-a ") != std::string::npos) {
+        return args_text;
+    }
+    if (args_text.empty()) {
+        return default_args;
+    }
+    return default_args + " " + args_text;
+}
+
 CommandResult BuildRunLightProfileResult(
     const AgentConfig & config,
     const std::string & action_id,
@@ -169,13 +200,20 @@ CommandResult BuildRunLightProfileResult(
         result.fields["error"] = "action_id is not in run-light allowlist";
         result.fields["action_id"] = action_id;
         result.fields["safe_action_allowlist"] = BuildRunLightSafeActionAllowlist(config);
+        result.fields["small_model_hint"] = "Keep command=run-light and choose action_id from safe_action_allowlist; do not put an exe path, powershell, cmd, screenshot, or Headless in command.";
+        result.fields["next_command"] = "run-light";
+        result.fields["next_action_id"] = "ui_screenshot";
+        result.fields["next_args_text"] = "";
+        result.fields["next_dry_run"] = "true";
         return result;
     }
 
     const std::string profile = mapping_it->second;
+    const std::string effective_args_text = MergeRunLightArgs(action_id, args_text);
     result.fields["action_id"] = action_id;
     result.fields["profile"] = profile;
-    result.fields["args"] = args_text;
+    result.fields["args"] = effective_args_text;
+    result.fields["raw_args"] = args_text;
     result.fields["execution_backend"] = "configured_run_light_profile";
     result.fields["config_key"] = "local_cli_run_light." + action_id;
     result.fields["safe_action_allowlist"] = BuildRunLightSafeActionAllowlist(config);
@@ -198,10 +236,11 @@ CommandResult BuildRunLightProfileResult(
         return result;
     }
 
-    result = RunCliProfile(config, profile, args_text, log_path, -1, -1);
+    result = RunCliProfile(config, profile, effective_args_text, log_path, -1, -1);
     result.fields["action_id"] = action_id;
     result.fields["profile"] = profile;
-    result.fields["args"] = args_text;
+    result.fields["args"] = effective_args_text;
+    result.fields["raw_args"] = args_text;
     result.fields["execution_backend"] = "configured_run_light_profile";
     result.fields["config_key"] = "local_cli_run_light." + action_id;
     result.fields["safe_action_allowlist"] = BuildRunLightSafeActionAllowlist(config);
@@ -540,9 +579,15 @@ CommandResult LocalCliResult(
     result.fields["error"] = "unsupported local_cli command";
     result.fields["recommended_tool_for_file_write"] = "lan_agent_write_text_file";
     result.fields["tool_selection_rule"] =
-        "Use lan_agent_write_text_file for generate/create/write/append text files; local_cli is only for whitelisted operations.";
+        "Use lan_agent_write_text_file for text file writes. For desktop screenshot/mouse/image analysis, use command=run-light with action_id, not a shell/exe command.";
     result.fields["supported_commands"] =
         "health,chat-status,task-latest,task,log-latest,diff,run-light,build-target,test-result,thread-report,mkdir";
+    result.fields["desktop_ui_actions_csv"] = "ui_screenshot,ui_cursor,ui_move,ui_click,ui_key,ui_key_press,ui_type,ui_hotkey,ui_activate_window,ui_get_focused_control,ui_analyze,ui_screenshot_analyze";
+    result.fields["small_model_hint"] = "If the user asks for screenshot/click/desktop image analysis, retry with command=run-light and action_id=ui_screenshot or another desktop_ui_actions_csv item.";
+    result.fields["next_command"] = "run-light";
+    result.fields["next_action_id"] = "ui_screenshot";
+    result.fields["next_args_text"] = "";
+    result.fields["next_dry_run"] = "true";
     return BuildLocalCliEnvelope(
         config,
         command,

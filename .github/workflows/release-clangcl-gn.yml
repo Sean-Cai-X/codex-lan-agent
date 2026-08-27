@@ -16,7 +16,7 @@ on:
         default: ""
         type: string
       force_rebuild_llvm:
-        description: "Force rebuild LLVM/Clang toolchain cache"
+        description: "Force rebuild LLVM/Clang toolchain cache (slow; default release requires an existing cache hit)"
         required: false
         default: false
         type: boolean
@@ -61,10 +61,14 @@ jobs:
           key: ${{ env.LLVM_CACHE_KEY }}
           save-always: true
 
+      - name: Require existing LLVM_ROOT cache unless force rebuild is requested
+        if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' && github.event.inputs.force_rebuild_llvm != 'true' }}
+        shell: pwsh
+        run: |
+          throw "LLVM_ROOT cache miss for $env:LLVM_CACHE_KEY. Default GN x64 release does not rebuild LLVM; rerun workflow_dispatch with force_rebuild_llvm=true only when intentionally refreshing the LLVM cache."
+
       - name: Build LLVM/Clang from official source and assemble LLVM_ROOT
-        if: |
-          steps.cache-llvm.outputs.cache-hit != 'true' ||
-          github.event.inputs.force_rebuild_llvm == 'true'
+        if: ${{ github.event.inputs.force_rebuild_llvm == 'true' }}
         shell: cmd
         run: |
           call "%VCVARS_PATH%"
@@ -199,7 +203,7 @@ jobs:
             "### Build path",
             "- GN is downloaded at workflow runtime from the configured network source and is not committed.",
             "- ``.gn``, ``BUILD.gn``, and ``.gn_bootstrap_codex/`` are generated temporarily by ``scripts/build_gn_clangcl_release.ps1`` and removed after packaging.",
-            "- LLVM/Clang 18.1.8 is built from official source and cached as ``LLVM_ROOT`` with ``bin/clang-cl.exe``, ``include/``, and ``lib/``.",
+            "- LLVM/Clang 18.1.8 is restored from the GitHub Actions cache by default; it is rebuilt only when ``force_rebuild_llvm=true`` is set manually.",
             "- The final binary is compiled through GN-generated Ninja using ``clang-cl.exe``.",
             "",
             "### Cache and provenance",

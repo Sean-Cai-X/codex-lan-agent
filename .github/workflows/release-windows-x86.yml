@@ -189,6 +189,11 @@ jobs:
       - name: Checkout codex-lan-agent sources
         uses: actions/checkout@v4
 
+      - name: Enforce repo upload policy
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/verify_repo_upload_policy.ps1
+
       - name: Probe MSVC (vcvars32 path — critical for x86 target)
         shell: pwsh
         run: |

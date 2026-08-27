@@ -426,6 +426,14 @@ CommandResult BuildMcpOverviewResult(const AgentConfig & config) {
     result.fields["local_ai_mcp_guidance_version"] = "local_ai_mcp_guidance_v1";
     result.fields["local_ai_required_entry"] =
         "start with lan_agent_mcp_overview and tools/list; use lan_agent_clips_decide before uncertain write/edit/build/test routing";
+    result.fields["desktop_ui_available"] = "true";
+    result.fields["desktop_ui_entry_tool"] = "lan_agent_run_command";
+    result.fields["desktop_ui_command"] = "run-light";
+    result.fields["desktop_ui_actions_csv"] = "ui_screenshot,ui_cursor,ui_move,ui_click,ui_key,ui_key_press,ui_type,ui_hotkey,ui_activate_window,ui_get_focused_control,ui_analyze,ui_screenshot_analyze";
+    result.fields["desktop_ui_model_hint"] =
+        "Small models: do not conclude desktop screenshot/click is unavailable just because tools/list exposes only lan_agent_mcp_route; use desktop_ui_call_example_json exactly.";
+    result.fields["desktop_ui_call_example_json"] =
+        "{\"mode\":\"call\",\"target_tool_name\":\"lan_agent_run_command\",\"arguments\":{\"command\":\"run-light\",\"action_id\":\"ui_screenshot\",\"args_text\":\"\",\"dry_run\":true}}";
     result.fields["local_ai_common_file_operation_policy"] =
         "probe first, operate on one file, use bounded windows or one atomic mutation, verify each step, and follow next_call_json until terminal";
     result.fields["local_ai_context_policy"] =
@@ -442,16 +450,9 @@ CommandResult BuildMcpOverviewResult(const AgentConfig & config) {
         "every interrupted or finished chat must preserve conversation_close_status; a new chat must first call next_chat_status_check_arguments_json or lan_agent_task_memory_resume_context before executing resume work";
     result.fields["local_ai_guidance_json"] =
         "{\"version\":\"local_ai_mcp_guidance_v1\","
-        "\"entry\":[\"lan_agent_mcp_overview\",\"tools/list\",\"lan_agent_clips_decide when routing is uncertain\"],"
-        "\"context\":[\"current goal\",\"current file/path\",\"one next MCP call\",\"completion gate\",\"result_ref/evidence_ref only\",\"no full old chat\",\"no full tools/list schemas\",\"no full logs/artifacts in prompt\"],"
-        "\"file_ops\":[\"probe first\",\"single file\",\"bounded window or one atomic mutation\",\"verify each step\",\"follow next_call_json until terminal\"],"
-        "\"comment_cleanup\":[\"lan_agent_probe_text_file\",\"lan_agent_delete_text_range_window_atomic max_lines=200\",\"repeat next_call_json until has_more=false\"],"
-        "\"code_format_cleanup\":[\"lan_agent_format_code_file dry_run=true\",\"if would_change=true and user requested cleanup then lan_agent_format_code_file dry_run=false\",\"never use scan_text_ranges/delete_text_range_window_atomic for whitespace/newline formatting\"],"
-        "\"long_loop\":[\"lan_agent_task_memory_freeze\",\"lan_agent_task_memory_execute_continuation_budget\",\"chat/client resets to a fresh context\",\"lan_agent_task_memory_resume_and_execute with goal_id\"],"
-        "\"fresh_chat_resume\":[\"lan_agent_task_memory_resume_and_execute with goal_id\",\"repeat returned required_tool_arguments_json only if continue_required=true\"],"
-        "\"clean_handoff\":[\"clean_chat_close_allowed=true means current chat can stop without claiming task completion\",\"chat_context_reset_required=true requires the chat/client to start a fresh context\",\"MCP cannot delete host history; old_context_dropped remains false until client acknowledgment\",\"new chat calls new_chat_entry_arguments_json\",\"handoff_completion_claim=not_task_complete forbids completion wording\"],"
-        "\"conversation_close_status\":[\"old chat must expose conversation_close_status\",\"new chat first calls next_chat_status_check_arguments_json\",\"then verify next_chat_must_verify_fields_json before continuing\"],"
-        "\"completion_gate\":[\"terminal_state=true\",\"completion_claim_allowed=true\",\"final_answer_allowed=true\",\"verification_ok=true\"]}";
+        "\"desktop_ui\":{\"available\":true,\"entry_tool\":\"lan_agent_run_command\",\"command\":\"run-light\","
+        "\"actions\":[\"ui_screenshot\",\"ui_cursor\",\"ui_move\",\"ui_click\",\"ui_key\",\"ui_key_press\",\"ui_type\",\"ui_hotkey\",\"ui_activate_window\",\"ui_get_focused_control\",\"ui_analyze\",\"ui_screenshot_analyze\"],"
+        "\"small_model_rule\":\"use desktop_ui_call_example_json; do not stop because standalone screenshot/click tools are absent\"}}";
     result.fields["local_ai_context_bootstrap_json"] =
         "{\"record_model\":\"mcp_context_bootstrap_v1\","
         "\"max_prompt_payload\":\"short\","

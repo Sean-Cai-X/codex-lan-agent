@@ -55,6 +55,10 @@ target_include_directories(codex_lan_agent PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
+if(MSVC)
+  target_compile_options(codex_lan_agent PRIVATE /bigobj)
+endif()
+
 # --- fact-factory 守卫层依赖 ---
 # CppJieba (header-only, INTERFACE library)
 set(CODEX_LAN_AGENT_CPPJIEBA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cppjieba"
