@@ -88,6 +88,7 @@ bool StartsWithPath(
     const std::filesystem::path & prefix);
 
 #include "TaskMemoryOperations.h"
+#include "ThreadSignalOperations.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

@@ -3883,6 +3883,15 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_cmm_delete_project", [](const AgentConfig & config, const JsonRequestView & params) {
             return BuildCmmDeleteProjectResult(config, params);
         }},
+        {"lan_agent_thread_signal_set", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildThreadSignalSetResult(config, params);
+        }},
+        {"lan_agent_thread_signal_get", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildThreadSignalGetResult(config, params);
+        }},
+        {"lan_agent_thread_signal_list", [](const AgentConfig & config, const JsonRequestView & params) {
+            return BuildThreadSignalListResult(config, params);
+        }},
         {"lan_agent_run_clang_ast_parser", [](const AgentConfig & config, const JsonRequestView & params) {
             return ::BuildRunClangAstParserResult(config, params);
         }},
@@ -3974,6 +3983,9 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"lan_agent_task_memory_migration_assess", "task_memory_read", "task_memory_migration_assess", "low", "task-memory,migration,backend-readiness,read_only"},
         {"lan_agent_task_memory_structure_manifest", "task_memory_write", "task_memory_structure_manifest", "medium", "task-memory,structure,manifest,write,audited"},
         {"lan_agent_task_memory_resume_context", "task_memory_read", "task_memory_resume_context", "low", "task-memory,resume-context,read_only"},
+        {"lan_agent_thread_signal_set", "thread_signal_write", "thread_signal_set", "low", "thread-signal,status,inter-thread,write,audited"},
+        {"lan_agent_thread_signal_get", "thread_signal_read", "thread_signal_get", "low", "thread-signal,status,inter-thread,read_only"},
+        {"lan_agent_thread_signal_list", "thread_signal_read", "thread_signal_list", "low", "thread-signal,status,inter-thread,read_only"},
         {"lan_agent_remote_session_semantic_catalog", "remote_session_semantic_catalog", "remote_session_semantic_catalog", "low", "remote-session,semantic-catalog,read_only"},
         {"lan_agent_semantic_grid_ingest_text", "semantic_grid_ingest", "semantic_grid_ingest_text", "low", "semantic-grid,ingest,text,read_only"},
         {"lan_agent_semantic_grid_build", "semantic_grid_build", "semantic_grid_build", "medium", "semantic-grid,build,artifact"},

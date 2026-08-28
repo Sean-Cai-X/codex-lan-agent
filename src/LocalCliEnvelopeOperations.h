@@ -186,6 +186,34 @@ std::string MergeRunLightArgs(const std::string & action_id, const std::string &
     return default_args + " " + args_text;
 }
 
+std::pair<std::string, std::string> NormalizeRunLightActionAndArgs(
+    const AgentConfig & config,
+    const std::string & action_id,
+    const std::string & args_text) {
+    if (!Trim(action_id).empty()) {
+        return {action_id, args_text};
+    }
+
+    const std::string trimmed_args = Trim(args_text);
+    if (trimmed_args.empty()) {
+        return {action_id, args_text};
+    }
+
+    const std::size_t split_pos = trimmed_args.find_first_of(" \t\r\n");
+    const std::string first_token = split_pos == std::string::npos
+        ? trimmed_args
+        : trimmed_args.substr(0, split_pos);
+    const auto mapping_it = config.local_cli_run_light_profiles.find(first_token);
+    if (mapping_it == config.local_cli_run_light_profiles.end() || mapping_it->second.empty()) {
+        return {action_id, args_text};
+    }
+
+    const std::string remaining_args = split_pos == std::string::npos
+        ? std::string()
+        : Trim(trimmed_args.substr(split_pos + 1));
+    return {first_token, remaining_args};
+}
+
 CommandResult BuildRunLightProfileResult(
     const AgentConfig & config,
     const std::string & action_id,
@@ -531,28 +559,36 @@ CommandResult LocalCliResult(
     }
     if (command == "run-light") {
         CommandResult result;
-        if (action_id == "check_remote_online") {
+        const auto normalized_run_light = NormalizeRunLightActionAndArgs(config, action_id, args_text);
+        const std::string normalized_action_id = normalized_run_light.first;
+        const std::string normalized_args_text = normalized_run_light.second;
+        if (normalized_action_id == "check_remote_online") {
             return LocalCliResult(config, "health", "", "", "", "", "", "", "", "", false);
         }
-        if (action_id == "check_local_chat") {
+        if (normalized_action_id == "check_local_chat") {
             return LocalCliResult(config, "chat-status", "", "", "", "", "", "", "", "", false);
         }
-        if (action_id == "read_latest_log") {
+        if (normalized_action_id == "read_latest_log") {
             return LocalCliResult(config, "log-latest", "", "", "", "", "", "", "", "", false);
         }
-        if (action_id == "get_git_diff") {
+        if (normalized_action_id == "get_git_diff") {
             return LocalCliResult(config, "diff", "", repo_root, "", "", "", "", "", "", false);
         }
-        if (action_id == "read_test_result") {
-            return LocalCliResult(config, "test-result", task_id, "", "", "", "", "", log_path, args_text, false);
+        if (normalized_action_id == "read_test_result") {
+            return LocalCliResult(config, "test-result", task_id, "", "", "", "", "", log_path, normalized_args_text, false);
         }
-        result = BuildRunLightProfileResult(config, action_id, args_text, log_path, dry_run);
+        result = BuildRunLightProfileResult(config, normalized_action_id, normalized_args_text, log_path, dry_run);
+        result.fields["requested_action_id"] = action_id;
+        result.fields["requested_args_text"] = args_text;
+        result.fields["run_light_input_compat"] = action_id.empty() && normalized_action_id != action_id ? "args_text_first_token" : "action_id_field";
         return BuildLocalCliEnvelope(
             config,
             command,
             result,
             "null");
     }
+
+    const std::string lower_command = ToLowerAscii(command);
 
     const std::string lower_command = ToLowerAscii(command);
     if (lower_command.rfind("echo", 0) == 0 || command.find(">>") != std::string::npos || command.find(">") != std::string::npos) {
