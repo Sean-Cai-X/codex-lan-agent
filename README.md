@@ -3994,6 +3994,36 @@ local_cli_run_light.verify_repo_upload_policy=verify_repo_upload_policy
 
 `codex-lan-agent` 默认只向 MCP 客户端暴露一个网关工具 `lan_agent_mcp_route`。因此，`tools/list` 中没有单独的 `screenshot`、`click`、`keyboard` 工具，并不代表桌面截图、鼠标控制或图像分析能力不存在。
 
+
+网关选择先看 identity 和路径探测，不要只看返回体里的 `listen_port`：
+
+```text
+Windows 桌面验收入口: codex_lan_agent_18080 / http://127.0.0.1:18080/mcp
+必须能访问: D:/Codex-WorkDir/Sean_WorkDir/cxvisionai
+必须避免: codex_lan_agent_18081 报告 system_id=linux:codexdeb12、environment_name=linux-local、workspace_root=/opt/codex-lan-agent 的入口
+```
+
+如果 identity 或返回字段中出现 `platform=linux`、`workspace_root=/opt/codex-lan-agent`、`system_id=linux:codexdeb12`，即使它同时报告 `listen_port=18080`，也不能用于 Windows GUI、D 盘文件、进程占用、编译或截图任务。此时结论不是 `MANUAL_GUI_NOT_RUN`，而是“当前线程选中了 Linux 网关；需要重新加载 `codex_lan_agent_18080` Windows MCP 工具”。
+
+最小 Windows 网关探测：
+
+```json
+{"mode":"identity"}
+```
+
+```json
+{
+  "mode": "call",
+  "target_tool_name": "lan_agent_list_directory",
+  "arguments": {
+    "directory_path": "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai"
+  }
+}
+```
+
+判定通过条件：目录探测返回 `ok=true`，并且 `normalized_path` / `file_paths` 使用 `D:\\Codex-WorkDir\\Sean_WorkDir\\cxvisionai`。如果返回 `/opt/codex-lan-agent` 或 Windows 路径探测 `exit_code=32`，当前工具注册是错误主机。
+
+
 桌面能力的稳定入口是二级动作面：
 
 ```text
