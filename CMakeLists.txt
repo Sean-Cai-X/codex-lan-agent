@@ -188,6 +188,26 @@ if(CODEX_LAN_AGENT_COPY_TO_ROOT)
   )
 endif()
 
+set(CODEX_LAN_AGENT_STAGE_BIN_DIR
+  "${CMAKE_BINARY_DIR}/stage_x64/bin"
+  CACHE PATH "Directory containing the staged codex_lan_agent runtime executable"
+)
+set(CODEX_LAN_AGENT_PROJECT_RUNTIME_DIR
+  "${CMAKE_SOURCE_DIR}"
+  CACHE PATH "Directory containing the project-root codex_lan_agent runtime executable used by run_agent_server_logged.bat"
+)
+add_custom_target(stage_codex_lan_agent
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+    "${CODEX_LAN_AGENT_STAGE_BIN_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "$<TARGET_FILE:codex_lan_agent>"
+    "${CODEX_LAN_AGENT_STAGE_BIN_DIR}/$<TARGET_FILE_NAME:codex_lan_agent>"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "$<TARGET_FILE:codex_lan_agent>"
+    "${CODEX_LAN_AGENT_PROJECT_RUNTIME_DIR}/$<TARGET_FILE_NAME:codex_lan_agent>"
+  DEPENDS codex_lan_agent
+)
+
 option(
   CODEX_LAN_AGENT_BUILD_CLANG_INDEXER
   "Build cxparser_clang_indexer alongside codex_lan_agent (requires LLVM/Clang)"
