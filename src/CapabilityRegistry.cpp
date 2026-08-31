@@ -959,6 +959,20 @@ const std::vector<SemanticActionSpec> & GetSemanticActionSpecs() {
 const std::vector<McpCapabilitySpec> & GetMcpCapabilitySpecs() {
     static const std::vector<McpCapabilitySpec> specs = {
         // -----------------------------------------------------------------
+        // Local Intent Acceptance
+        // -----------------------------------------------------------------
+        {
+            "intent_acceptance",
+            "codex_lan_agent_intent_acceptance",
+            "codex-lan-agent",
+            "user_intent,request_text?,primary_intent?,scope_path?,file_path?,directory_path?,build_dir?,target?,test_regex?,task_id?,task_ref?,trace_id?",
+            "acceptance_decision,intent_class,matched_capability,next_tool_name,required_arguments_json,plan_steps_json,verification_contract_json,agent_can_complete,llm_decomposition_required,missing_args,reason_code,risk,confidence",
+            "CapabilityRegistry + deterministic MCP route/semantic action policy",
+            "structured JSON",
+            "local_agent_intent_acceptance",
+            "Preferred first local-task entry: decide whether MCP can accept and close the task before the LLM decomposes it into gateway-style primitive calls."
+        },
+        // -----------------------------------------------------------------
         // Remote Session
         // -----------------------------------------------------------------
         {

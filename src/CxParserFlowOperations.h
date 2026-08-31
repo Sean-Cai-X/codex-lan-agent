@@ -658,7 +658,9 @@ CommandResult RunCxParserFlowResult(
     result.fields["public_entry_flow_id"] = "cxparser_ext_cxscript_cli";
     result.fields["public_entry_contract"] = "--script | --kind --layer --module --case";
     result.fields["cxparser_public_build_root"] =
-        (std::filesystem::path(config.workspace_root) / "cxparser" / "build").string();
+        (config.cxparser_public_build_root.empty()
+            ? (std::filesystem::path(config.workspace_root) / "cxparser" / "build")
+            : std::filesystem::path(config.cxparser_public_build_root)).string();
     result.fields["cxparser_public_build_contract"] = "single_public_build_directory";
     result.fields["cxparser_public_entry"] =
         resolved_flow_id == "cxparser_ext_cxscript_cli" ? "true" : "false";

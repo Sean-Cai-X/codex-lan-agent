@@ -1,11 +1,12 @@
 #include "HttpClient.h"
 
-#include <cstring>
+#include <cctype>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string>
-
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -219,6 +220,92 @@ int CloseSocketPortable(SOCKET socket_handle) {
 }
 #endif
 
+bool SetSocketIoTimeouts(
+#ifdef _WIN32
+    SOCKET socket_handle,
+#else
+    int socket_handle,
+#endif
+    int timeout_ms) {
+    if (timeout_ms <= 0) {
+        return true;
+    }
+#ifdef _WIN32
+    const DWORD timeout = static_cast<DWORD>(timeout_ms);
+    const char * option_value = reinterpret_cast<const char *>(&timeout);
+    return setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO, option_value, sizeof(timeout)) == 0
+        && setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO, option_value, sizeof(timeout)) == 0;
+#else
+    timeval timeout{};
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    return setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0
+        && setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0;
+#endif
+}
+
+std::string LowerAsciiCopy(const std::string & value) {
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (unsigned char ch : value) {
+        lowered.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return lowered;
+}
+
+bool TryParseHttpContentLength(const std::string & raw_response, std::size_t * content_length) {
+    if (content_length == nullptr) {
+        return false;
+    }
+    const std::size_t header_end = raw_response.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return false;
+    }
+    std::size_t pos = 0;
+    while (pos < header_end) {
+        const std::size_t line_end = raw_response.find("\r\n", pos);
+        const std::size_t bounded_line_end = line_end == std::string::npos
+            ? header_end
+            : std::min(line_end, header_end);
+        const std::string line = raw_response.substr(pos, bounded_line_end - pos);
+        const std::string lowered = LowerAsciiCopy(line);
+        const std::string prefix = "content-length:";
+        if (lowered.rfind(prefix, 0) == 0) {
+            std::size_t value_pos = prefix.size();
+            while (value_pos < line.size() && std::isspace(static_cast<unsigned char>(line[value_pos]))) {
+                ++value_pos;
+            }
+            if (value_pos >= line.size()) {
+                return false;
+            }
+            char * end = nullptr;
+            const unsigned long long parsed = std::strtoull(line.c_str() + value_pos, &end, 10);
+            if (end == line.c_str() + value_pos) {
+                return false;
+            }
+            *content_length = static_cast<std::size_t>(parsed);
+            return true;
+        }
+        if (line_end == std::string::npos || line_end >= header_end) {
+            break;
+        }
+        pos = line_end + 2;
+    }
+    return false;
+}
+
+bool HttpResponseHasCompleteBody(const std::string & raw_response) {
+    const std::size_t header_end = raw_response.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return false;
+    }
+    std::size_t content_length = 0;
+    if (!TryParseHttpContentLength(raw_response, &content_length)) {
+        return false;
+    }
+    return raw_response.size() >= header_end + 4 + content_length;
+}
+
 HttpResponse SendHttpPlain(
     const ParsedUrl & parsed,
     const std::string & method,
@@ -307,6 +394,24 @@ HttpResponse SendHttpPlain(
         return response;
     }
 
+    if (!SetSocketIoTimeouts(
+#ifdef _WIN32
+            socket_handle,
+#else
+            socket_handle,
+#endif
+            timeout_ms)) {
+        response.error_message = "failed to set socket timeouts";
+        CloseSocketPortable(
+#ifdef _WIN32
+            socket_handle
+#else
+            socket_handle
+#endif
+        );
+        return response;
+    }
+
     const std::string path = NormalizePathString(parsed.path);
     std::ostringstream request;
     request << method << " " << path << " HTTP/1.1\r\n"
@@ -358,6 +463,9 @@ HttpResponse SendHttpPlain(
             break;
         }
         raw_response.append(buffer, buffer + received);
+        if (HttpResponseHasCompleteBody(raw_response)) {
+            break;
+        }
     }
     CloseSocketPortable(
 #ifdef _WIN32

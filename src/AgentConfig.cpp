@@ -241,6 +241,8 @@ bool LoadAgentConfig(
             loaded.cmm_store_path = value;
         } else if (key == "clang_indexer_binary_path") {
             loaded.clang_indexer_binary_path = value;
+        } else if (key == "cxparser_public_build_root") {
+            loaded.cxparser_public_build_root = value;
         } else if (key == "optfile_write_enabled") {
             if (!ParseBool(value, &loaded.optfile_write_enabled)) {
                 if (error_message) {
@@ -365,6 +367,8 @@ bool LoadAgentConfig(
     loaded.cmm_store_path = NormalizePathValue(loaded.cmm_store_path, loaded.config_dir);
     loaded.clang_indexer_binary_path = NormalizePathValue(
         loaded.clang_indexer_binary_path, loaded.config_dir);
+    loaded.cxparser_public_build_root = NormalizePathValue(
+        loaded.cxparser_public_build_root, loaded.config_dir);
 
     if (loaded.tool_config_path.empty() && !loaded.profiles.empty()) {
         loaded.tool_config_path = absolute_config_path.lexically_normal().string();

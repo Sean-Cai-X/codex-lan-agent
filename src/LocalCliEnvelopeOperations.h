@@ -589,8 +589,6 @@ CommandResult LocalCliResult(
     }
 
     const std::string lower_command = ToLowerAscii(command);
-
-    const std::string lower_command = ToLowerAscii(command);
     if (lower_command.rfind("echo", 0) == 0 || command.find(">>") != std::string::npos || command.find(">") != std::string::npos) {
         CommandResult result;
         result.ok = false;

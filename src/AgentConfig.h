@@ -24,6 +24,7 @@ struct AgentConfig {
     std::string cmm_binary_path;
     std::string cmm_store_path;
     std::string clang_indexer_binary_path;
+    std::string cxparser_public_build_root;
     bool optfile_write_enabled = true;
     bool direct_file_write_enabled = false;
     int task_timeout_sec = 1800;

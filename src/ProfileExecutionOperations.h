@@ -32,6 +32,9 @@ std::string CxParserCliExecutableName() {
 }
 
 std::filesystem::path CanonicalCxParserPublicBuildRoot(const AgentConfig & config) {
+    if (!config.cxparser_public_build_root.empty()) {
+        return std::filesystem::path(config.cxparser_public_build_root);
+    }
     const std::filesystem::path workspace_root =
         std::filesystem::path(config.workspace_root);
     return workspace_root / "cxparser" / "build";
