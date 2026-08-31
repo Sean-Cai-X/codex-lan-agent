@@ -63,11 +63,29 @@ struct LocalChatEvidencePacket {
     }
 };
 
+std::string Utf8SafePrefix(const std::string & value, std::size_t max_bytes) {
+    if (value.size() <= max_bytes) {
+        return value;
+    }
+    std::size_t end = max_bytes;
+    while (end > 0 && end < value.size()) {
+        const unsigned char current = static_cast<unsigned char>(value[end]);
+        if ((current & 0xC0) != 0x80) {
+            break;
+        }
+        --end;
+    }
+    if (end == 0) {
+        return "";
+    }
+    return value.substr(0, end);
+}
 std::string TruncateLocalChatEvidenceText(const std::string & value, std::size_t max_chars) {
     if (value.size() <= max_chars) {
         return value;
     }
-    return value.substr(0, max_chars) + "\n[truncated]";
+    const std::string prefix = Utf8SafePrefix(value, max_chars);
+    return prefix + "\n[truncated]";
 }
 
 std::string BuildLocalChatEvidenceInjectionText(const LocalChatEvidencePacket & evidence) {
@@ -926,15 +944,20 @@ CommandResult RunLocalChat(
         "You may also use lan_agent_execute_semantic_action as the execution bridge. "
         "Return real task_id, result_ref, evidence_ref, patch_id, or log_path fields.";
     result.fields["real_execution_toolchain_json"] =
-        "[\"lan_agent_apply_diff_patch\",\"lan_agent_preview_patch\","
-        "\"lan_agent_apply_single_file_patch\",\"lan_agent_verify_single_file_patch\","
-        "\"lan_agent_write_text_file\",\"lan_agent_execute_semantic_action\","
-        "\"lan_agent_configure_project\",\"lan_agent_build_target\","
-        "\"lan_agent_run_ctest_target\",\"lan_agent_get_task\","
-        "\"lan_agent_resolve_task_result\"]";
+        "lan_agent_apply_diff_patch,lan_agent_preview_patch,lan_agent_apply_single_file_patch,lan_agent_verify_single_file_patch,lan_agent_write_text_file,lan_agent_execute_semantic_action,lan_agent_configure_project,lan_agent_build_target,lan_agent_run_ctest_target,lan_agent_get_task,lan_agent_resolve_task_result";
     result.fields["status_code"] = std::to_string(response.status_code);
     result.fields["log_path"] = log_path;
-    result.fields["body"] = response.body;
+    result.fields["body_ref"] = log_path;
+    result.fields["body_chars"] = std::to_string(response.body.size());
+    result.fields["body_return_policy"] =
+        "full local model HTTP body is stored in body_ref only; MCP response returns bounded extracted text to avoid invalid unicode or oversized transport payloads";
+    const std::string local_model_output_text = ExtractJsonString(response.body, "content");
+    if (!local_model_output_text.empty()) {
+        result.fields["output_text"] = Utf8SafePrefix(local_model_output_text, 1200);
+    }
+    const std::string local_model_evidence_text = local_model_output_text.empty()
+        ? (std::string("local_chat_response_body_ref=") + log_path)
+        : Utf8SafePrefix(local_model_output_text, 2000);
     const std::string structured_conclusion = ExtractStructuredConclusionRaw(response.body);
     if (!structured_conclusion.empty()) {
         result.fields["structured_conclusion"] = structured_conclusion;
@@ -959,7 +982,7 @@ CommandResult RunLocalChat(
     AddRagEvidenceFields(
         &result,
         scope.empty() ? "local_chat" : scope,
-        response.body.substr(0, std::min<std::size_t>(response.body.size(), 2000)),
+        local_model_evidence_text,
         !response.ok || response.body.empty(),
         response.ok && !response.body.empty() ? "medium" : "low");
     if (!hydrated_evidence_source_ref.empty()) {
@@ -969,7 +992,7 @@ CommandResult RunLocalChat(
         const std::string output_text = ExtractOutputTextFallback(result);
         result.fields["summary"] = output_text.empty()
             ? (response.ok ? "local chat ok" : "local chat failed")
-            : output_text.substr(0, std::min<std::size_t>(output_text.size(), 160));
+            : Utf8SafePrefix(output_text, 160);
     }
     if (GetFieldOrDefault(result, "direct_answer", "").empty()) {
         const std::string output_text = ExtractOutputTextFallback(result);
@@ -977,7 +1000,7 @@ CommandResult RunLocalChat(
             output_text.empty() ? GetFieldOrDefault(result, "summary", "") : output_text;
         if (!fallback_answer.empty()) {
             result.fields["direct_answer"] =
-                fallback_answer.substr(0, std::min<std::size_t>(fallback_answer.size(), 240));
+                Utf8SafePrefix(fallback_answer, 240);
         }
     }
     if (GetFieldOrDefault(result, "next_action", "").empty()) {

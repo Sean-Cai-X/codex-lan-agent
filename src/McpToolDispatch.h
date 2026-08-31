@@ -322,6 +322,13 @@ CommandResult BuildPatchOverviewResult(
     const std::string & patch_id_filter,
     const std::string & trace_id_filter,
     const std::string & file_path_filter);
+CommandResult TaskLogTailResult(
+    const AgentConfig & config,
+    const std::string & task_id,
+    int max_lines);
+CommandResult ResolveTaskResultReferenceResult(
+    const std::string & task_id,
+    const std::string & task_ref);
 CommandResult BuildBrowserListOverviewResult(
     const AgentConfig & config,
     int task_max_entries,
@@ -1247,6 +1254,660 @@ std::string NormalizeMcpRouteTargetToolName(const std::string & target_tool_name
     return trimmed;
 }
 
+bool IntentTextContainsAny(const std::string & lower_text, const std::vector<std::string> & terms) {
+    for (const std::string & term : terms) {
+        if (!term.empty() && lower_text.find(term) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsIntentAutoExecuteDirectToolAllowed(const std::string & tool_name) {
+    return tool_name == "lan_agent_health"
+        || tool_name == "lan_agent_probe_text_file"
+        || tool_name == "lan_agent_read_text_file"
+        || tool_name == "lan_agent_search_text"
+        || tool_name == "lan_agent_list_directory"
+        || tool_name == "lan_agent_get_task"
+        || tool_name == "lan_agent_task_log"
+        || tool_name == "lan_agent_resolve_task_result";
+}
+
+std::string IntentCompactFieldPrefix(const std::string & value, int max_chars) {
+    if (max_chars <= 0 || value.empty()) {
+        return std::string();
+    }
+    return Utf8SafePrefix(value, static_cast<std::size_t>(max_chars));
+}
+
+void CopyIntentFieldIfPresent(
+    CommandResult * target,
+    const CommandResult & source,
+    const std::string & source_key,
+    const std::string & target_key,
+    int max_chars = 0) {
+    if (target == nullptr) {
+        return;
+    }
+    const std::string value = GetFieldOrDefault(source, source_key, "");
+    if (value.empty()) {
+        return;
+    }
+    (*target).fields[target_key] = max_chars > 0
+        ? IntentCompactFieldPrefix(value, max_chars)
+        : value;
+}
+
+void AttachIntentAutoExecutionResult(
+    CommandResult * acceptance,
+    const CommandResult & executed,
+    const std::string & tool_name,
+    int max_chars) {
+    if (acceptance == nullptr) {
+        return;
+    }
+    acceptance->ok = executed.ok;
+    acceptance->exit_code = executed.exit_code;
+    acceptance->fields["execution_performed"] = "true";
+    acceptance->fields["executed_tool_name"] = tool_name;
+    acceptance->fields["executed_ok"] = executed.ok ? "true" : "false";
+    acceptance->fields["executed_exit_code"] = std::to_string(executed.exit_code);
+    CopyIntentFieldIfPresent(acceptance, executed, "status", "execution_status");
+    CopyIntentFieldIfPresent(acceptance, executed, "result", "execution_result");
+    CopyIntentFieldIfPresent(acceptance, executed, "summary", "execution_summary", max_chars);
+    CopyIntentFieldIfPresent(acceptance, executed, "content_text", "content_text", max_chars);
+    CopyIntentFieldIfPresent(acceptance, executed, "content_text", "stdout_excerpt", max_chars);
+    CopyIntentFieldIfPresent(acceptance, executed, "output_text", "output_text", max_chars);
+    CopyIntentFieldIfPresent(acceptance, executed, "evidence_ref", "evidence_ref");
+    CopyIntentFieldIfPresent(acceptance, executed, "result_ref", "result_ref");
+    acceptance->fields["next_action"] = executed.ok
+        ? "auto_execute_direct completed"
+        : "auto_execute_direct failed; inspect evidence_ref/result_ref";
+}
+
+CommandResult BuildCompactIntentAcceptanceResult(
+    const CommandResult & acceptance,
+    int max_chars) {
+    CommandResult compact;
+    compact.ok = acceptance.ok;
+    compact.exit_code = acceptance.exit_code;
+    compact.fields["status"] = acceptance.ok ? "success" : "failed";
+    compact.fields["result"] = GetFieldOrDefault(acceptance, "result", "intent_acceptance_compact");
+    CopyIntentFieldIfPresent(&compact, acceptance, "acceptance_schema_version", "acceptance_schema_version");
+    CopyIntentFieldIfPresent(&compact, acceptance, "acceptance_decision", "acceptance_decision");
+    CopyIntentFieldIfPresent(&compact, acceptance, "executor_decision", "executor_decision");
+    CopyIntentFieldIfPresent(&compact, acceptance, "intent_class", "intent_class");
+    CopyIntentFieldIfPresent(&compact, acceptance, "reason_code", "reason_code");
+    CopyIntentFieldIfPresent(&compact, acceptance, "next_action", "next_action", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "next_tool_name", "next_tool_name");
+    CopyIntentFieldIfPresent(&compact, acceptance, "required_arguments_json", "required_arguments_json", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "plan_steps_json", "plan_steps_json", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "agent_can_complete", "agent_can_complete");
+    CopyIntentFieldIfPresent(&compact, acceptance, "llm_decomposition_required", "llm_decomposition_required");
+    CopyIntentFieldIfPresent(&compact, acceptance, "small_model_allowed", "small_model_allowed");
+    CopyIntentFieldIfPresent(&compact, acceptance, "small_model_reason", "small_model_reason", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "expected_latency_class", "expected_latency_class");
+    CopyIntentFieldIfPresent(&compact, acceptance, "expected_turn_saving", "expected_turn_saving");
+    CopyIntentFieldIfPresent(&compact, acceptance, "evidence_policy", "evidence_policy");
+    CopyIntentFieldIfPresent(&compact, acceptance, "execution_performed", "execution_performed");
+    CopyIntentFieldIfPresent(&compact, acceptance, "executed_tool_name", "executed_tool_name");
+    CopyIntentFieldIfPresent(&compact, acceptance, "executed_ok", "executed_ok");
+    CopyIntentFieldIfPresent(&compact, acceptance, "executed_exit_code", "executed_exit_code");
+    CopyIntentFieldIfPresent(&compact, acceptance, "execution_status", "execution_status");
+    CopyIntentFieldIfPresent(&compact, acceptance, "execution_result", "execution_result");
+    CopyIntentFieldIfPresent(&compact, acceptance, "execution_summary", "summary", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "content_text", "content_text", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "stdout_excerpt", "stdout_excerpt", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "output_text", "output_text", max_chars);
+    CopyIntentFieldIfPresent(&compact, acceptance, "evidence_ref", "evidence_ref");
+    CopyIntentFieldIfPresent(&compact, acceptance, "result_ref", "result_ref");
+    return compact;
+}
+
+std::string BuildIntentAcceptanceArgsJson(
+    const std::vector<std::pair<std::string, std::string>> & string_fields,
+    const std::vector<std::pair<std::string, int>> & int_fields = {}) {
+    std::string json = "{";
+    bool first = true;
+    for (const auto & field : string_fields) {
+        AppendJsonStringField(&json, &first, field.first.c_str(), field.second);
+    }
+    for (const auto & field : int_fields) {
+        if (!first) {
+            json += ",";
+        }
+        json += "\"" + codex_lan_agent::JsonEscape(field.first) + "\":"
+            + std::to_string(field.second);
+        first = false;
+    }
+    json += "}";
+    return json;
+}
+
+CommandResult BuildIntentAcceptanceResult(
+    const AgentConfig & config,
+    const JsonRequestView & params) {
+    CommandResult result;
+    const std::string user_intent = FirstNonEmpty(
+        params.GetString("user_intent"),
+        params.GetString("request_text"),
+        params.GetString("query"),
+        params.GetString("intent"));
+    const std::string lower_text = ToLowerAscii(user_intent);
+    const std::string file_path = FirstNonEmpty(
+        params.GetString("file_path"),
+        params.GetString("known_file_path"),
+        params.GetString("source_file"),
+        ExtractMcpRouteWindowsPathFromText(user_intent));
+    const std::string directory_path = FirstNonEmpty(
+        params.GetString("directory_path"),
+        params.GetString("scope_path"));
+    const std::string build_dir = params.GetString("build_dir");
+    const std::string target = params.GetString("target");
+    const std::string task_id = params.GetString("task_id");
+    const std::string task_ref = params.GetString("task_ref");
+    const std::string test_regex = params.GetString("test_regex");
+    const std::string query_text = FirstNonEmpty(
+        params.GetString("query_text"),
+        params.GetString("search_text"),
+        params.GetString("pattern"));
+    std::string config_name = params.GetString("config", "Release");
+    if (config_name.empty()) {
+        config_name = "Release";
+    }
+
+    result.ok = true;
+    result.exit_code = 0;
+    result.fields["acceptance_schema_version"] = "intent_acceptance_v1";
+    result.fields["user_intent"] = user_intent;
+    result.fields["agent_can_complete"] = "false";
+    result.fields["llm_decomposition_required"] = "true";
+    result.fields["acceptance_decision"] = "delegate_to_llm";
+    result.fields["intent_class"] = "unknown";
+    result.fields["confidence"] = "0.00";
+    result.fields["risk"] = "medium";
+    result.fields["reason_code"] = "unmatched_intent";
+    result.fields["next_action"] =
+        "LLM should clarify the target scope or decompose into a known MCP capability";
+    result.fields["executor_decision"] = "delegate_to_llm";
+    result.fields["small_model_allowed"] = "false";
+    result.fields["small_model_reason"] =
+        "unmatched or complex intent must be clarified or decomposed by the LLM first";
+    result.fields["expected_latency_class"] = "fast";
+    result.fields["expected_turn_saving"] = "0";
+    result.fields["evidence_policy"] = "bounded_excerpt_or_ref_only";
+
+
+    if (Trim(user_intent).empty()) {
+        LanResultBuilder(&result).Error(400, "user_intent or request_text is required");
+        result.fields["acceptance_decision"] = "blocked";
+        result.fields["executor_decision"] = "blocked";
+        result.fields["small_model_allowed"] = "false";
+        result.fields["small_model_reason"] =
+            "missing user intent cannot be safely delegated to a local model";
+        result.fields["expected_latency_class"] = "fast";
+        result.fields["expected_turn_saving"] = "0";
+        result.fields["evidence_policy"] = "missing_args_first";
+        result.fields["reason_code"] = "missing_user_intent";
+        result.fields["next_action"] = "provide user_intent or request_text";
+        return result;
+    }
+
+    const auto accept_direct = [&](const std::string & intent_class,
+                                  const std::string & capability,
+                                  const std::string & tool,
+                                  const std::string & args_json,
+                                  const std::string & reason_code,
+                                  const std::string & confidence,
+                                  const std::string & risk = "low") {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["acceptance_decision"] = "accept";
+        result.fields["intent_class"] = intent_class;
+        result.fields["matched_capability"] = capability;
+        result.fields["next_tool_name"] = tool;
+        result.fields["required_arguments_json"] = args_json;
+        result.fields["agent_can_complete"] = "true";
+        result.fields["llm_decomposition_required"] = "false";
+        result.fields["confidence"] = confidence;
+        result.fields["risk"] = risk;
+        result.fields["reason_code"] = reason_code;
+        result.fields["plan_steps_json"] =
+            "[{\"step\":\"call_next_tool\",\"tool\":\"" + codex_lan_agent::JsonEscape(tool) + "\"}]";
+        result.fields["verification_contract_json"] =
+            "{\"required\":\"ok=true and result_field_contract_status=complete when available\"}";
+        result.fields["next_action"] = "call next_tool_name with required_arguments_json";
+        result.fields["executor_decision"] = "direct_mcp";
+        result.fields["small_model_allowed"] = "false";
+        result.fields["small_model_reason"] =
+            "deterministic MCP tool is faster and more reliable than local model generation";
+        result.fields["expected_latency_class"] = "fast";
+        result.fields["expected_turn_saving"] = "0";
+        result.fields["evidence_policy"] = "deterministic_tool_result";
+
+    };
+
+    const auto accept_plan = [&](const std::string & intent_class,
+                                const std::string & capability,
+                                const std::string & tool,
+                                const std::string & args_json,
+                                const std::string & plan_json,
+                                const std::string & reason_code,
+                                const std::string & confidence,
+                                const std::string & risk = "medium") {
+        accept_direct(intent_class, capability, tool, args_json, reason_code, confidence, risk);
+        result.fields["acceptance_decision"] = "accept_with_plan";
+        result.fields["plan_steps_json"] = plan_json;
+        result.fields["verification_contract_json"] =
+            R"({"terminal_state":"true when available","completion_claim_allowed":"true when available","verification_ok":"true when available","evidence":"result_ref or evidence_ref should be retained"})";
+        result.fields["executor_decision"] = "direct_mcp_plan";
+        result.fields["small_model_allowed"] = "false";
+        result.fields["small_model_reason"] =
+            "MCP plan/tool chain can handle this without semantic generation";
+        result.fields["expected_latency_class"] = risk == "high" ? "slow" : "medium";
+        result.fields["expected_turn_saving"] = "1";
+        result.fields["evidence_policy"] = "tool_result_refs_required";
+    };
+
+    const auto delegate_missing = [&](const std::string & intent_class,
+                                      const std::string & missing_args,
+                                      const std::string & reason_code) {
+        result.ok = true;
+        result.exit_code = 0;
+        result.fields["acceptance_decision"] = "delegate_to_llm";
+        result.fields["intent_class"] = intent_class;
+        result.fields["agent_can_complete"] = "false";
+        result.fields["llm_decomposition_required"] = "true";
+        result.fields["missing_args"] = missing_args;
+        result.fields["confidence"] = "0.70";
+        result.fields["risk"] = "medium";
+        result.fields["reason_code"] = reason_code;
+        result.fields["next_action"] = "LLM should supply missing_args, then call lan_agent_accept_intent again";
+        result.fields["executor_decision"] = "blocked";
+        result.fields["small_model_allowed"] = "false";
+        result.fields["small_model_reason"] =
+            "missing required arguments must be supplied by the LLM or user before delegation";
+        result.fields["expected_latency_class"] = "fast";
+        result.fields["expected_turn_saving"] = "0";
+        result.fields["evidence_policy"] = "missing_args_first";
+    };
+
+    const std::string requested_complexity = ToLowerAscii(FirstNonEmpty(
+        params.GetString("task_complexity"),
+        params.GetString("complexity")));
+    const bool has_explicit_semantic_mode =
+        params.GetBool("semantic_atomic", false)
+        || !params.GetRawJson("semantic_mode").empty()
+        || !params.GetRawJson("reduce_mode").empty()
+        || !params.GetRawJson("task_mode").empty();
+    const std::string semantic_task_mode = FirstNonEmpty(
+        params.GetString("semantic_mode"),
+        params.GetString("reduce_mode"),
+        params.GetString("task_mode"),
+        "semantic_reduce");
+    const std::string lower_semantic_mode = ToLowerAscii(semantic_task_mode);
+    const bool explicit_semantic_atomic =
+        has_explicit_semantic_mode
+        && (params.GetBool("semantic_atomic", false)
+            || lower_semantic_mode == "intent_reduce"
+            || lower_semantic_mode == "result_summarize"
+            || lower_semantic_mode == "error_diagnose"
+            || lower_semantic_mode == "next_tool_plan"
+            || lower_semantic_mode == "semantic_reduce");
+    const bool semantic_reduce_requested =
+        params.GetBool("prefer_local_model", false)
+        || explicit_semantic_atomic
+        || IntentTextContainsAny(lower_text, {
+            "local model", "small model", "local llm", "8095", "semantic reduce",
+            "semantic reduction", "semantic analysis", "summarize", "summary",
+            "本地模型", "小模型", "语义缩减", "语义压缩", "语义分析",
+            "总结", "归纳"
+        });
+    const bool complex_goal_requested =
+        params.GetBool("force_llm_decomposition", false)
+        || requested_complexity == "complex"
+        || IntentTextContainsAny(lower_text, {
+            "复杂目标", "拆解目标", "拆解", "回溯大模型", "先分析", "而后",
+            "推进", "落地", "研判", "流程", "方案", "架构", "整体", "端到端",
+            "大目录", "大文本", "项目级", "多文件", "系统相关", "深入",
+            "解决", "修复", "生成后替换", "rework", "refactor", "design", "plan and execute"
+        });
+
+    result.fields["complexity_gate"] = complex_goal_requested
+        ? "complex_goal_delegate_to_llm"
+        : (semantic_reduce_requested ? "semantic_atomic_candidate" : "deterministic_mcp_candidate");
+    result.fields["small_model_role"] =
+        "semantic reducer for atomic subtasks only; not a complex-goal decomposer or tool executor";
+    result.fields["tool_execution_boundary"] =
+        "all real file/build/test/command operations must return through lan_agent_mcp_route";
+
+    if (complex_goal_requested && !params.GetBool("allow_complex_goal_to_local_model", false)) {
+        result.fields["acceptance_decision"] = "delegate_to_llm";
+        result.fields["intent_class"] = "complex_goal";
+        result.fields["agent_can_complete"] = "false";
+        result.fields["llm_decomposition_required"] = "true";
+        result.fields["confidence"] = "0.88";
+        result.fields["risk"] = "medium";
+        result.fields["reason_code"] = "complex_goal_requires_llm_decomposition";
+        result.fields["next_action"] =
+            "LLM should decompose the complex goal into atomic MCP tasks, then optionally send bounded semantic_atomic subtasks to the local model";
+        result.fields["executor_decision"] = "delegate_to_llm";
+        result.fields["small_model_allowed"] = "false";
+        result.fields["small_model_reason"] =
+            "complex goal requires LLM decomposition before any local semantic reduction";
+        result.fields["expected_latency_class"] = "fast";
+        result.fields["expected_turn_saving"] = "2+";
+        result.fields["evidence_policy"] = "llm_task_plan_required_before_evidence_lookup";
+        result.fields["decomposition_contract_json"] =
+            R"({"required_output":"task_plan","task_plan_item_fields":["id","objective","task_complexity","preferred_mcp_tool","required_arguments","evidence_needed","semantic_atomic_allowed","risk"]})";
+        result.fields["semantic_atomic_allowed_modes_json"] =
+            R"(["intent_reduce","result_summarize","error_diagnose","next_tool_plan"])";
+        result.fields["large_context_policy"] =
+            "directory or large-text inputs must be reduced by deterministic MCP search/read/probe first; local model receives bounded excerpts or refs only";
+        return result;
+    }
+
+    if (semantic_reduce_requested) {
+        std::string resolved_endpoint;
+        std::string endpoint_detail;
+        std::string endpoint_source;
+        const bool local_model_ready = ResolveReachableEndpoint(
+            config.local_chat_endpoint,
+            DeriveLocalChatFallbackEndpoint(config),
+            1500,
+            &resolved_endpoint,
+            &endpoint_detail,
+            &endpoint_source);
+        if (local_model_ready && !resolved_endpoint.empty()) {
+            const std::string semantic_scope = params.GetString("scope", "workspace");
+            accept_plan(
+                "local_semantic_atomic",
+                "local_model_semantic_reduce",
+                "lan_agent_semantic_reduce",
+                BuildIntentAcceptanceArgsJson({
+                    {"scope", semantic_scope},
+                    {"question", user_intent},
+                    {"mode", semantic_task_mode},
+                    {"request_text", user_intent},
+                    {"max_input_chars", params.GetString("max_input_chars", "6000")},
+                    {"allow_implicit_evidence_lookup", params.GetBool("allow_implicit_evidence_lookup", false) ? "true" : "false"}
+                }, {{"timeout_ms", std::max(1000, params.GetInt("timeout_ms", 12000))}}),
+                "semantic_atomic -> propose_next_mcp_tool_or_summary -> execute_real_tools_via_same_mcp",
+                "local_model_semantic_atomic_matched",
+                "0.82",
+                "low");
+            result.fields["semantic_atomic"] = "true";
+            result.fields["local_model_available"] = "true";
+            result.fields["local_model_endpoint_effective"] = resolved_endpoint;
+            result.fields["local_model_endpoint_source"] = endpoint_source;
+            result.fields["local_model_endpoint_detail"] = endpoint_detail;
+            result.fields["small_model_execution_boundary"] =
+                "small model may reduce semantics or propose MCP tool calls; all real tool execution must return through lan_agent_mcp_route";
+            result.fields["large_context_policy"] =
+                "no implicit directory bundle unless allow_implicit_evidence_lookup=true";
+            result.fields["executor_decision"] = "semantic_atomic";
+            result.fields["small_model_allowed"] = "true";
+            result.fields["small_model_reason"] =
+                "atomic semantic reduction can reduce LLM turns when bounded evidence is available";
+            result.fields["expected_latency_class"] = "slow";
+            result.fields["expected_turn_saving"] = "2+";
+            result.fields["evidence_policy"] =
+                "bounded_excerpt_or_ref_only_no_implicit_lookup_by_default";
+            return result;
+        }
+        result.fields["local_model_available"] = "false";
+        result.fields["local_model_endpoint_detail"] = endpoint_detail;
+        result.fields["local_model_fallback_policy"] = "original_mcp_route_unchanged";
+        result.fields["executor_decision"] = "direct_mcp_or_delegate_to_llm";
+        result.fields["small_model_allowed"] = "false";
+        result.fields["small_model_reason"] =
+            "local model unavailable; keep original MCP/LLM loop";
+        result.fields["expected_latency_class"] = "fast";
+        result.fields["expected_turn_saving"] = "0";
+        result.fields["evidence_policy"] = "original_mcp_route_unchanged";
+    }
+    if (IntentTextContainsAny(lower_text, {"health", "ready", "reachable", "online", "status", "健康", "就绪", "状态"})) {
+        accept_direct(
+            "runtime_health",
+            "runtime_health",
+            "lan_agent_health",
+            "{}",
+            "health_intent_matched",
+            "0.95");
+        return result;
+    }
+
+    if (IntentTextContainsAny(lower_text, {"cxparser", "cxscript", "链接库", "系统链接", "dll", "runtime binding"})) {
+        accept_plan(
+            "cxparser_flow",
+            "cxparser_flow_execution",
+            "lan_agent_run_cxparser_flow",
+            BuildIntentAcceptanceArgsJson({{"flow_id", "cxparser_ext_cxscript_cli"}}),
+            "[{\"step\":\"validate_runtime_binding\",\"tool\":\"lan_agent_run_cxparser_flow\"},{\"step\":\"poll_task\",\"tool\":\"lan_agent_get_task\"},{\"step\":\"read_task_log_if_needed\",\"tool\":\"lan_agent_task_log\"}]",
+            "cxparser_intent_matched",
+            "0.90",
+            "medium");
+        return result;
+    }
+
+    if (IntentTextContainsAny(lower_text, {"task log", "任务日志", "日志尾部"})) {
+        if (task_id.empty()) {
+            delegate_missing("task_log", "task_id", "task_log_requires_task_id");
+            return result;
+        }
+        accept_direct(
+            "task_log",
+            "task_log",
+            "lan_agent_task_log",
+            BuildIntentAcceptanceArgsJson({{"task_id", task_id}}, {{"max_lines", std::max(1, params.GetInt("max_lines", 80))}}),
+            "task_log_intent_matched",
+            "0.90");
+        return result;
+    }
+
+    if (IntentTextContainsAny(lower_text, {"task", "任务", "result_ref", "evidence_ref"})) {
+        accept_direct(
+            "task_status",
+            task_ref.empty() ? "task_status" : "task_result_reference",
+            task_ref.empty() ? "lan_agent_get_task" : "lan_agent_resolve_task_result",
+            task_ref.empty()
+                ? BuildIntentAcceptanceArgsJson({{"task_id", task_id}})
+                : BuildIntentAcceptanceArgsJson({{"task_id", task_id}, {"task_ref", task_ref}}),
+            task_id.empty() && task_ref.empty()
+                ? "task_status_latest_fallback"
+                : "task_status_intent_matched",
+            task_id.empty() && task_ref.empty() ? "0.65" : "0.90");
+        return result;
+    }
+
+    if (IntentTextContainsAny(lower_text, {"build", "compile", "cmake", "编译", "构建"})) {
+        if (build_dir.empty() || target.empty()) {
+            delegate_missing("build", "build_dir,target", "build_requires_build_dir_and_target");
+            return result;
+        }
+        accept_plan(
+            "build",
+            "build_execution",
+            "lan_agent_preflight_build_target",
+            BuildIntentAcceptanceArgsJson({{"build_dir", build_dir}, {"target", target}, {"config", config_name}}),
+            "[{\"step\":\"preflight\",\"tool\":\"lan_agent_preflight_build_target\"},{\"step\":\"queue_build\",\"tool\":\"lan_agent_build_target\"},{\"step\":\"poll_task\",\"tool\":\"lan_agent_get_task\"},{\"step\":\"tail_log_on_failure\",\"tool\":\"lan_agent_task_log\"}]",
+            "build_intent_matched",
+            "0.88",
+            "high");
+        return result;
+    }
+
+    if (IntentTextContainsAny(lower_text, {"ctest", "test", "测试", "回归"})) {
+        if (build_dir.empty() || test_regex.empty()) {
+            delegate_missing("test", "build_dir,test_regex", "test_requires_build_dir_and_test_regex");
+            return result;
+        }
+        accept_plan(
+            "test",
+            "ctest_execution",
+            "lan_agent_preflight_run_ctest_target",
+            BuildIntentAcceptanceArgsJson({{"build_dir", build_dir}, {"test_regex", test_regex}, {"config", config_name}}),
+            "[{\"step\":\"preflight\",\"tool\":\"lan_agent_preflight_run_ctest_target\"},{\"step\":\"queue_test\",\"tool\":\"lan_agent_run_ctest_target\"},{\"step\":\"poll_task\",\"tool\":\"lan_agent_get_task\"},{\"step\":\"tail_log_on_failure\",\"tool\":\"lan_agent_task_log\"}]",
+            "test_intent_matched",
+            "0.86",
+            "high");
+        return result;
+    }
+
+    if (!directory_path.empty()
+        && IntentTextContainsAny(lower_text, {"search", "find text", "grep", "查找", "搜索"})
+        && !query_text.empty()) {
+        accept_direct(
+            "text_search",
+            "text_search",
+            "lan_agent_search_text",
+            BuildIntentAcceptanceArgsJson({
+                {"directory_path", directory_path},
+                {"query_text", query_text},
+                {"trace_id", params.GetString("trace_id")}
+            }),
+            "text_search_direct_intent_matched",
+            "0.88");
+        return result;
+    }
+
+    if (!directory_path.empty()
+        && IntentTextContainsAny(lower_text, {"list", "dir", "ls", "列目录", "目录列表"})) {
+        accept_direct(
+            "directory_list",
+            "directory_listing",
+            "lan_agent_list_directory",
+            BuildIntentAcceptanceArgsJson({
+                {"directory_path", directory_path},
+                {"file_extensions_csv", params.GetString("file_extensions_csv")},
+                {"trace_id", params.GetString("trace_id")}
+            }),
+            "directory_list_direct_intent_matched",
+            "0.88");
+        return result;
+    }
+
+    if (IntentTextContainsAny(lower_text, {"directory", "folder", "目录"}) || !directory_path.empty()) {
+        if (directory_path.empty()) {
+            delegate_missing("directory_analysis", "directory_path", "directory_analysis_requires_directory_path");
+            return result;
+        }
+        accept_plan(
+            "directory_analysis",
+            "directory_analysis_bundle",
+            "lan_agent_prepare_directory_analysis",
+            BuildIntentAcceptanceArgsJson({
+                {"directory_path", directory_path},
+                {"file_extensions_csv", params.GetString("file_extensions_csv", ".cpp,.h,.hpp,.c,.txt,.md")},
+                {"trace_id", params.GetString("trace_id")}
+            }),
+            "[{\"step\":\"prepare_bounded_bundle\",\"tool\":\"lan_agent_prepare_directory_analysis\"},{\"step\":\"return_evidence\",\"field\":\"analysis_bundle_ref\"}]",
+            "directory_analysis_intent_matched",
+            "0.82");
+        return result;
+    }
+
+    if (QueryImpliesSegmentedTextEditing(lower_text)
+        || IntentTextContainsAny(lower_text, {"注释清理", "删除注释", "清理注释"})) {
+        if (file_path.empty()) {
+            delegate_missing("comment_cleanup", "file_path", "comment_cleanup_requires_file_path");
+            return result;
+        }
+        accept_plan(
+            "comment_cleanup",
+            "segmented_text_editing",
+            "lan_agent_scan_text_ranges",
+            BuildIntentAcceptanceArgsJson({
+                {"file_path", file_path},
+                {"scan_mode", params.GetString("scan_mode", "comments")},
+                {"primary_intent", "comment_cleanup"},
+                {"trace_id", params.GetString("trace_id")}
+            }, {{"max_ranges_per_call", 1}}),
+            "[{\"step\":\"scan_one_range\",\"tool\":\"lan_agent_scan_text_ranges\"},{\"step\":\"apply_one_atomic_edit\",\"tool\":\"lan_agent_delete_text_range_window_atomic\"},{\"step\":\"verify_and_repeat_until_has_more_false\",\"tool\":\"lan_agent_probe_text_file\"}]",
+            "comment_cleanup_intent_matched",
+            "0.82",
+            "high");
+        return result;
+    }
+
+    if (!file_path.empty()
+        && IntentTextContainsAny(lower_text, {"read", "读取"})) {
+        accept_direct(
+            "file_read",
+            "file_read",
+            "lan_agent_read_text_file",
+            BuildIntentAcceptanceArgsJson({
+                {"file_path", file_path}
+            }, {
+                {"start_line", std::max(1, params.GetInt("start_line", 1))},
+                {"max_lines", std::max(1, params.GetInt("max_lines", 200))}
+            }),
+            "file_read_direct_intent_matched",
+            "0.90");
+        return result;
+    }
+
+    if (!file_path.empty()
+        && IntentTextContainsAny(lower_text, {"probe", "stat", "metadata", "hash", "探测"})) {
+        accept_direct(
+            "file_probe",
+            "file_probe",
+            "lan_agent_probe_text_file",
+            BuildIntentAcceptanceArgsJson({
+                {"file_path", file_path},
+                {"primary_intent", params.GetString("primary_intent", "probe_source_file")},
+                {"trace_id", params.GetString("trace_id")}
+            }),
+            "file_probe_direct_intent_matched",
+            "0.90");
+        return result;
+    }
+
+    if (!file_path.empty()
+        && IntentTextContainsAny(lower_text, {"read", "analyze", "inspect", "probe", "log", "读取", "分析", "查看", "检查", "日志"})) {
+        accept_plan(
+            "file_analysis",
+            "file_probe_read",
+            "lan_agent_probe_text_file",
+            BuildIntentAcceptanceArgsJson({
+                {"file_path", file_path},
+                {"primary_intent", params.GetString("primary_intent", "probe_source_file")},
+                {"trace_id", params.GetString("trace_id")}
+            }),
+            "[{\"step\":\"probe_file\",\"tool\":\"lan_agent_probe_text_file\"},{\"step\":\"read_page_if_needed\",\"tool\":\"lan_agent_read_text_file\"},{\"step\":\"return_evidence\",\"field\":\"result_ref\"}]",
+            "file_analysis_intent_matched",
+            "0.86",
+            "low");
+        return result;
+    }
+
+    const std::string inferred_intent = InferMcpRoutePrimaryIntent(params.GetString("primary_intent"), user_intent);
+    const std::string route_target = ResolveRouteBySynonymAndPattern(inferred_intent, params);
+    if (!route_target.empty()) {
+        accept_plan(
+            "mcp_route",
+            "mcp_route_pattern",
+            "lan_agent_mcp_route",
+            BuildIntentAcceptanceArgsJson({
+                {"mode", "route"},
+                {"primary_intent", inferred_intent},
+                {"request_text", user_intent},
+                {"file_path", file_path},
+                {"directory_path", directory_path}
+            }),
+            "[{\"step\":\"route_intent\",\"tool\":\"lan_agent_mcp_route\"},{\"step\":\"execute_required_tool_if_returned\",\"field\":\"required_tool_name\"}]",
+            "route_pattern_matched",
+            "0.70",
+            "medium");
+        result.fields["candidate_routed_tool"] = route_target;
+        return result;
+    }
+
+    result.fields["candidate_tools"] = BuildCandidateToolsJson(inferred_intent);
+    return result;
+}
+
 struct BuildLogDiagnosticSummary {
     std::string first_error;
     std::string first_warning;
@@ -1590,6 +2251,61 @@ CommandResult BuildLocalCmakeTargetResult(
 
 const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegistry() {
     static const std::unordered_map<std::string, McpToolHandler> handlers = {
+        {"lan_agent_accept_intent", [](const AgentConfig & config, const JsonRequestView & params) {
+            CommandResult result = BuildIntentAcceptanceResult(config, params);
+            const bool compact_output =
+                ToLowerAscii(params.GetString("output_mode")) == "compact"
+                || params.GetBool("compact_output", false);
+            const int max_chars = std::max(256, params.GetInt("max_stdout_chars", 4000));
+            const bool auto_execute_direct = params.GetBool("auto_execute_direct", false);
+            if (!auto_execute_direct) {
+                result.fields["execution_performed"] = "false";
+                return compact_output ? BuildCompactIntentAcceptanceResult(result, max_chars) : result;
+            }
+
+            const std::string executor_decision = GetFieldOrDefault(result, "executor_decision", "");
+            const std::string target_tool_name = GetFieldOrDefault(result, "next_tool_name", "");
+            if (executor_decision != "direct_mcp" || target_tool_name.empty()) {
+                result.fields["execution_performed"] = "false";
+                result.fields["auto_execute_direct_skip_reason"] =
+                    executor_decision.empty()
+                        ? "executor_decision_not_direct_mcp"
+                        : "executor_decision=" + executor_decision;
+                return compact_output ? BuildCompactIntentAcceptanceResult(result, max_chars) : result;
+            }
+
+            if (!IsIntentAutoExecuteDirectToolAllowed(target_tool_name)) {
+                result.fields["execution_performed"] = "false";
+                result.fields["auto_execute_direct_skip_reason"] =
+                    "target_tool_not_in_readonly_fast_path_allowlist";
+                return compact_output ? BuildCompactIntentAcceptanceResult(result, max_chars) : result;
+            }
+
+            const auto & registry = BuildMcpToolHandlerRegistry();
+            const auto route_it = registry.find("lan_agent_mcp_route");
+            if (route_it == registry.end()) {
+                result.fields["execution_performed"] = "false";
+                result.fields["auto_execute_direct_skip_reason"] = "mcp_route_handler_not_registered";
+                return compact_output ? BuildCompactIntentAcceptanceResult(result, max_chars) : result;
+            }
+
+            const std::string required_args = GetFieldOrDefault(result, "required_arguments_json", "{}");
+            std::string routed_body = "{";
+            bool routed_first = true;
+            AppendJsonStringField(&routed_body, &routed_first, "mode", "call");
+            AppendJsonStringField(&routed_body, &routed_first, "target_tool_name", target_tool_name);
+            AppendJsonStringField(&routed_body, &routed_first, "model_profile", "large-llm");
+            if (!routed_first) {
+                routed_body += ",";
+            }
+            routed_body += "\"arguments\":";
+            routed_body += required_args.empty() ? "{}" : required_args;
+            routed_body += "}";
+            JsonRequestView routed_params(routed_body);
+            CommandResult executed = route_it->second(config, routed_params);
+            AttachIntentAutoExecutionResult(&result, executed, target_tool_name, max_chars);
+            return compact_output ? BuildCompactIntentAcceptanceResult(result, max_chars) : result;
+        }},
         {"lan_agent_mcp_route", [](const AgentConfig & config, const JsonRequestView & params) {
             // ── Phase1-3: 入口首先解析 Model-Profile（必须所有模式分支都共享）──
             const std::string explicit_profile_name = params.GetString("model_profile");
@@ -2562,6 +3278,109 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
         {"lan_agent_rag_overview", [](const AgentConfig & config, const JsonRequestView &) {
             return BuildRagOverviewResult(config);
         }},
+        {"lan_agent_run_rag_flow", [](const AgentConfig & config, const JsonRequestView & params) {
+            std::string mode = params.GetString("mode");
+            if (mode.empty()) {
+                mode = "review";
+            }
+            return RunRagFlow(
+                config,
+                FirstNonEmpty(params.GetString("query"), params.GetString("question"), params.GetString("query_text")),
+                mode);
+        }},
+        {"lan_agent_run_local_chat", [](const AgentConfig & config, const JsonRequestView & params) {
+            std::string mode = params.GetString("mode");
+            if (mode.empty()) {
+                mode = "code_analysis";
+            }
+            const LocalChatEvidencePacket evidence = ExtractLocalChatEvidencePacket(params.body());
+            return RunLocalChat(
+                config,
+                params.GetString("scope"),
+                FirstNonEmpty(params.GetString("question"), params.GetString("query"), params.GetString("query_text")),
+                mode,
+                std::max(1000, params.GetInt("timeout_ms", 30000)),
+                &evidence);
+        }},
+        {"lan_agent_semantic_reduce", [](const AgentConfig & config, const JsonRequestView & params) {
+            std::string mode = params.GetString("mode");
+            if (mode.empty()) {
+                mode = "semantic_reduce";
+            }
+            const std::string lower_mode = ToLowerAscii(mode);
+            const std::string question = FirstNonEmpty(
+                params.GetString("question"),
+                params.GetString("query"),
+                params.GetString("request_text"));
+            const std::string lower_question = ToLowerAscii(question);
+            const bool semantic_mode_allowed =
+                lower_mode == "intent_reduce"
+                || lower_mode == "result_summarize"
+                || lower_mode == "error_diagnose"
+                || lower_mode == "next_tool_plan"
+                || lower_mode == "semantic_reduce";
+            const bool complex_goal_requested =
+                params.GetBool("force_llm_decomposition", false)
+                || ToLowerAscii(params.GetString("task_complexity")) == "complex"
+                || IntentTextContainsAny(lower_question, {
+                    "复杂目标", "拆解目标", "拆解", "回溯大模型", "先分析", "而后",
+                    "推进", "落地", "研判", "流程", "方案", "架构", "整体", "端到端",
+                    "大目录", "大文本", "项目级", "多文件", "系统相关", "深入",
+                    "解决", "修复", "生成后替换", "rework", "refactor", "design", "plan and execute"
+                });
+            if (!semantic_mode_allowed || (complex_goal_requested && !params.GetBool("allow_complex_goal_to_local_model", false))) {
+                CommandResult result;
+                result.ok = true;
+                result.exit_code = 0;
+                result.fields["status"] = "success";
+                result.fields["acceptance_decision"] = "delegate_to_llm";
+                result.fields["intent_class"] = complex_goal_requested ? "complex_goal" : "unsupported_semantic_mode";
+                result.fields["llm_decomposition_required"] = "true";
+                result.fields["local_model_called"] = "false";
+                result.fields["reason_code"] = complex_goal_requested
+                    ? "semantic_reduce_rejected_complex_goal"
+                    : "semantic_reduce_rejected_unknown_mode";
+                result.fields["next_action"] =
+                    "LLM should decompose into atomic MCP tasks; call lan_agent_semantic_reduce only for intent_reduce/result_summarize/error_diagnose/next_tool_plan with bounded evidence";
+                result.fields["small_model_role"] =
+                    "semantic reducer for atomic subtasks only; not a complex-goal decomposer or tool executor";
+                result.fields["tool_execution_boundary"] =
+                    "all real file/build/test/command operations must return through lan_agent_mcp_route";
+                return result;
+            }
+            const LocalChatEvidencePacket evidence = ExtractLocalChatEvidencePacket(params.body());
+            const bool allow_implicit_evidence_lookup =
+                params.GetBool("allow_implicit_evidence_lookup", false);
+            std::string scope = params.GetString("scope", "workspace");
+            if (!allow_implicit_evidence_lookup) {
+                scope = "workspace";
+            }
+            return RunLocalChat(
+                config,
+                scope,
+                question,
+                mode,
+                std::max(1000, params.GetInt("timeout_ms", 12000)),
+                &evidence);
+        }},
+        {"rag.query", [](const AgentConfig & config, const JsonRequestView & params) {
+            std::string scope = params.GetString("scope");
+            std::string mode = params.GetString("mode");
+            if (scope.empty()) {
+                scope = "workspace";
+            }
+            if (mode.empty()) {
+                mode = "rag_query";
+            }
+            const LocalChatEvidencePacket evidence = ExtractLocalChatEvidencePacket(params.body());
+            return RunLocalChat(
+                config,
+                scope,
+                FirstNonEmpty(params.GetString("query"), params.GetString("question"), params.GetString("query_text")),
+                mode,
+                std::max(1000, params.GetInt("timeout_ms", 30000)),
+                &evidence);
+        }},
         {"lan_agent_patch_overview", [](const AgentConfig & config, const JsonRequestView & params) {
             return BuildPatchOverviewResult(
                 config,
@@ -3085,6 +3904,43 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             result.fields["summary"] = "CLI profile queued";
             result.fields["next_action"] = "poll lan_agent_get_task with task_id or use task-latest";
             return result;
+        }},
+        {"lan_agent_get_task", [](const AgentConfig &, const JsonRequestView & params) {
+            CommandResult result;
+            if (g_task_manager == nullptr) {
+                LanResultBuilder(&result).Error(41, "task manager is not active");
+                result.fields["result"] = "task_status_unavailable";
+                result.fields["error_code"] = "task_manager_inactive";
+                return result;
+            }
+            const std::string task_id = params.GetString("task_id");
+            if (task_id.empty()) {
+                result = g_task_manager->GetLatestTaskResult();
+                result.fields["task_lookup_mode"] = "latest";
+                return result;
+            }
+            result = g_task_manager->GetTaskResult(task_id);
+            result.fields["task_lookup_mode"] = "by_task_id";
+            return result;
+        }},
+        {"lan_agent_task_log", [](const AgentConfig & config, const JsonRequestView & params) {
+            CommandResult result;
+            const std::string task_id = params.GetString("task_id");
+            if (task_id.empty()) {
+                LanResultBuilder(&result).Error(400, "task_id is required");
+                result.fields["result"] = "task_log_validation_failed";
+                result.fields["error_code"] = "missing_task_id";
+                return result;
+            }
+            return TaskLogTailResult(
+                config,
+                task_id,
+                std::max(1, params.GetInt("max_lines", 60)));
+        }},
+        {"lan_agent_resolve_task_result", [](const AgentConfig &, const JsonRequestView & params) {
+            return ResolveTaskResultReferenceResult(
+                params.GetString("task_id"),
+                params.GetString("task_ref"));
         }},
         {"lan_agent_preflight_run_ctest_target", [](const AgentConfig & config, const JsonRequestView & params) {
             std::string config_name = params.GetString("config", "Release");
@@ -4032,6 +4888,7 @@ const std::vector<RequestRule> & GetRequestRules() {
         {"mcp_capability_registry", "read_observe", "mcp_capability_registry", "low", "mcp,capability,read_only"},
         {"rag_memory_slice_contract", "read_observe", "rag_memory_slice_contract", "low", "rag,memory,contract,read_only"},
         {"intent_dispatch_prepare", "rag_bridge_clips_run", "intent_dispatch_prepare", "medium", "intent,dispatch,prepare,bridge"},
+        {"lan_agent_accept_intent", "intent_acceptance", "accept_intent", "low", "intent,acceptance,route,local_agent"},
         {"semantic_action_map", "read_observe", "semantic_action_map", "low", "semantic-action,map,read_only"},
         {"tool_shortcuts", "read_observe", "semantic_action_map", "low", "semantic-action,map,read_only"},
         {"mcp_actions", "read_observe", "semantic_action_map", "low", "semantic-action,map,read_only"},

@@ -168,6 +168,66 @@ $response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Bo
 $response.result.tools.Count  # 应输出工具总数
 ```
 
+### 3.5 推荐调用闭环：Intent Acceptance + Fast Path
+
+`codex-lan-agent` 的推荐入口不是让大模型直接拆很多工具调用，而是先调用 `lan_agent_accept_intent`，由 MCP 判断当前任务是否可以本地承接、是否需要小模型语义缩减、是否必须回到大模型拆解。
+
+推荐请求：
+
+```json
+{
+  "name": "lan_agent_mcp_route",
+  "arguments": {
+    "mode": "call",
+    "target_tool_name": "lan_agent_accept_intent",
+    "model_profile": "large-llm",
+    "arguments": {
+      "user_intent": "read file",
+      "file_path": "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/README.md",
+      "auto_execute_direct": true,
+      "output_mode": "compact",
+      "max_stdout_chars": 4000
+    }
+  }
+}
+```
+
+MCP 返回的关键字段：
+
+| 字段 | 语义 |
+|---|---|
+| `executor_decision` | 执行决策：`direct_mcp` / `direct_mcp_plan` / `semantic_atomic` / `delegate_to_llm` / `blocked` |
+| `auto_execute_direct` | 请求参数。为 `true` 时，允许 MCP 对只读白名单工具做内部快速执行 |
+| `execution_performed` | 是否已经在 `lan_agent_accept_intent` 内部完成工具调用 |
+| `executed_tool_name` | 已自动执行的内部工具名 |
+| `small_model_allowed` | 当前任务是否适合下放本地小模型 |
+| `evidence_ref` / `result_ref` | 完整证据日志或结果引用，compact 响应也必须保留 |
+
+执行分支：
+
+```text
+大模型 → lan_agent_accept_intent(auto_execute_direct=true, output_mode=compact)
+      ├─ direct_mcp：只读白名单工具可在 MCP 内部直接执行
+      ├─ direct_mcp_plan：返回计划，由大模型按 plan_steps_json 继续调用 MCP
+      ├─ semantic_atomic：调用 lan_agent_semantic_reduce，本地小模型只做原子语义缩减
+      ├─ delegate_to_llm：复杂目标回到大模型拆解
+      └─ blocked：缺参数，先补齐再重试
+```
+
+第一版 fast path 只允许只读、低风险工具自动执行：
+
+- `lan_agent_health`
+- `lan_agent_probe_text_file`
+- `lan_agent_read_text_file`
+- `lan_agent_search_text`
+- `lan_agent_list_directory`
+- `lan_agent_get_task`
+- `lan_agent_task_log`
+- `lan_agent_resolve_task_result`
+
+写文件、构建、测试、任意命令执行不会走 `auto_execute_direct`。这些任务仍然返回 `direct_mcp_plan` 或 `delegate_to_llm`，由大模型按计划继续调用 MCP。这样保留 Ran-like 的快速和直观，同时保留 MCP 的路径约束、CLIPS guard、日志与审计链。
+
+
 ---
 
 ## 4. 工具清单与参数
@@ -1849,352 +1909,352 @@ CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服�
 | 场景 | 推荐工具 | 原因 |
 |---|---|---|
 | 分析单个函数的控制流 | `build_cfg` (L2) | AST 级精确 CFG，含基本块和分支 |
-| 分析变量 `center_x` 的数据流 | `build_dfg` (L4) | statement-level def/use，含过程间绑定 |
-| 做程序切片（找符号影响范围） | `build_program_slice` (L5) | 精确到语句的 backward/forward 切片 |
-| 跨文件查找谁调用了 `learn()` | `cmm_search_graph` / `cmm_trace_path` | 项目级调用链，无需逐个文件解析 |
-| 搜索代码中的 TODO/FIXME | `cmm_search_code` | 文本搜索，支持正则和文件过滤 |
-| 了解项目整体架构分层 | `cmm_get_architecture` | 模块依赖、分层、入口点分析 |
-| 对比两个分支的变更影响 | `cmm_detect_changes` | 基于 git diff + 图分析 |
-| 快速查询已分析结果（分页） | `query_*_artifact` (L6) | 毫秒级，无需重跑 Clang |
+| 分析变量 `center_x` 的数据流 | `build_dfg` (L4) | statement-level def/use |
+|  | `build_program_slice` (L5) |  backward/forward  |
+|  `learn()` | `cmm_search_graph` / `cmm_trace_path` |  |
+|  TODO/FIXME | `cmm_search_code` |  |
+|  | `cmm_get_architecture` |  |
+|  | `cmm_detect_changes` |  git diff +  |
+|  | `query_*_artifact` (L6) |  Clang |
 
-### 13.4 组合使用建议
+### 13.4 
 
 ```
-复杂分析任务典型工作流：
 
-1. 项目级定位（CMM）
-   cmm_search_code(query="center_x") → 找到涉及的文件
 
-2. 文件级深度分析（Clang）
+1. CMM
+   cmm_search_code(query="center_x")  
+
+2. Clang
    build_dfg(source_file=FastMatch.cpp, focus_symbol="center_x")
-   → 获取精确的数据流和过程间绑定
+    
 
-3. 结果复用（Artifact Query）
+3. Artifact Query
    query_dfg_artifact(artifact_summary_path=...)
-   → 分页查看、聚焦邻域，无需重跑
+    
 ```
 
-**互补关系**：CMM 适合**项目级快速定位**，Clang 工具适合**单文件深度语义分析**。两者结合可覆盖从宏观架构到微观语句的完整分析链路。
+****CMM ****Clang ****
 
 ---
 
-## 14. 常见问题排查
+## 14. 
 
-### 14.1 服务启动失败 / 连接拒绝
+### 14.1  / 
 
 ```
-错误：Could not establish connection
+Could not establish connection
 ```
 
-**原因**：端口 18080 被旧进程占用。
+**** 18080 
 
-**解决**：
+****
 ```powershell
 Get-Process codex_lan_agent -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
-# 重新启动
+# 
 ```
 
-### 14.2 工具不在 tools/list 中
+### 14.2  tools/list 
 
-**原因**：工具 schema 未在 `McpProtocolOperations.h` 的 `BuildMcpToolsListResponse` 中注册。
+**** schema  `McpProtocolOperations.h`  `BuildMcpToolsListResponse` 
 
-**解决**：检查 [src/McpProtocolOperations.h](src/McpProtocolOperations.h) 中对应工具的 schema 定义是否存在。
+**** [src/McpProtocolOperations.h](src/McpProtocolOperations.h)  schema 
 
-### 14.3 复杂文件解析失败
+### 14.3 
 
-**原因**：`compile_commands.json` 未找到或路径不正确。
+****`compile_commands.json` 
 
-**解决**：
-1. 确认 `project_root` 参数指向项目根目录。
-2. 确认 `<project_root>/build/compile_commands.json` 存在。
-3. 如无，用 CMake 生成：`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`。
+****
+1.  `project_root` 
+2.  `<project_root>/build/compile_commands.json` 
+3.  CMake `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`
 
-### 14.4 DFG/Slice 超时
+### 14.4 DFG/Slice 
 
-**解决**：增大超时到 300s，或减小 `max_nodes` / `max_edges` / `max_interprocedural_bindings`。
+**** 300s `max_nodes` / `max_edges` / `max_interprocedural_bindings`
 
-### 14.5 MinGW 编译
+### 14.5 MinGW 
 
-项目默认使用 MSVC。如需 MinGW：
+ MSVC MinGW
 
 ```powershell
 cmake -B AIbuild -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
 cmake --build AIbuild
 ```
 
-> 注意：MinGW 模式下 Clang Tooling 的头文件路径需要额外配置，建议优先使用 MSVC。
+> MinGW  Clang Tooling  MSVC
 
-### 14.6 语义网格增量去重不生效
+### 14.6 
 
-**原因**：`dedupe_existing` 参数未设置为 `true`，或上一轮的 `artifact_summary_path` 不正确。
+****`dedupe_existing`  `true` `artifact_summary_path` 
 
-**解决**：
-1. 确认 `dedupe_existing=true`（默认为 true）。
-2. 确认 `artifact_summary_path` 指向上一轮 `incremental_update` 返回的 `artifact_summary_json_path`。
-3. 检查 `summary.json` 中的 `artifact_semantic_grid_json_path` 指针是否有效。
+****
+1.  `dedupe_existing=true` true
+2.  `artifact_summary_path`  `incremental_update`  `artifact_summary_json_path`
+3.  `summary.json`  `artifact_semantic_grid_json_path` 
 
-### 14.7 语义网格 query 返回空结果
+### 14.7  query 
 
-**原因**：keyword 未匹配到任何节点，或 layer 过滤过严。
+****keyword  layer 
 
-**解决**：
-1. 尝试 `fuzzy_match=true` 启用模糊匹配。
-2. 尝试不传 `layer` 参数，搜索所有层。
-3. 使用 `regex_match=true` 扩展匹配范围。
+****
+1.  `fuzzy_match=true` 
+2.  `layer` 
+3.  `regex_match=true` 
 
-### 14.8 Task Memory resume_context 找不到文件
+### 14.8 Task Memory resume_context 
 
-**原因**：`goal_id` 不匹配，或尚未对该 goal 调用过 `task_memory_freeze`。
+****`goal_id`  goal  `task_memory_freeze`
 
-**解决**：
-1. 确认 `goal_id` 与 `freeze` 时使用的一致（仅 `[A-Za-z0-9._-]`，其他字符被替换为 `_`）。
-2. 先调用 `lan_agent_task_memory_freeze(goal_id=...)` 创建文件对象层。
-3. 检查 `<data_root>/task_memory/{goal_id}/latest_resume_context.json` 是否存在。
+****
+1.  `goal_id`  `freeze`  `[A-Za-z0-9._-]` `_`
+2.  `lan_agent_task_memory_freeze(goal_id=...)` 
+3.  `<data_root>/task_memory/{goal_id}/latest_resume_context.json` 
 
-### 14.9 RocksDB 镜像不可用
+### 14.9 RocksDB 
 
-**原因**：未以 `-DCODEX_LAN_AGENT_WITH_ROCKSDB=ON` 编译，或 `rocksdb_mirror` 尚未执行。
+**** `-DCODEX_LAN_AGENT_WITH_ROCKSDB=ON`  `rocksdb_mirror` 
 
-**解决**：
-1. 重新编译：`cmake -B AIbuild -DCODEX_LAN_AGENT_WITH_ROCKSDB=ON`。
-2. 先调用 `build_kv_snapshot` 再调用 `rocksdb_mirror`。
-3. 检查 `rocksdb_mirror_manifest.json` 是否生成。
-4. 注意：RocksDB 仅为可选读镜像，缺失不影响文件对象层源真和 `kv_lookup` 正常使用。
+****
+1. `cmake -B AIbuild -DCODEX_LAN_AGENT_WITH_ROCKSDB=ON`
+2.  `build_kv_snapshot`  `rocksdb_mirror`
+3.  `rocksdb_mirror_manifest.json` 
+4. RocksDB  `kv_lookup` 
 
-### 14.10 parity_check 失败
+### 14.10 parity_check 
 
-**原因**：文件 KV 快照与 RocksDB 镜像内容不一致，可能是 `rocksdb_mirror` 后又追加了新步骤未重新镜像。
+**** KV  RocksDB  `rocksdb_mirror` 
 
-**解决**：
-1. 重新执行 `build_kv_snapshot` 刷新文件 KV。
-2. 重新执行 `rocksdb_mirror` 同步到 RocksDB。
-3. 再次 `rocksdb_parity_check`，应返回 `parity_status=pass`。
-4. **切勿**通过修改源真来"迁就"镜像 —— `safe_to_replace_source_of_truth` 必须保持 `false`。
+****
+1.  `build_kv_snapshot`  KV
+2.  `rocksdb_mirror`  RocksDB
+3.  `rocksdb_parity_check` `parity_status=pass`
+4. ****""  `safe_to_replace_source_of_truth`  `false`
 
 
 ---
 
-## 15. 项目演进分析报告（8月9日 → 8月11日）
+## 15. 89  811
 
-> 本节为 2026-08-09 → 2026-08-11 期间 4 个提交的对比分析快照，记录项目从"代码分析 MCP 工具链"演变为"AI Agent 本地操作系统"的架构级变化，供后续维护与架构决策参考。
+>  2026-08-09  2026-08-11  4 " MCP ""AI Agent "
 
-### 15.1 核心变化总览
+### 15.1 
 
-两天内 4 个提交，但**架构层面发生了根本性演进**——从"代码分析 MCP 工具链"演变为**完整的 AI Agent 执行平台**。
+ 4 ****" MCP "** AI Agent **
 
-| 维度 | 8月9日状态 | 8月11日状态 | 变化性质 |
+|  | 89 | 811 |  |
 |---|---|---|---|
-| MCP 工具表面 | 135 扁平工具列表 | 单网关路由 + 134 个隐藏内部工具 | **架构重构** |
-| Task Memory | 12 工具，多步手动编排 | 14 工具，新增一键续接入口 | **能力增强** |
-| CLIPS 专家系统 | 隐藏层，源码存在但未暴露 | 正式 MCP 工具，可调用决策 | **从暗到明** |
-| 执行能力 | 只读代码分析 | 可执行构建/测试/文件编辑/格式化 | **边界扩展** |
-| CI/CD | 无公开流水线 | 两层缓存全自动 Release 流水线 | **工程化落地** |
-| 文档 | 工具参数说明 | 新增真实使用对话案例 | **可用性提升** |
+| MCP  | 135  |  + 134  | **** |
+| Task Memory | 12  | 14  | **** |
+| CLIPS  |  |  MCP  | **** |
+|  |  | /// | **** |
+| CI/CD |  |  Release  | **** |
+|  |  |  | **** |
 
-### 15.2 架构级变化：MCP 网关路由模式
+### 15.2 MCP 
 
-#### 15.2.1 默认只暴露一个工具
+#### 15.2.1 
 
-`McpProtocolOperations.h` 中新增了 `UseFullMcpToolSurface()` 控制逻辑：
+`McpProtocolOperations.h`  `UseFullMcpToolSurface()` 
 
 ```cpp
-// 默认返回 false，只暴露 lan_agent_mcp_route
-// 需要环境变量 CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full/all/legacy/153 才暴露全部工具
+//  false lan_agent_mcp_route
+//  CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full/all/legacy/153 
 ```
 
-**默认工具**：`lan_agent_mcp_route`——单聊天入口网关，支持三种模式：
+****`lan_agent_mcp_route`
 
-- `mode=overview`：返回指导信息
-- `mode=route`：返回 `tool_use_decision` / `current_tool_chain_node` / `required_tool_name` / `required_tool_arguments_json`
-- `mode=call`：执行一个内部 MCP 工具，完整内部目录对模型隐藏
+- `mode=overview`
+- `mode=route` `tool_use_decision` / `current_tool_chain_node` / `required_tool_name` / `required_tool_arguments_json`
+- `mode=call` MCP 
 
-#### 15.2.2 设计意图
+#### 15.2.2 
 
-这是从"模型自由选择 135 个工具"到"网关决策 + 受控执行"的关键转变：
+" 135 "" + "
 
-- **降低模型认知负担**：模型只看到一个工具，不需要理解 134 个内部工具的 schema
-- **强制决策层**：所有工具调用必须经过路由决策，可插入 CLIPS 规则校验
-- **隐藏内部复杂度**：内部工具链对模型不可见，只暴露决策结果
-- **完成声明门禁**：`terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` 四个字段控制模型能否宣布任务完成
+- **** 134  schema
+- **** CLIPS 
+- ****
+- ****`terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` 
 
-### 15.3 Task Memory 新增工具
+### 15.3 Task Memory 
 
-#### 15.3.1 `lan_agent_task_memory_resume_and_execute`（第 13 工具）
+#### 15.3.1 `lan_agent_task_memory_resume_and_execute` 13 
 
-**本次更新最有价值的新增**。
-
-```
-新对话一键入口：
-  读取 latest_resume_context → 执行 bounded continuation budget → 刷新 task memory
-  → 返回 terminal verification fields 或 next action
-```
-
-关键设计：
-
-- 默认 `dry_run=false` / `execute=true`（与其他工具默认 `dry_run=true` 相反）
-- 不需要模型手动编排 freeze → budget → kv → mirror 链路
-- 全新模型只需传 `goal_id` 即可续接已归档任务
-- 直接替代"重新读取旧对话历史"的传统做法
-
-#### 15.3.2 `lan_agent_task_memory_new_chat_round_selftest`（第 14 工具）
-
-自测工具，验证 MCP-owned continuation semantics：
-
-- 创建 MCP round manifest
-- freeze 一个微型归档续接
-- 通过 `resume_and_execute` 使用 goal_id-only 入口语义恢复
-- 执行 bounded step
-- 验证 `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok`
-- **不依赖旧模型上下文**，`chat_context_reset_acknowledged` 保持 false 直到客户端确认
-
-#### 15.3.3 Task Memory 演进路径
+****
 
 ```
-8月9日：freeze → resume → budget → kv_snapshot → rocksdb_mirror → parity → manifest → acceptance
-         （8 步手动编排，模型需要理解每一步）
 
-8月11日：resume_and_execute(goal_id) → 一键完成上述链路
-         （模型只需知道 goal_id，内部链路由 MCP 服务端自动执行）
+   latest_resume_context   bounded continuation budget   task memory
+    terminal verification fields  next action
 ```
 
-### 15.4 CLIPS 专家系统正式暴露
 
-上次分析中 CLIPS 是"隐藏的第五层"——源码存在但 README 未提及。现已正式暴露为 MCP 工具：
 
-| 工具 | 功能 |
+-  `dry_run=false` / `execute=true` `dry_run=true` 
+-  freeze  budget  kv  mirror 
+-  `goal_id` 
+- ""
+
+#### 15.3.2 `lan_agent_task_memory_new_chat_round_selftest` 14 
+
+ MCP-owned continuation semantics
+
+-  MCP round manifest
+- freeze 
+-  `resume_and_execute`  goal_id-only 
+-  bounded step
+-  `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok`
+- ****`chat_context_reset_acknowledged`  false 
+
+#### 15.3.3 Task Memory 
+
+```
+89freeze  resume  budget  kv_snapshot  rocksdb_mirror  parity  manifest  acceptance
+         8 
+
+811resume_and_execute(goal_id)  
+          goal_id MCP 
+```
+
+### 15.4 CLIPS 
+
+ CLIPS "" README  MCP 
+
+|  |  |
 |---|---|
-| `lan_agent_clips_decide` | 基于规则的决策逻辑，输入 MCP request/result facts，返回 allow/block/route + verified/not_verified + 最终答案约束 |
-| `lan_agent_clips_chain_template` | 返回标准 CLIPS `mcp_tool_chain` 模板，每个工具共享规则驱动的 pre-call/post-result 链 |
-| `lan_agent_rag_clips_meta` | 调用上游 `/rag/clips/meta`，返回 fact_bundle + serialized_assertions |
-| `lan_agent_rag_clips_run` | 调用上游 `/rag/clips/run`，返回 request_id/trace_id/query_id + 存储引用 |
+| `lan_agent_clips_decide` |  MCP request/result facts allow/block/route + verified/not_verified +  |
+| `lan_agent_clips_chain_template` |  CLIPS `mcp_tool_chain`  pre-call/post-result  |
+| `lan_agent_rag_clips_meta` |  `/rag/clips/meta` fact_bundle + serialized_assertions |
+| `lan_agent_rag_clips_run` |  `/rag/clips/run` request_id/trace_id/query_id +  |
 
-**意义**：CLIPS 不再是"预留接口"，而是已经成为**工具调用决策的规则引擎**——在文件操作、长循环、构建、测试、结果验收之前，先经过 CLIPS 规则校验。CLIPS 规则体系的完整说明（目录结构、fact 模板、5 个规则域、49 条 defrule、salience 优先级模型、扩展指南）详见 [第 16 节](#16-clips-规则体系详解)。
+****CLIPS ""**** CLIPS CLIPS fact 5 49  defrulesalience  [ 16 ](#16-clips-)
 
-### 15.5 执行能力边界扩展
+### 15.5 
 
-#### 15.5.1 从只读分析到可执行操作
+#### 15.5.1 
 
-新增完整的执行工具链。
 
-**构建/测试**：
 
-- `lan_agent_configure_project`：CMake 配置
-- `lan_agent_build_target`：构建目标（需 preflight_ref）
-- `lan_agent_run_ctest_target`：运行 CTest
-- `lan_agent_preflight_build_target` / `preflight_run_ctest_target`：预检契约
-- `lan_agent_discover_ctest_tests`：CTest 发现
+**/**
+
+- `lan_agent_configure_project`CMake 
+- `lan_agent_build_target` preflight_ref
+- `lan_agent_run_ctest_target` CTest
+- `lan_agent_preflight_build_target` / `preflight_run_ctest_target`
+- `lan_agent_discover_ctest_tests`CTest 
 - `lan_agent_prepare_build_dir` / `check_build_dir`
 
-**文件编辑（安全受控）**：
+****
 
-- `lan_agent_write_text_file`：创建/覆盖/追加文本文件
-- `lan_agent_preview_patch`：高风险单文件替换预览（不写盘）
-- `lan_agent_apply_single_file_patch` / `apply_diff_patch`：应用补丁
-- `lan_agent_verify_single_file_patch`：验证补丁结果（hash + 包含/排除文本检查）
-- `lan_agent_revert_single_file_patch`：回滚补丁
-- `lan_agent_format_code_file`：clang-format 格式化（支持 dry_run）
-- `lan_agent_ensure_directory`：目录创建
+- `lan_agent_write_text_file`//
+- `lan_agent_preview_patch`
+- `lan_agent_apply_single_file_patch` / `apply_diff_patch`
+- `lan_agent_verify_single_file_patch`hash + /
+- `lan_agent_revert_single_file_patch`
+- `lan_agent_format_code_file`clang-format  dry_run
+- `lan_agent_ensure_directory`
 
-**编辑安全约束**：
+****
 
-- 明确禁止用 patch 工具做注释清理/文本清理
-- 必须用 `scan_text_ranges(max_ranges_per_call=1)` → `prepare_edit_windows(max_windows_per_call=1)` → 一次原子编辑
-- 完整审计链：preview → apply → verify → revert，每个 patch_id 可追溯
+-  patch /
+-  `scan_text_ranges(max_ranges_per_call=1)`  `prepare_edit_windows(max_windows_per_call=1)`  
+- preview  apply  verify  revert patch_id 
 
-#### 15.5.2 本地模型/RAG 集成
+#### 15.5.2 /RAG 
 
-- `lan_agent_run_local_chat` / `enqueue_local_chat`：项目范围代码分析
-- `lan_agent_run_rag_flow` / `enqueue_rag_flow`：RAG 生成请求
-- `lan_agent_ventriloquist_reply`：受控本地 AI 代理回复，归一化为 direct_answer/evidence/next_action/confidence
-- `lan_agent_remote_session_new_turn` / `append_turn`：llama.cpp 远程会话管理
-- `llama.observer_smoke`：观察 CODEX → local MCP → local llama.cpp 链路
+- `lan_agent_run_local_chat` / `enqueue_local_chat`
+- `lan_agent_run_rag_flow` / `enqueue_rag_flow`RAG 
+- `lan_agent_ventriloquist_reply` AI  direct_answer/evidence/next_action/confidence
+- `lan_agent_remote_session_new_turn` / `append_turn`llama.cpp 
+- `llama.observer_smoke` CODEX  local MCP  local llama.cpp 
 
-### 15.6 CI/CD 工程化落地
+### 15.6 CI/CD 
 
-#### 15.6.1 两层缓存架构
+#### 15.6.1 
 
 ```
-Layer 1 · LLVM/Clang 18.1.8 toolchain（缓存持久化）
-  ├─ 从官方源码 llvmorg-18.1.8 构建
-  ├─ 静态库，X86 target only，关闭 tests/examples/benchmarks/docs/tools
-  ├─ 缓存 key: llvm-18.1.8-static-flat-msvc-ninja-v3
-  ├─ 仅当 LLVM 版本/源码/编译标志变化时重建
-  └─ save-always: 即使后续步骤失败也保存缓存
+Layer 1  LLVM/Clang 18.1.8 toolchain
+    llvmorg-18.1.8 
+   X86 target only tests/examples/benchmarks/docs/tools
+    key: llvm-18.1.8-static-flat-msvc-ninja-v3
+    LLVM //
+   save-always: 
 
-Layer 2 · codex_lan_agent 业务构建（增量编译）
-  ├─ 恢复缓存的 flat LLVM_ROOT {include, lib}
-  ├─ 业务源码变化只编译 codex_lan_agent，不触发 LLVM 重编译
-  ├─ 默认启用 CODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
-  └─ 默认启用 CODEX_LAN_AGENT_WITH_ROCKSDB=ON
+Layer 2  codex_lan_agent 
+    flat LLVM_ROOT {include, lib}
+    codex_lan_agent LLVM 
+    CODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
+    CODEX_LAN_AGENT_WITH_ROCKSDB=ON
 ```
 
-#### 15.6.2 新增 RocksDB 11.0.4 静态构建
+#### 15.6.2  RocksDB 11.0.4 
 
-- 缓存 key：`rocksdb-11.0.4-static-msvc-md-v1`
-- 从官方 release tarball 构建，关闭所有可选压缩依赖（snappy/lz4/zlib/zstd/bzip2/tbb）
-- `/MD` CRT 匹配，静态库
-- Release 构建默认启用 RocksDB，`task_memory_rocksdb_mirror/lookup/parity_check` 工具可用
+-  key`rocksdb-11.0.4-static-msvc-md-v1`
+-  release tarball snappy/lz4/zlib/zstd/bzip2/tbb
+- `/MD` CRT 
+- Release  RocksDB`task_memory_rocksdb_mirror/lookup/parity_check` 
 
-#### 15.6.3 纯网络构建策略
+#### 15.6.3 
 
-- **不 vendor 任何第三方库**：LLVM 和 RocksDB 都从网络下载构建
-- Release ZIP 只包含 `codex_lan_agent.exe` + config + README，无 `.lib`/`.dll`
-- `.gitignore` 白名单：只允许 `CMakeLists.txt` / `src/**` / `.github/workflows/**`
-- 禁止 `*.exe *.dll *.lib *.obj *.o *.a` / 图片 / 归档 / `third_party/` / `vendor/`
+- ** vendor **LLVM  RocksDB 
+- Release ZIP  `codex_lan_agent.exe` + config + README `.lib`/`.dll`
+- `.gitignore`  `CMakeLists.txt` / `src/**` / `.github/workflows/**`
+-  `*.exe *.dll *.lib *.obj *.o *.a` /  /  / `third_party/` / `vendor/`
 
-### 15.7 语义动作调度层
+### 15.7 
 
-新增完整的语义动作抽象层，把自然语言意图映射到工具调用：
 
-| 工具 | 功能 |
+
+|  |  |
 |---|---|
-| `semantic_action_map` | 标准语义动作快捷方式表 |
-| `semantic_action_resolve` | 自然语言 → 语义动作（不执行） |
-| `semantic_action_validate` | 验证参数和副作用风险（不执行） |
-| `semantic_action_prepare` | resolve + validate 一次性预检 |
-| `semantic_action_tool_call` | 生成非执行的 MCP tools/call JSON 模板 |
-| `lan_agent_execute_semantic_action` | 解析并立即执行真实工具，返回 task_id/result_ref/evidence_ref |
+| `semantic_action_map` |  |
+| `semantic_action_resolve` |    |
+| `semantic_action_validate` |  |
+| `semantic_action_prepare` | resolve + validate  |
+| `semantic_action_tool_call` |  MCP tools/call JSON  |
+| `lan_agent_execute_semantic_action` |  task_id/result_ref/evidence_ref |
 
-配合 `intent_dispatch_prepare`——消费结构化模型意图输出，自动准备下一个 MCP 工具调用，支持 legacy fallback。
+ `intent_dispatch_prepare` MCP  legacy fallback
 
-### 15.8 与 research-mcp 体系的契合度更新
+### 15.8  research-mcp 
 
-上次分析指出两个项目"高度契合"，现在契合度进一步提升：
+""
 
-| 设计原则 | research-mcp | codex-lan-agent（更新后） |
+|  | research-mcp | codex-lan-agent |
 |---|---|---|
-| 协议层 | MCP over HTTP/stdio | MCP over Streamable HTTP + 网关路由 |
-| 分层架构 | L1/L2/L3 三层观测 | 网关路由 + 134 个内部工具 + CLIPS 决策层 |
-| 缓存/持久化 | SQLite 统一缓存层 | 文件对象层 + RocksDB 镜像 + parity check |
-| 源真分离 | 多源融合 + 降级链 | 文件源真 + RocksDB 镜像 + parity check |
-| 实体/关系 | Entity Mapper + 关系图谱 | Semantic Grid + dialog_slice + task_memory |
-| CI/CD | GitHub Actions 云端编译 | 两层缓存全自动 Release 流水线 |
-| 决策层 | （尚未实现） | CLIPS 专家系统正式暴露 |
-| 执行能力 | 只读信息获取 | 只读分析 + 可执行构建/测试/编辑 |
+|  | MCP over HTTP/stdio | MCP over Streamable HTTP +  |
+|  | L1/L2/L3  |  + 134  + CLIPS  |
+| / | SQLite  |  + RocksDB  + parity check |
+|  |  +  |  + RocksDB  + parity check |
+| / | Entity Mapper +  | Semantic Grid + dialog_slice + task_memory |
+| CI/CD | GitHub Actions  |  Release  |
+|  |  | CLIPS  |
+|  |  |  + // |
 
-**潜在整合方向**：
+****
 
-1. `resume_and_execute` 模式可以直接复用到 research-mcp 的长任务续接
-2. CLIPS 决策层可以统一两个项目的工具调用决策
-3. 网关路由模式（单入口 + 隐藏内部工具）可以作为 research-mcp 的演进方向
-4. 两层缓存 CI 架构可以直接复用到 research-mcp 的 Release 流水线
+1. `resume_and_execute`  research-mcp 
+2. CLIPS 
+3.  +  research-mcp 
+4.  CI  research-mcp  Release 
 
-### 15.9 技术债务
+### 15.9 
 
-#### 15.9.1 已有问题持续存在
+#### 15.9.1 
 
-- 硬编码路径：`TaskMemoryOperations.h` 中仍有 `D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/...`
-- Windows 优先：WinHTTP + MSVC + WebView2
-- DFG 性能瓶颈：复杂文件 180-300s
+- `TaskMemoryOperations.h`  `D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/...`
+- Windows WinHTTP + MSVC + WebView2
+- DFG  180-300s
 
-#### 15.9.2 新增隐忧
+#### 15.9.2 
 
-1. **工具数量爆炸**：完整模式下 135 个工具，维护成本急剧上升
-2. **网关路由黑盒**：默认模式下模型只看到一个工具，调试难度增加
-3. **CLIPS 规则已文档化**：`clips_rules/` 目录的 8 个 `.clp` 文件、5 个规则域、49 条 defrule 已在第 16 节详述（原"未开源"问题已解决）
-4. **执行安全边界**：新增文件编辑/构建/测试能力，但安全约束分散在各工具描述中，缺乏统一的权限模型
-5. **README 同步机制**：已通过 4.0 节"完整工具清单概览（135 个）"校准工具表与 `McpProtocolOperations.h` 实际注册一致；新增/删除工具时必须同步更新 4.0 节合计（原"滞后风险"已缓解）
+1. **** 135 
+2. ****
+3. **CLIPS **`clips_rules/`  8  `.clp` 5 49  defrule  16 ""
+4. ****//
+5. **README ** 4.0 "135 "�工具表与 `McpProtocolOperations.h` 实际注册一致；新增/删除工具时必须同步更新 4.0 节合计（原"滞后风险"已缓解）
 
 ### 15.10 结论
 
@@ -3730,117 +3790,117 @@ C++  ssert_fact lambda  fact  domain  fact  fact  CLIPS  fact
 |  | CLIPS_MAX_RULE_FIRINGS = 200 |
 |  | Run(env, -1)  Run(env, CLIPS_MAX_RULE_FIRINGS) |
 |  |  >= 200   circuit_breaker_rules_exceeded |
-| �码位置 | [ClipsDecisionOperations.h L2296-2300](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2296-L2300) |
+|  | [ClipsDecisionOperations.h L2296-2300](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2296-L2300) |
 
-### 熔断触发时行为
+### 
 
 `
-任一熔断器触发
-    ↓
-decision.decision = "allow"              // 强制放行，不阻塞调用方
+
+    
+decision.decision = "allow"              // 
 decision.verification = "circuit_breaker_triggered"
 decision.reason_code = "clips_internal_circuit_breaker"
 decision.next_action = "circuit_breaker: clips internal limit exceeded"
-    ↓
-DestroyEnvironment(env)                  // 立即销毁 Environment 释放内存
-return decision                          // 返回安全结果
+    
+DestroyEnvironment(env)                  //  Environment 
+return decision                          // 
 `
 
-### 审计输出新增字段
+### 
 
-每个 CLIPS decision 结果新增 6 个审计字段，可在 mcp_trace_audit_events.jsonl 中观测：
+ CLIPS decision  6  mcp_trace_audit_events.jsonl 
 
-| 字段 | 说明 |
+|  |  |
 |---|---|
-| act_count_before_run | Run 前已存在 fact 数 |
-| act_count_after_run | Run 后总 fact 数 |
-| ule_firings_actual | Run 实际触发的规则数 |
-| duplicate_facts_blocked | 被去重拦截的 fact 数 |
-| circuit_breaker_facts_exceeded | 熔断①是否触发 |
-| circuit_breaker_rules_exceeded | 熔断③是否触发 |
+| act_count_before_run | Run  fact  |
+| act_count_after_run | Run  fact  |
+| ule_firings_actual | Run  |
+| duplicate_facts_blocked |  fact  |
+| circuit_breaker_facts_exceeded |  |
+| circuit_breaker_rules_exceeded |  |
 
-### 附带修复：日志膨胀治理
+### 
 
-- emote_control_events.jsonl：393 MB → 0（清理）
-- mcp_trace_audit_events.jsonl：7.3 MB → 0（清理）
-- 后续应增加日志轮转机制（单文件超 10 MB 自动截断）
+- emote_control_events.jsonl393 MB  0
+- mcp_trace_audit_events.jsonl7.3 MB  0
+-  10 MB 
 
 ---
 
-## 24.4 验证结论
+## 24.4 
 
-修复后重新编译部署 codex_lan_agent.exe，验证结果：
+ codex_lan_agent.exe
 
-| 验证项 | 结果 |
+|  |  |
 |---|---|
-| 进程状态 | **运行中** PID=25436，内存 8.7 MB |
-| exe 编译时间 | 17:12:27（晚于源码修改 17:11:47，确认熔断器代码已编译进 exe） |
-| pending continuations | 0 文件 |
-| 日志文件大小 | 全部 0 MB |
-| MCP 	ools/list 响应 | **正常**（protocol=2.0，tools count=1） |
+|  | **** PID=25436 8.7 MB |
+| exe  | 17:12:27 17:11:47 exe |
+| pending continuations | 0  |
+|  |  0 MB |
+| MCP 	ools/list  | ****protocol=2.0tools count=1 |
 
-**结论：崩溃问题已解决。** 三层熔断器确保：
+**** 
 
-1. **CLIPS 内部 fact 爆炸** → 熔断①在 500 fact 时停止断言，强制返回
-2. **相同 fact 重复插入** → 熔断②在签名命中时拦截，计数但不断言
-3. **规则互相触发死循环** → 熔断③在 200 次规则触发后停止 Run，强制返回
-4. **日志膨胀** → 已清理；后续应增加日志轮转
+1. **CLIPS  fact **   500 fact 
+2. ** fact **  
+3. ****   200  Run
+4. ****  
 
-任一熔断触发时，服务不会崩溃，而是返回 decision=allow + circuit_breaker_triggered 标记，保证 Codex 工作流不中断。
+ decision=allow + circuit_breaker_triggered  Codex 
 
 ---
 
-## 24.5 熔断器与 fact-factory 守卫层的关系
+## 24.5  fact-factory 
 
 `
-外部 LLM / Codex 输出
-        ↓
-┌─────────────────────────────┐
-│  fact-factory 守卫层（外部）  │  ← 管住从外部流入推理引擎的 fact
-│  第0层: 字节硬过滤            │     字节消毒、长度检查、CLIPS 转义
-│  第1层: CppJieba 分词         │
-│  第2层: marisa-trie 检索      │
-│  第3层: 语义同义归一           │
-└──────────┬──────────────────┘
-           ↓ 消毒后的 fact 进入 CLIPS
-┌─────────────────────────────┐
-│  CLIPS 推理引擎（内部）        │  ← 内部规则执行产生的新 fact 不经过守卫层
-│  规则匹配 → assert 新 fact    │
-│  ┌───────────────────────┐   │
-│  │ 熔断①: fact 数量 ≤ 500 │   │  ← 运行时硬上限
-│  │ 熔断②: 签名去重        │   │  ← C++ 侧断言去重
-│  │ 熔断③: 规则触发 ≤ 200  │   │  ← Run 有界替代无限
-│  └───────────────────────┘   │
-└──────────┬──────────────────┘
-           ↓
-     decision 结果返回
+ LLM / Codex 
+        
+
+  fact-factory       fact
+  0:                  CLIPS 
+  1: CppJieba          
+  2: marisa-trie       
+  3:            
+
+             fact  CLIPS
+
+  CLIPS             fact 
+    assert  fact    
+     
+   : fact   500       
+   :               C++ 
+   :   200        Run 
+     
+
+           
+     decision 
 `
 
-> **明确边界**：fact-factory 守卫层无法管住 CLIPS 内部自生 fact。三层熔断器是独立于守卫层的运行时安全机制，二者互补但职责分离。
+> ****fact-factory  CLIPS  fact
 
 ---
 
 ---
 
-## Headless 命令被白名单拒绝的处理方法
+## Headless 
 
-### 问题现象
+### 
 
-当 Headless 或验收程序通过 `local_cli` / `lan_agent_run_command` 被当作普通命令直接执行时，可能返回：
+ Headless  `local_cli` / `lan_agent_run_command` 
 
 ```text
 unsupported local_cli command
 ```
 
-这表示请求已经进入 `codex-lan-agent`，但命中了本地 CLI 网关的命令白名单拦截。它不是 Headless 程序本身崩溃，也不是 Windows 找不到 exe，而是调用方式不在 `local_cli` 允许的命令集合内。
+ `codex-lan-agent` CLI  Headless  Windows  exe `local_cli` 
 
-`local_cli` 只接受固定的内置命令，例如 `health`、`chat-status`、`task-latest`、`task`、`log-latest`、`diff`、`run-light`、`build-target`、`test-result`、`thread-report`、`mkdir`。不要把任意 exe、`cmd.exe`、`powershell.exe` 或 `Headless` 字符串直接塞进 `command` 字段。
+`local_cli`  `health``chat-status``task-latest``task``log-latest``diff``run-light``build-target``test-result``thread-report``mkdir` exe`cmd.exe``powershell.exe`  `Headless`  `command` 
 
-### 推荐方案：用 CLI profile 加入白名单
+###  CLI profile 
 
-需要运行 `D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/build01/Release/cxvision_imgui_acceptance.exe` 时，推荐把它注册为 `profile`，然后通过 `lan_agent_run_cli_profile` 调用。
+ `D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/build01/Release/cxvision_imgui_acceptance.exe`  `profile` `lan_agent_run_cli_profile` 
 
-1. 确认程序路径在 `allowed_roots` 覆盖范围内。当前 `cxvisionai` 应在允许根目录中，例如：
+1. � `allowed_roots` 覆盖范围内。当前 `cxvisionai` 应在允许根目录中，例如：
 
 ```ini
 allowed_roots=D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent;D:/Codex-WorkDir/Sean_WorkDir/cxvisionai
