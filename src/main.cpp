@@ -868,8 +868,12 @@ bool IsSafeClipsContinuationAction(
     }
     if (required_tool == "lan_agent_task_memory_resume_and_execute"
         && safety_class == "TASK_MEMORY_CONTINUATION"
-        && GetFieldOrDefault(result, "record_model", "") ==
-            "mcp_task_memory_execute_continuation_budget_response_v1"
+        && (GetFieldOrDefault(result, "record_model", "") ==
+                "mcp_task_memory_execute_continuation_budget_response_v1"
+            || (GetFieldOrDefault(result, "record_model", "") ==
+                    "mcp_task_memory_resume_and_execute_response_v1"
+                && GetFieldOrDefault(result, "inner_record_model", "") ==
+                    "mcp_task_memory_execute_continuation_budget_response_v1"))
         && GetFieldOrDefault(result, "execution_mode", "") == "bounded_allowlist_execute"
         && GetFieldOrDefault(result, "continue_required", "") == "true"
         && GetFieldOrDefault(result, "terminal_state", "") != "true") {

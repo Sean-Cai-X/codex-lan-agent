@@ -443,20 +443,34 @@ CommandResult LocalCliResult(
     }
     if (command == "chat-status") {
         CommandResult health = BuildHealthResult(config);
+        CommandResult probe = RunLocalChat(
+            config,
+            "local_chat_health_probe",
+            "Reply with exactly: ok",
+            "health_probe",
+            3000,
+            nullptr);
+
         CommandResult result;
-        result.fields["local_chat_ready"] = GetFieldOrDefault(health, "local_chat_ready", "false");
+        result.fields["local_chat_tcp_ready"] = GetFieldOrDefault(health, "local_chat_ready", "false");
+        result.fields["local_chat_ready"] = probe.ok ? "true" : "false";
+        result.fields["local_chat_completion_ready"] = probe.ok ? "true" : "false";
+        result.fields["local_chat_ready_semantics"] = "chat_completion_probe";
         result.fields["local_chat_endpoint"] = GetFieldOrDefault(health, "local_chat_endpoint", "");
+        result.fields["local_chat_endpoint_effective"] = GetFieldOrDefault(probe, "local_chat_endpoint_effective", GetFieldOrDefault(health, "local_chat_endpoint_effective", ""));
+        result.fields["local_chat_endpoint_source"] = GetFieldOrDefault(probe, "local_chat_endpoint_source", GetFieldOrDefault(health, "local_chat_endpoint_source", ""));
         result.fields["local_chat_detail"] = GetFieldOrDefault(health, "local_chat_detail", "");
-        result.ok = result.fields["local_chat_ready"] == "true";
+        result.fields["local_chat_probe_status_code"] = GetFieldOrDefault(probe, "status_code", "0");
+        result.fields["local_chat_probe_log_path"] = GetFieldOrDefault(probe, "log_path", "");
+        result.fields["local_chat_probe_body_ref"] = GetFieldOrDefault(probe, "body_ref", "");
+        result.fields["local_chat_probe_error"] = GetFieldOrDefault(probe, "error", "");
+        result.fields["local_chat_probe_timeout_ms"] = "3000";
+        result.ok = probe.ok;
         result.exit_code = result.ok ? 0 : 50;
         if (!result.ok) {
-            result.fields["error"] = "local chat is not ready";
+            result.fields["error"] = "local chat completion probe failed";
         }
-        return BuildLocalCliEnvelope(
-            config,
-            command,
-            result,
-            "{\"command\":\"health\",\"reason\":\"chat status unavailable\"}");
+        return BuildLocalCliEnvelope(config, command, result, "null");
     }
     if (command == "task-latest") {
         CommandResult result = g_task_manager == nullptr

@@ -91,7 +91,7 @@ std::string TruncateLocalChatEvidenceText(const std::string & value, std::size_t
 std::string BuildLocalChatEvidenceInjectionText(const LocalChatEvidencePacket & evidence) {
     std::ostringstream packet;
     packet
-        << "\n\nReview evidence packet (caller supplied; analysis-only; do not infer real execution beyond these refs):\n"
+        << "\n\nReview evidence packet (caller supplied; analysis-only; evaluate supplied evidence, but do not claim new execution):\n"
         << "task_id=" << evidence.task_id << "\n"
         << "result_ref=" << evidence.result_ref << "\n"
         << "evidence_ref=" << evidence.evidence_ref << "\n"
@@ -107,8 +107,8 @@ std::string BuildLocalChatEvidenceInjectionText(const LocalChatEvidencePacket & 
                << "\n";
     }
     packet
-        << "Analysis rule: if evidence is insufficient, request the real MCP execution tool "
-        << "or explicit refs; do not fabricate build logs, test logs, file paths, or executed changes.";
+        << "Analysis rule: analyze caller-supplied excerpts when present; if evidence is insufficient, request "
+        << "a real MCP execution tool or explicit refs. Do not fabricate build logs, test logs, file paths, or executed changes.";
     return packet.str();
 }
 
@@ -126,9 +126,17 @@ LocalChatEvidencePacket ExtractLocalChatEvidencePacket(const std::string & body)
     if (evidence.source_excerpt.empty()) {
         evidence.source_excerpt = ExtractJsonString(body, "key_source_excerpt");
     }
+    if (evidence.source_excerpt.empty()) {
+        evidence.source_excerpt = ExtractJsonString(body, "content");
+    }
+    if (evidence.source_excerpt.empty()) {
+        evidence.source_excerpt = ExtractJsonString(body, "content_text");
+    }
+    if (evidence.source_excerpt.empty()) {
+        evidence.source_excerpt = ExtractJsonString(body, "evidence_content");
+    }
     return evidence;
 }
-
 bool LooksLikeDirectoryScope(
     const AgentConfig & config,
     const std::string & scope,
