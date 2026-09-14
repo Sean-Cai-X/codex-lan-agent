@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <vector>
 
+bool IsSourceFilePathForWritePolicy(const std::string & file_path);
+
 CommandResult BuildBuildTargetPreflightResult(
     const std::string & build_dir,
     const std::string & target,
@@ -1167,8 +1169,12 @@ std::string ResolveRouteBySynonymAndPattern(
         params.GetString("query_text"),
         params.GetString("text"),
         params.GetString("anchor_text"))).empty();
-    const bool has_start_line = !Trim(params.GetString("start_line")).empty();
-    const bool has_end_line = !Trim(params.GetString("end_line")).empty();
+    // Line ranges are normally encoded as JSON numbers. GetString() only sees
+    // quoted values, which caused a numeric start_line/end_line pair to be
+    // misrouted as a whole-file write and then blocked by the source-write
+    // guard. Raw JSON preserves both numeric and quoted line coordinates.
+    const bool has_start_line = !Trim(params.GetRawJson("start_line")).empty();
+    const bool has_end_line = !Trim(params.GetRawJson("end_line")).empty();
     const bool has_anchor = !Trim(params.GetString("anchor_text")).empty();
     if (has_build_dir && has_target) return "lan_agent_build_target";
     if (has_command) return "local_cli";
@@ -4096,7 +4102,7 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
             const std::string task_id = g_task_manager->EnqueueCliProfile(
                 "run_ctest_target",
                 BuildRunCTestTargetArguments(build_dir, config_name, effective_test_regex));
-            result = BuildQueuedTaskResult(task_id);
+            result = BuildQueuedTaskResult(config, task_id);
             if (!preflight_ref.empty()) {
                 result.fields["preflight_ref"] = preflight_ref;
             }
@@ -4684,18 +4690,31 @@ const std::unordered_map<std::string, McpToolHandler> & BuildMcpToolHandlerRegis
                 return payload_result;
             }
             const std::string expected_file_hash = params.GetString("expected_file_hash");
-            CommandResult result = expected_file_hash.empty()
-                ? WriteTextFileResult(
+            const std::string file_path = params.GetString("file_path");
+            const bool append = params.GetBool("append", false);
+            CommandResult result;
+            if (IsSourceFilePathForWritePolicy(file_path) && !append) {
+                // Small models sometimes select write_text_file for a source edit.
+                // Preserve the requested mutation, but upgrade it to the audited
+                // patch path instead of rejecting it as an unsafe direct write.
+                result = ApplySingleFilePatchResult(
                     config,
-                    params.GetString("file_path"),
+                    file_path,
                     content,
-                    params.GetBool("append", false))
-                : WriteWholeTextViaOptfileResult(
-                    config,
-                    params.GetString("file_path"),
-                    content,
-                    params.GetBool("append", false),
-                    expected_file_hash);
+                    expected_file_hash,
+                    params.GetString("request_id"),
+                    params.GetString("trace_id"),
+                    params.GetString("patch_id"),
+                    "auto_rerouted_from_write_text_file",
+                    params.GetBool("allow_empty_content", false));
+                result.fields["source_write_rerouted_to_patch"] = "true";
+                result.fields["requested_tool"] = "lan_agent_write_text_file";
+            } else {
+                result = expected_file_hash.empty()
+                    ? WriteTextFileResult(config, file_path, content, append)
+                    : WriteWholeTextViaOptfileResult(
+                        config, file_path, content, append, expected_file_hash);
+            }
             result.fields["content_transport"] = GetFieldOrDefault(payload_result, "content_transport", "json_string");
             result.fields["content_base64_bytes"] = GetFieldOrDefault(payload_result, "content_base64_bytes", "");
             return result;

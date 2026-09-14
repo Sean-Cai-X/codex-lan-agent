@@ -563,7 +563,7 @@ CommandResult LocalCliResult(
             const std::string queued_task_id = g_task_manager->EnqueueCliProfile(
                 "build_target",
                 "-BuildDir \"" + build_dir + "\" -Config " + resolved_config + " -Target " + target);
-            result = BuildQueuedTaskResult(queued_task_id);
+            result = BuildQueuedTaskResult(config, queued_task_id);
         }
         return BuildLocalCliEnvelope(
             config,

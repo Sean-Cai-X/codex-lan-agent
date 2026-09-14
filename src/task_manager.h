@@ -24,6 +24,7 @@ public:
     std::string EnqueueRagFlow(const std::string & query, const std::string & mode);
     std::string EnqueueLocalChat(const std::string & scope, const std::string & question, const std::string & mode);
     CommandResult GetTaskResult(const std::string & task_id) const;
+    CommandResult WaitForTaskResult(const std::string & task_id, int timeout_sec);
     CommandResult GetLatestTaskResult() const;
     CommandResult ListTaskResults(int max_entries) const;
     int QueueDepth() const;

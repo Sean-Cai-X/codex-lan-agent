@@ -277,7 +277,7 @@ CommandResult HandleHttpRoute(
             BuildBuildTargetArguments(build_dir, config_name, target),
             -1,
             stall_timeout_sec >= 0 ? stall_timeout_sec : config.build_target_stall_timeout_sec);
-        result = BuildQueuedTaskResult(task_id);
+        result = BuildQueuedTaskResult(config, task_id);
         result.fields["build_target_stall_timeout_sec"] =
             std::to_string(stall_timeout_sec >= 0 ? stall_timeout_sec : config.build_target_stall_timeout_sec);
         result.fields["build_target_stall_timeout_source"] =
@@ -325,7 +325,7 @@ CommandResult HandleHttpRoute(
                 env_args),
             -1,
             std::max(0, stall_timeout_sec));
-        result = BuildQueuedTaskResult(task_id);
+        result = BuildQueuedTaskResult(config, task_id);
         result.fields["generator_kind"] = generator_kind;
         result.fields["configure_project_stall_timeout_sec"] = std::to_string(std::max(0, stall_timeout_sec));
         result.fields["configure_project_stall_timeout_source"] = stall_timeout_raw.empty() ? "config" : "request";

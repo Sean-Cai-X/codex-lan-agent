@@ -1301,6 +1301,36 @@ CommandResult TaskManager::GetTaskResult(const std::string & task_id) const {
     return result;
 }
 
+CommandResult TaskManager::WaitForTaskResult(const std::string & task_id, int timeout_sec) {
+    const int bounded_timeout_sec = std::max(1, timeout_sec);
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const bool terminal = condition_.wait_for(
+            lock,
+            std::chrono::seconds(bounded_timeout_sec),
+            [this, &task_id]() {
+                const auto it = tasks_.find(task_id);
+                return it == tasks_.end()
+                    || (it->second.status != "queued" && it->second.status != "running");
+            });
+        if (!terminal) {
+            lock.unlock();
+            CommandResult result = GetTaskResult(task_id);
+            result.ok = false;
+            result.exit_code = 408;
+            result.fields["status"] = "wait_timeout";
+            result.fields["summary"] = "terminal task result was not available before the wait timeout";
+            result.fields["next_action"] = "inspect task_log_ref or resolved_log_path; do not claim task completion";
+            result.fields["terminal_result_observed"] = "false";
+            result.fields["wait_timeout_sec"] = std::to_string(bounded_timeout_sec);
+            return result;
+        }
+    }
+    CommandResult result = GetTaskResult(task_id);
+    result.fields["terminal_result_observed"] = "true";
+    return result;
+}
+
 CommandResult TaskManager::GetLatestTaskResult() const {
     std::string latest_task_id;
     {
@@ -1462,5 +1492,6 @@ void TaskManager::WorkerLoop() {
             completed_ids_.push_back(task.task_id);
             PruneCompletedTasksLocked();
         }
+        condition_.notify_all();
     }
 }

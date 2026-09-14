@@ -212,7 +212,7 @@ CommandResult BuildRunCtestPreflightResult(
     return discover;
 }
 
-CommandResult BuildQueuedTaskResult(const std::string & task_id) {
+CommandResult BuildQueuedTaskResult(const AgentConfig & config, const std::string & task_id) {
     if (g_task_manager == nullptr) {
         CommandResult result;
         result.ok = false;
@@ -221,8 +221,14 @@ CommandResult BuildQueuedTaskResult(const std::string & task_id) {
         return result;
     }
 
-    CommandResult result = g_task_manager->GetTaskResult(task_id);
+    // Queue submission is not a result.  Keep the MCP turn open until the
+    // worker reaches a terminal state so small models cannot replace actual
+    // execution with a "please wait" response.
+    CommandResult result = g_task_manager->WaitForTaskResult(
+        task_id,
+        std::max(1, config.task_timeout_sec));
     result.fields["task_id"] = task_id;
+    result.fields["task_completion_mode"] = "wait_for_terminal_result";
     return result;
 }
 

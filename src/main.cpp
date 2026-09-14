@@ -401,7 +401,7 @@ CommandResult DiscoverCtestTestsResult(
     const std::string & test_regex,
     int start_index,
     int max_entries);
-CommandResult BuildQueuedTaskResult(const std::string & task_id);
+CommandResult BuildQueuedTaskResult(const AgentConfig & config, const std::string & task_id);
 CommandResult BuildOptFileBaseResult(
     const AgentConfig & config,
     const std::string & target_name,
@@ -1545,6 +1545,19 @@ void ApplySupervisionEnvelope(CommandResult * result) {
         || GetFieldOrDefault(*result, "supervision_status", "") == "alarm";
 
     if (!result->ok || result->exit_code != 0) {
+        // A tool can be invoked and still fail before it performs the requested
+        // operation.  Do not expose that attempt as successful execution: tool
+        // clients otherwise have a success-shaped field to misread and may
+        // fabricate progress or completion in their next assistant message.
+        if (GetFieldOrDefault(*result, "internal_execution_performed", "") == "true") {
+            result->fields["internal_execution_attempted"] = "true";
+        }
+        result->fields["internal_execution_performed"] = "false";
+        result->fields["execution_verified"] = "false";
+        result->fields["client_turn_disposition"] = "suppress_assistant_text";
+        result->fields["client_turn_guard"] =
+            "Do not generate a success, progress, or completion message after this failed tool result. "
+            "Display the concrete error only, or issue an explicit recovery tool call.";
         result->fields["supervision_status"] = "failed";
         result->fields["goal_status"] = "failed";
         result->fields["assistant_response_allowed"] = "false";
@@ -3889,7 +3902,7 @@ CommandResult ExecuteSemanticBridgeTool(
         const std::string task_id = g_task_manager->EnqueueCliProfile(
             "run_ctest_target",
             BuildRunCTestTargetArguments(build_dir, config_name, effective_test_regex));
-        result = BuildQueuedTaskResult(task_id);
+        result = BuildQueuedTaskResult(config, task_id);
         if (!preflight_ref.empty()) {
             result.fields["preflight_ref"] = preflight_ref;
         }
@@ -3951,7 +3964,7 @@ CommandResult ExecuteSemanticBridgeTool(
             BuildBuildTargetArguments(build_dir, config_name, target),
             -1,
             std::max(0, stall_timeout_sec));
-        result = BuildQueuedTaskResult(task_id);
+        result = BuildQueuedTaskResult(config, task_id);
         result.fields["build_target_stall_timeout_sec"] = std::to_string(std::max(0, stall_timeout_sec));
         result.fields["build_target_stall_timeout_source"] = has_stall_timeout ? "request" : "config";
         if (!preflight_ref.empty()) {
@@ -4002,7 +4015,7 @@ CommandResult ExecuteSemanticBridgeTool(
                 env_args),
             -1,
             std::max(0, stall_timeout_sec));
-        result = BuildQueuedTaskResult(task_id);
+        result = BuildQueuedTaskResult(config, task_id);
         result.fields["generator_kind"] = generator_kind;
         result.fields["configure_project_stall_timeout_sec"] = std::to_string(std::max(0, stall_timeout_sec));
         result.fields["configure_project_stall_timeout_source"] = has_stall_timeout ? "request" : "config";
@@ -5284,7 +5297,7 @@ bool HandleMcpRoute(
                         BuildBuildTargetArguments(build_dir, config_name, target),
                         -1,
                         std::max(0, stall_timeout_sec));
-                    result = BuildQueuedTaskResult(task_id);
+                    result = BuildQueuedTaskResult(config, task_id);
                     result.fields["build_target_stall_timeout_sec"] = std::to_string(std::max(0, stall_timeout_sec));
                     result.fields["build_target_stall_timeout_source"] =
                         stall_timeout_raw.empty() ? "config" : "request";
@@ -5334,7 +5347,7 @@ bool HandleMcpRoute(
                             env_args),
                         -1,
                         std::max(0, stall_timeout_sec));
-                    result = BuildQueuedTaskResult(task_id);
+                    result = BuildQueuedTaskResult(config, task_id);
                     result.fields["generator_kind"] = generator_kind;
                     result.fields["configure_project_stall_timeout_sec"] =
                         std::to_string(std::max(0, stall_timeout_sec));

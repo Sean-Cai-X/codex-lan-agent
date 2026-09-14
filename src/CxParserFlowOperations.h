@@ -549,7 +549,7 @@ CommandResult RunCxParserFlowResult(
                 const std::string task_id = g_task_manager->EnqueueCxParserRuntime(
                     resolved_flow_id,
                     queued_args);
-                result = BuildQueuedTaskResult(task_id);
+                result = BuildQueuedTaskResult(config, task_id);
                 result.fields["status"] = "success";
                 result.fields["task_completion"] = "complete";
                 result.fields["continue_required"] = "false";
