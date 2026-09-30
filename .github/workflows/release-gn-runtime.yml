@@ -32,6 +32,8 @@ jobs:
             ca-certificates curl git unzip python3 g++ ninja-build qtbase5-dev \
             patchelf binutils
       - uses: actions/checkout@v4
+      - name: Trust only the Actions-mounted checkout inside this container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Reject tracked local payloads
         run: python3 gn/verify_tracked_sources.py
       - name: Download pinned GN for Linux x86_64
