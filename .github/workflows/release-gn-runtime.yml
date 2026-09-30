@@ -58,11 +58,12 @@ jobs:
       - name: Package portable runtime from CI-built outputs
         run: |
           bundle="codex-lan-agent-linux-x86_64-gn-portable-cmd-$(date -u +%Y%m%d)"
-          mkdir -p "$RUNNER_TEMP/delivery"
+          delivery_root="$PWD/out/gn-linux-x64/delivery"
+          mkdir -p "$delivery_root"
           SOURCE_BIN_DIR="$PWD/out/gn-linux-x64" \
-            DELIVERY_ROOT="$RUNNER_TEMP/delivery" \
+            DELIVERY_ROOT="$delivery_root" \
             bash linux/scripts/package_gn_portable_bundle.sh "$bundle"
-          cd "$RUNNER_TEMP/delivery/$bundle"
+          cd "$delivery_root/$bundle"
           sha256sum -c SHA256SUMS
           ./bin/codex_lan_agent --config ./bin/kvm_agent.cfg health
           if ldd ./bin/codex_lan_agent | grep -Ei 'lib(clang|LLVM)'; then
@@ -73,8 +74,8 @@ jobs:
         with:
           name: gn-linux-x86_64
           path: |
-            ${{ runner.temp }}/delivery/*.tar.gz
-            ${{ runner.temp }}/delivery/*.tar.gz.sha256
+            out/gn-linux-x64/delivery/*.tar.gz
+            out/gn-linux-x64/delivery/*.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
 
