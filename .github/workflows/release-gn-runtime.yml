@@ -1,0 +1,186 @@
+name: release-gn-runtime-no-llvm
+
+# Both archives are compiled on GitHub runners from checked-in source. The
+# locally built 20260922 tarball and all local libraries stay outside Git.
+on:
+  push:
+    tags:
+      - 'v*-gn-runtime'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'New tag, for example v2026.09.30-gn-runtime'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-gn-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    container: debian:12
+    steps:
+      - name: Install build dependencies from Debian network repositories
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git unzip python3 g++ ninja-build qtbase5-dev \
+            patchelf binutils
+      - uses: actions/checkout@v4
+      - name: Reject tracked local payloads
+        run: python3 gn/verify_tracked_sources.py
+      - name: Download pinned GN for Linux x86_64
+        run: |
+          mkdir -p /tmp/codex-gn
+          curl --fail --location --silent --show-error \
+            'https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/JSmm5hi-E9BbdhobW14vDIvT5cWS0Mi_Fq_tErYxTxIC' \
+            --output /tmp/codex-gn.zip
+          printf '%s  %s\n' \
+            '2529a6e618be13d05b761a1b5b5e2f0c8bd3e5c592d0c8bf16afed12b6314f12' \
+            /tmp/codex-gn.zip | sha256sum --check -
+          unzip -q /tmp/codex-gn.zip -d /tmp/codex-gn
+          echo /tmp/codex-gn >> "$GITHUB_PATH"
+      - name: GN generate and Ninja build without LLVM
+        run: |
+          gn gen out/gn-linux-x64
+          ninja -C out/gn-linux-x64 -j2 runtime
+          test -x out/gn-linux-x64/codex_lan_agent
+          test -x out/gn-linux-x64/optfile
+          test -x out/gn-linux-x64/directory_access
+          test -x out/gn-linux-x64/git_snapshot
+      - name: Package portable runtime from CI-built outputs
+        run: |
+          bundle="codex-lan-agent-linux-x86_64-gn-portable-cmd-$(date -u +%Y%m%d)"
+          mkdir -p "$RUNNER_TEMP/delivery"
+          SOURCE_BIN_DIR="$PWD/out/gn-linux-x64" \
+            DELIVERY_ROOT="$RUNNER_TEMP/delivery" \
+            bash linux/scripts/package_gn_portable_bundle.sh "$bundle"
+          cd "$RUNNER_TEMP/delivery/$bundle"
+          sha256sum -c SHA256SUMS
+          ./bin/codex_lan_agent --config ./bin/kvm_agent.cfg health
+          if ldd ./bin/codex_lan_agent | grep -Ei 'lib(clang|LLVM)'; then
+            echo 'LLVM-linked runtime is forbidden' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gn-linux-x86_64
+          path: |
+            ${{ runner.temp }}/delivery/*.tar.gz
+            ${{ runner.temp }}/delivery/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject tracked local payloads
+        shell: pwsh
+        run: python gn/verify_tracked_sources.py
+      - name: Download pinned GN for Windows x64
+        shell: pwsh
+        run: |
+          $gnDir = Join-Path $env:RUNNER_TEMP 'codex-gn'
+          New-Item -ItemType Directory -Force -Path $gnDir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'codex-gn.zip'
+          Invoke-WebRequest -Uri 'https://chrome-infra-packages.appspot.com/dl/gn/gn/windows-amd64/+/pQEufIBYMmWE56aNYgUmfWo2n8sFYGinA2mDYXzghJUC' -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne 'a5012e7c8058326584e7a68d6205267d6a369fcb056068a7036983617ce08495') {
+            throw 'GN download SHA256 mismatch'
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $gnDir -Force
+          $gnDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Locate MSVC and Ninja on the hosted runner
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC C++ tools not installed' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
+          if (-not (Test-Path $vcvars) -or -not (Test-Path $ninja)) { throw 'vcvars64 or Ninja missing' }
+          "VCVARS_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "NINJA_PATH=$ninja" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: GN generate and Ninja build without LLVM
+        shell: cmd
+        run: |
+          call "%VCVARS_PATH%"
+          gn gen out/gn-windows-x64
+          if errorlevel 1 exit /b 1
+          "%NINJA_PATH%" -C out\gn-windows-x64 -j2 codex_lan_agent
+          if errorlevel 1 exit /b 1
+      - name: Package CI-built Windows runtime
+        shell: pwsh
+        run: |
+          $helpOut = Join-Path $env:RUNNER_TEMP 'codex-agent-help.txt'
+          Start-Process -FilePath 'out/gn-windows-x64/codex_lan_agent.exe' -ArgumentList '--help' -Wait -WindowStyle Hidden -RedirectStandardOutput $helpOut | Out-Null
+          if ((Get-Content $helpOut -Raw) -notmatch 'codex_lan_agent --config') { throw 'Windows executable smoke failed' }
+          $stage = Join-Path $env:RUNNER_TEMP 'codex-lan-agent-windows-x64-gn'
+          $bin = Join-Path $stage 'bin'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Copy-Item 'out/gn-windows-x64/codex_lan_agent.exe' (Join-Path $bin 'codex_lan_agent.exe')
+          @'
+          workspace_root=${AGENT_DIR}/..
+          log_root=${AGENT_DIR}/../runtime/logs
+          data_root=${AGENT_DIR}/../runtime/data
+          listen_host=127.0.0.1
+          listen_port=18080
+          '@ | Set-Content -Path (Join-Path $bin 'codex_lan_agent.cfg') -Encoding ascii
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'runtime/logs') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'runtime/data') | Out-Null
+          & (Join-Path $bin 'codex_lan_agent.exe') --config (Join-Path $bin 'codex_lan_agent.cfg') health
+          if ($LASTEXITCODE -ne 0) { throw 'Windows health smoke failed' }
+          Copy-Item gn/README.md (Join-Path $stage 'README.md')
+          $zip = Join-Path $env:RUNNER_TEMP 'codex-lan-agent-windows-x64-gn.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $zip -Leaf)" | Set-Content "$zip.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gn-windows-x64
+          path: |
+            ${{ runner.temp }}/codex-lan-agent-windows-x64-gn.zip
+            ${{ runner.temp }}/codex-lan-agent-windows-x64-gn.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    runs-on: ubuntu-24.04
+    needs: [linux-x64, windows-x64]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gn-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish both CI-built archives only after both builds pass
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}-gn-runtime$ ]] || {
+            echo 'Invalid release tag' >&2; exit 1;
+          }
+          shopt -s nullglob
+          linux=(release-assets/*.tar.gz)
+          windows=(release-assets/*.zip)
+          hashes=(release-assets/*.sha256)
+          test "${#linux[@]}" -eq 1
+          test "${#windows[@]}" -eq 1
+          test "${#hashes[@]}" -eq 2
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "${linux[0]}" "${windows[0]}" "${hashes[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "codex-lan-agent $RELEASE_TAG (GN, no LLVM)" \
+            --notes 'Linux x86_64 and Windows x64 built by GN/Ninja on GitHub runners from source and network dependencies. LLVM/Clang AST disabled. No local binary, image, library or archive was uploaded to Git.'

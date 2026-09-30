@@ -1,0 +1,6 @@
+buildconfig = "//gn/BUILDCONFIG.gn"
+
+default_args = {
+  is_debug = false
+  target_cpu = "x64"
+}

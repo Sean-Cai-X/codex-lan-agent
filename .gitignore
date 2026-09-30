@@ -163,3 +163,23 @@ linux/config/**/id_*
 /src/_prep_index.py
 /src/_doom_fix4.patch
 /src/_gen_patch.py
+
+# Checked-in GN release definitions and the Linux source port. Generated
+# out/, packages/, local libraries, images and archives remain ignored.
+!.gn
+!BUILD.gn
+!gn/
+!gn/**
+!linux/src/
+!linux/src/*.cpp
+!linux/src/*.h
+!linux/scripts/
+!linux/scripts/package_gn_portable_bundle.sh
+!linux/scripts/portable_bundle_README.md
+!optfile/
+!optfile/main.cpp
+!tools/
+!tools/directory_access/
+!tools/directory_access/main.cpp
+!tools/git_snapshot/
+!tools/git_snapshot/main.cpp
