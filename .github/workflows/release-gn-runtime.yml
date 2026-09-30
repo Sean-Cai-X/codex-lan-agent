@@ -29,7 +29,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git unzip python3 g++ ninja-build qtbase5-dev \
+            ca-certificates curl git unzip python3 python-is-python3 g++ ninja-build qtbase5-dev \
             patchelf binutils
       - uses: actions/checkout@v4
       - name: Trust only the Actions-mounted checkout inside this container
