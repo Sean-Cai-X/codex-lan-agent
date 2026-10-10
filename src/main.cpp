@@ -307,6 +307,14 @@ void PrintUsage() {
         << "  run-case <case-path>\n"
         << "  run-rag-flow <query> [mode]\n"
         << "  serve --machine-code <code> [--agent-server-stdout-log-path <path>] [--no-agent-server-stdout-log]  (exposes async enqueue/task endpoints over HTTP/MCP; stdout log is on by default)\n"
+        << "\n"
+        << "ctx-cli 等价子命令 (本地文件操作, 零依赖, IRC Bridge ctx_cli route 也会调):\n"
+        << "  ctx-ls [path] [--maxdepth N]         列目录 (默认 scope/src, maxdepth=3)\n"
+        << "  ctx-cat <path> [--lines N] [--line-start M]  读文件 (前 N 行, 或从第 M 行起)\n"
+        << "  ctx-grep <pattern> [path] [--include *.cpp] [--include *.h]  正则搜索\n"
+        << "  ctx-glob <pattern> [path]            find -name 模式匹配\n"
+        << "  ctx-wc <path>                        行数/字数统计\n"
+        << "  ctx-find <path> [--maxdepth N] [--name '*.h']  find 高级搜索\n"
         ;
 }
 
@@ -6285,6 +6293,147 @@ int main(int argc, char ** argv) {
             }
             std::cerr << "run-rag-flow requires a query" << std::endl;
             return 1;
+        }
+
+        if (command == "ctx-ls") {
+            // ctx-ls [path] [--maxdepth N]
+            std::string path = config.workspace_root + "/src";
+            int maxdepth = 3;
+            std::size_t cmd_idx = 0;
+            while (cmd_idx < arguments.size() && arguments[cmd_idx] != "ctx-ls") ++cmd_idx;
+            for (std::size_t i = cmd_idx + 1; i < arguments.size(); ++i) {
+                if (arguments[i] == "--maxdepth" && i + 1 < arguments.size()) {
+                    maxdepth = std::atoi(arguments[i + 1].c_str());
+                    ++i;
+                } else if (arguments[i].front() != '-') {
+                    path = arguments[i];
+                }
+            }
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec)) {
+                std::cerr << "ctx-ls: path not found: " << path << std::endl;
+                return 1;
+            }
+            for (const auto & entry : std::filesystem::directory_iterator(path, ec)) {
+                std::cout << (entry.is_directory() ? "DIR " : "FILE")
+                          << " " << entry.path().filename().string() << "\n";
+            }
+            return 0;
+        }
+
+        if (command == "ctx-cat") {
+            std::string path;
+            int lines = 80;
+            int line_start = 0;
+            std::size_t cmd_idx = 0;
+            while (cmd_idx < arguments.size() && arguments[cmd_idx] != "ctx-cat") ++cmd_idx;
+            for (std::size_t i = cmd_idx + 1; i < arguments.size(); ++i) {
+                if (arguments[i] == "--lines" && i + 1 < arguments.size()) {
+                    lines = std::atoi(arguments[i + 1].c_str()); ++i;
+                } else if (arguments[i] == "--line-start" && i + 1 < arguments.size()) {
+                    line_start = std::atoi(arguments[i + 1].c_str()); ++i;
+                } else if (arguments[i].front() != '-') {
+                    if (path.empty()) path = arguments[i];
+                }
+            }
+            if (path.empty()) { std::cerr << "ctx-cat requires a file path\n"; return 1; }
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec)) path = config.workspace_root + "/" + path;
+            std::ifstream f(path);
+            if (!f) { std::cerr << "ctx-cat: cannot open: " << path << "\n"; return 1; }
+            std::string line; int lineno = 0; int shown = 0;
+            while (std::getline(f, line)) {
+                ++lineno;
+                if (lineno < line_start) continue;
+                if (shown++ >= lines) break;
+                std::cout << lineno << ":" << line << "\n";
+            }
+            return 0;
+        }
+
+        if (command == "ctx-grep") {
+            std::string pattern;
+            std::string path = config.workspace_root + "/src";
+            std::vector<std::string> includes = {"*.cpp", "*.h"};
+            std::size_t cmd_idx = 0;
+            while (cmd_idx < arguments.size() && arguments[cmd_idx] != "ctx-grep") ++cmd_idx;
+            for (std::size_t i = cmd_idx + 1; i < arguments.size(); ++i) {
+                if (arguments[i] == "--include" && i + 1 < arguments.size()) {
+                    includes.push_back(arguments[++i]);
+                } else if (arguments[i].front() != '-') {
+                    if (pattern.empty()) pattern = arguments[i];
+                    else path = arguments[i];
+                }
+            }
+            if (pattern.empty()) { std::cerr << "ctx-grep requires a pattern\n"; return 1; }
+            std::string inc_arg;
+            for (auto & inc : includes) inc_arg += " --include='" + inc + "'";
+            std::string cmd = "grep -rn " + inc_arg + " -E '" + pattern + "' '" + path + "' 2>/dev/null | head -50";
+            FILE * pipe = popen(cmd.c_str(), "r");
+            if (!pipe) { std::cerr << "ctx-grep: popen failed\n"; return 1; }
+            char buf[2048];
+            while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
+            int rc = pclose(pipe);
+            if (rc == 256) return 0;
+            return WEXITSTATUS(rc);
+        }
+
+        if (command == "ctx-glob") {
+            std::string pattern;
+            std::string path = config.workspace_root;
+            std::size_t cmd_idx = 0;
+            while (cmd_idx < arguments.size() && arguments[cmd_idx] != "ctx-glob") ++cmd_idx;
+            for (std::size_t i = cmd_idx + 1; i < arguments.size(); ++i) {
+                if (arguments[i].front() != '-') {
+                    if (pattern.empty()) pattern = arguments[i];
+                    else path = arguments[i];
+                }
+            }
+            if (pattern.empty()) { std::cerr << "ctx-glob requires a pattern\n"; return 1; }
+            std::string cmd = "find '" + path + "' -type f -name '*" + pattern + "*' 2>/dev/null | head -50";
+            FILE * pipe = popen(cmd.c_str(), "r");
+            if (!pipe) { std::cerr << "ctx-glob: popen failed\n"; return 1; }
+            char buf[2048];
+            while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
+            return WEXITSTATUS(pclose(pipe));
+        }
+
+        if (command == "ctx-wc") {
+            std::string path = config.workspace_root;
+            std::size_t cmd_idx = 0;
+            while (cmd_idx < arguments.size() && arguments[cmd_idx] != "ctx-wc") ++cmd_idx;
+            for (std::size_t i = cmd_idx + 1; i < arguments.size(); ++i) {
+                if (arguments[i].front() != '-') path = arguments[i];
+            }
+            std::string cmd = "find '" + path + "' -type f \\( -name '*.cpp' -o -name '*.h' \\) -exec wc -lwc {} + 2>/dev/null | tail -20";
+            FILE * pipe = popen(cmd.c_str(), "r");
+            if (!pipe) { std::cerr << "ctx-wc: popen failed\n"; return 1; }
+            char buf[2048];
+            while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
+            return WEXITSTATUS(pclose(pipe));
+        }
+
+        if (command == "ctx-find") {
+            std::string path = config.workspace_root;
+            int maxdepth = 3;
+            std::string name_filter;
+            std::string type_filter = "f";
+            std::size_t cmd_idx = 0;
+            while (cmd_idx < arguments.size() && arguments[cmd_idx] != "ctx-find") ++cmd_idx;
+            for (std::size_t i = cmd_idx + 1; i < arguments.size(); ++i) {
+                if (arguments[i] == "--maxdepth" && i + 1 < arguments.size()) maxdepth = std::atoi(arguments[++i].c_str());
+                else if (arguments[i] == "--name" && i + 1 < arguments.size()) name_filter = arguments[++i];
+                else if (arguments[i] == "--type" && i + 1 < arguments.size()) type_filter = arguments[++i];
+                else if (arguments[i].front() != '-') path = arguments[i];
+            }
+            std::string cmd = "find '" + path + "' -maxdepth " + std::to_string(maxdepth) + " -type " + type_filter;
+            if (!name_filter.empty()) cmd += " -name '" + name_filter + "'";
+            cmd += " 2>/dev/null | head -50";
+            FILE * pipe = popen(cmd.c_str(), "r");
+            if (!pipe) { std::cerr << "ctx-find: popen failed\n"; return 1; }
+            char buf[2048];
+            while (fgets(buf, sizeof(buf), pipe)) std::cout << buf;
+            return WEXITSTATUS(pclose(pipe));
         }
 
         if (command == "serve") {
