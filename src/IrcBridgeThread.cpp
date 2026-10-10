@@ -565,8 +565,8 @@ struct IrcCfg {
     std::string ws_host = "127.0.0.1";
     int ws_port = 8067;
     std::string ws_path = "/";          // nginx proxy 走 /ws，直连 UnrealIRCd 走 /
-    std::string bot_nick = "codex-bridge";
-    std::string bot_user = "codex-bridge";
+    std::string bot_nick = "seedcode-bridge";
+    std::string bot_user = "seedcode-bridge";
     std::string channel = "#main";
     int irc_enabled = 0;
     int output_enabled = 1;
@@ -906,7 +906,7 @@ static bool ExecLlmRoute(const IrcCfg::Route & route, int fd, const IrcCfg & irc
     std::string model    = model_it->second;
     std::string system_prompt = (system_it != route.params.end() && !system_it->second.empty())
         ? system_it->second
-        : "You are codex-bridge IRC agent. Answer concisely (≤200 chars). Use Chinese if the question is in Chinese.";
+        : "You are seedcode-bridge IRC agent. Answer concisely (≤200 chars). Use Chinese if the question is in Chinese.";
     int timeout_ms = 15000;
     auto to_it = route.params.find("timeout_ms");
     if (to_it != route.params.end()) timeout_ms = atoi(to_it->second.c_str());
