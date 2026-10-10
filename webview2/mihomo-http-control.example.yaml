@@ -1,0 +1,10 @@
+# Merge these keys into the config.yaml used by clash-meta.exe / mihomo.exe.
+# clash-native.exe controls the core through this HTTP API.
+
+mixed-port: 7890
+allow-lan: false
+external-controller: 127.0.0.1:9090
+
+# Leave empty for local-only testing, or set a value and enter the same value
+# in Clash Native's Secret field.
+secret: ""

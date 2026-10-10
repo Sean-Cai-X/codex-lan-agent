@@ -1,0 +1,39 @@
+# Gateway-local Mihomo template.
+# Copy a real Clash Verge generated config to /opt/codex-mihomo/config.yaml,
+# then keep these runtime settings for gateway deployment.
+#
+# Do not commit real subscription proxies, passwords, private keys, geodata,
+# logs, cache databases, binaries, archives, or provider payloads.
+
+mode: rule
+mixed-port: 12790
+allow-lan: false
+bind-address: 127.0.0.1
+log-level: warning
+ipv6: true
+external-controller: 127.0.0.1:19090
+secret: ""
+unified-delay: true
+
+dns:
+  enable: true
+  ipv6: true
+  use-system-hosts: false
+  listen: 127.0.0.1:5335
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+
+proxies:
+  # Replace this block with the sanitized or private node list copied from
+  # Clash Verge. Real node passwords must stay out of Git.
+  - name: DIRECT-placeholder
+    type: direct
+
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies:
+      - DIRECT-placeholder
+
+rules:
+  - MATCH,GLOBAL

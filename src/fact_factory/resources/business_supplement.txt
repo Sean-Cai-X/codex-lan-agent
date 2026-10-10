@@ -1,0 +1,52 @@
+# business_supplement.txt
+# 词林缺口补丁映射表，格式: raw_term -> standard_tag
+# 仅用于 cilin_ext.txt 覆盖不到的极少数业务特殊词汇
+# 每行一条规则，# 开头为注释
+
+# --- intent 类补丁 ---
+probe_ready -> read_observe
+preflight -> read_observe
+preflight_check -> read_observe
+preflight_status -> read_observe
+probe_text_file -> probe
+scan_text_ranges -> scan
+find_line_metadata -> scan
+find_content_matches -> scan
+locate_text_lines -> scan
+prepare_edit_windows -> scan
+
+# --- tool action 类补丁 ---
+delete_line_atomic -> delete
+delete_content_atomic -> delete
+delete_text_range_window_atomic -> delete
+delete_next_text_range_atomic -> delete
+insert_after_anchor_atomic -> insert
+replace_line_range_atomic -> replace
+apply_single_file_patch -> apply
+apply_diff_patch -> apply
+preview_patch -> preview
+revert_single_file_patch -> apply
+write_text_file -> write
+read_text_file -> read
+build_target -> build
+run_ctest_target -> test
+discover_ctest_tests -> test
+configure_project -> build
+prepare_build_dir -> build
+check_build_dir -> read
+
+# --- state 类补丁 ---
+pending_continuation -> route
+continuation_takeover -> route
+terminal_state -> verified
+completion_claim -> verified
+not_complete -> not_verified
+needs_continue -> route
+closed_loop_continue -> route
+
+# --- safety 类补丁 ---
+write_controlled -> write_audited
+state_write_audited -> write_audited
+queued_execution -> execution_task
+analysis_only -> read_observe
+rule_control -> clips_control

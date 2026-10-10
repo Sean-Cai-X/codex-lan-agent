@@ -1,0 +1,72 @@
+assert(target_cpu == "x64", "The portable GN release currently targets x64 only")
+
+clips_sources = exec_script("//gn/list_clips_sources.py", [], "json")
+
+executable("codex_lan_agent") {
+  sources = clips_sources
+  if (target_os == "linux") {
+    sources += [
+      "linux/src/AgentConfig.cpp",
+      "linux/src/CapabilityRegistry.cpp",
+      "linux/src/ProcessRunner.cpp",
+      "linux/src/HttpClient.cpp",
+      "linux/src/main.cpp",
+    ]
+    include_dirs = [ "linux/src", "src" ]
+    defines = [ "_FILE_OFFSET_BITS=64" ]
+    cflags = [ "-O2", "-pthread" ]
+    cflags_c = [ "-std=c99" ]
+    cflags_cc = [ "-std=c++17" ]
+    ldflags = [ "-pthread" ]
+  } else {
+    sources += [
+      "linux/src/AgentConfig.cpp",
+      "linux/src/CapabilityRegistry.cpp",
+      "linux/src/ProcessRunner.cpp",
+      "linux/src/HttpClient.cpp",
+      "linux/src/main.cpp",
+    ]
+    include_dirs = [ "linux/src", "src" ]
+    defines = [ "_CRT_SECURE_NO_WARNINGS", "WIN32_LEAN_AND_MEAN", "NOMINMAX" ]
+    cflags = [ "/O2", "/MD", "/bigobj", "/DNDEBUG" ]
+    cflags_c = [ "/std:c17" ]
+    cflags_cc = [ "/std:c++17", "/EHsc" ]
+    ldflags = [
+      "/INCREMENTAL:NO",
+      "/SUBSYSTEM:CONSOLE",
+      "ws2_32.lib",
+      "winhttp.lib",
+      "version.lib",
+    ]
+  }
+  # CODEX_LAN_AGENT_HAS_CLANG_AST is deliberately absent: no LLVM sources,
+  # downloaded LLVM libraries, or Clang AST code paths enter either release.
+}
+
+if (target_os == "linux") {
+  foreach(target_name, [ "optfile", "directory_access", "git_snapshot" ]) {
+    executable(target_name) {
+      if (target_name == "optfile") {
+        sources = [ "optfile/main.cpp" ]
+      } else {
+        sources = [ "tools/$target_name/main.cpp" ]
+      }
+      defines = [ "QT_CORE_LIB" ]
+      cflags = [
+        "-O2",
+        "-fPIC",
+        "-I/usr/include/x86_64-linux-gnu/qt5",
+        "-I/usr/include/x86_64-linux-gnu/qt5/QtCore",
+      ]
+      cflags_cc = [ "-std=c++17" ]
+      libs = [ "Qt5Core", "pthread" ]
+    }
+  }
+}
+
+group("runtime") {
+  deps = [ ":codex_lan_agent" ]
+  if (target_os == "linux") {
+    deps += [ ":optfile", ":directory_access", ":git_snapshot" ]
+  }
+}

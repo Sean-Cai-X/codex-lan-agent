@@ -1,0 +1,5064 @@
+# codex-lan-agent
+
+基于 Clang AST 的 C/C++ 代码分析 MCP 工具链，提供 AST 解析、控制流图（CFG）、调用图（Call Graph）、数据流图（DFG）、程序切片（Program Slice）能力，并内置语义网格（Semantic Grid）长文本解构、归纳、检索、溯源与上下文重构能力，以及面向长会话上下文压力的 **Task Memory（任务记忆）** 工具链 —— 在 MCP 服务端文件对象层持久化任务状态、步骤账本、关键切片、KV 快照、RocksDB 镜像与一致性校验，使全新模型只需读取 `latest_resume_context.json` 即可续接长任务，无需加载完整历史对话。通过 MCP 协议（Streamable HTTP）对外服务。
+
+---
+
+## 目录
+
+1. [架构概览](#1-架构概览)
+2. [构建与启动](#2-构建与启动)
+   2.1 [前置条件](#21-前置条件)
+   2.2 [编译](#22-编译)
+   2.3 [启动服务](#23-启动服务)
+   2.4 [配置文件](#24-配置文件-codex_lan_agentcfg)
+   2.5 [Linux 部署：IRC Bridge 自动启动、配置与运维](#25-linux-部署irc-bridge-自动启动配置与运维)
+3. [MCP 协议接入](#3-mcp-协议接入)
+4. [工具清单与参数](#4-工具清单与参数)
+5. [接入本地模型后的操作语义](#5-接入本地模型后的操作语义)
+6. [完整使用案例](#6-完整使用案例)
+7. [Artifact 二次查询与分页](#7-artifact-二次查询与分页)
+8. [语义网格工具：长文本解构与上下文重构](#8-语义网格工具长文本解构与上下文重构)
+9. [Task Memory 工具：长任务记忆与跨模型续接](#9-task-memory-工具长任务记忆与跨模型续接)
+10. [测试脚本与一键验证](#10-测试脚本与一键验证)
+11. [测试结论](#11-测试结论)
+12. [CMM 工具清单](#12-cmm-工具清单)
+13. [Clang 分析工具 vs CMM 工具功能对比](#13-clang-分析工具-vs-cmm-工具功能对比)
+14. [常见问题排查](#14-常见问题排查)
+15. [项目演进分析报告（8月9日 → 8月11日）](#15-项目演进分析报告8月9日--8月11日)
+16. [CLIPS 规则体系详解](#16-clips-规则体系详解)
+17. [Fact-Factory 守卫层（LLM ↔ CLIPS 中间防护）](#17-fact-factory-守卫层llm--clips-中间防护)
+18. [optfile 原子文件操作工具](#18-optfile-原子文件操作工具)
+19. [Fact-Factory 守卫层冒烟测试](#19-fact-factory-守卫层冒烟测试)
+20. [Qt6 工具链构建记录（无系统安装）](#20-qt6-工具链构建记录无系统安装)
+
+---
+
+## 1. 架构概览
+
+```
+AI Agent / IDE / 本地模型
+        │  JSON-RPC over HTTP (POST /mcp)
+        ▼
+┌───────────────────────────────────┐
+│        codex_lan_agent.exe        │
+│        (MCP Server :18080)        │
+├───────────────────────────────────┤
+│  McpProtocolOperations.h          │  ← 工具列表 / Schema 暴露
+│  McpToolDispatch.h                │  ← 工具分发
+│  ClangIndexerAdapter.cpp          │  ← 适配层
+├───────────────────────────────────┤
+│  ClangAstParser.cpp               │  ← AST 解析
+│  CfGBuilder.cpp                   │  ← CFG 构建
+│  GraphSerialization.cpp           │  ← CallGraph / DFG / Slice
+├───────────────────────────────────┤
+│  SemanticGridOperations.h         │  ← 语义网格（解构/归纳/检索/溯源/增量）
+├───────────────────────────────────┤
+│  TaskMemoryOperations.h           │  ← Task Memory（freeze/step/kv/rocksdb/parity）
+├───────────────────────────────────┤
+│  compile_commands.json            │  ← 编译数据库（项目侧）
+│  Clang / LLVM                     │  ← 底层解析引擎
+│  logs/task_memory/{goal_id}       │  ← 任务记忆文件对象层（source of truth）
+└───────────────────────────────────┘
+```
+
+**核心设计原则：**
+- 所有代码分析工具共享同一个 Clang Tooling 执行核心。
+- 复杂项目通过 `compile_commands.json` 提供编译参数，不硬编码环境。
+- 每个工具产出标准化 JSON artifact，支持二次查询（artifact query）。
+- 分页（`offset_*` / `max_*`）和邻域提取（`focus_symbol` / `neighborhood_depth`）在 artifact 层完成，无需重跑 Clang。
+- 语义网格工具独立于 Clang 工具链，可单独用于长文本/规则文档的解构与检索，为本地模型提供上下文重构能力。
+- Task Memory 把"长任务记忆"从模型上下文外移到 MCP 服务端文件对象层：源真（source of truth）始终是 `logs/task_memory/{goal_id}/` 下的文件对象，RocksDB 仅作可选读镜像，需通过 parity check 校验后才允许替换读路径。
+
+---
+
+## 2. 构建与启动
+
+### 2.1 前置条件
+
+- **编译器**：MSVC（推荐）或 MinGW
+- **依赖**：Clang/LLVM（随项目构建链集成）
+- **构建系统**：CMake
+
+### 2.2 编译
+
+```powershell
+cd D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent
+cmake -B AIbuild -G "Visual Studio 17 2022" -A x64
+cmake --build AIbuild --config Release
+```
+
+### 2.3 启动服务
+
+```powershell
+# 清理可能残留的旧进程（端口 18080 占用是启动失败最常见原因）
+Get-Process codex_lan_agent -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 1
+
+# 启动
+cd AIbuild\Release
+.\codex_lan_agent.exe --config "..\..\codex_lan_agent.cfg" serve --machine-code 8EE5-2336-71AE-74DD
+```
+
+### 2.4 配置文件 (`codex_lan_agent.cfg`)
+
+关键字段：
+
+| 字段 | 说明 |
+|---|---|
+| `listen_host` / `listen_port` | 监听地址，默认 `0.0.0.0:18080` |
+| `workspace_root` | 工作区根目录 |
+| `data_root` | **Task Memory 文件对象层根目录**（默认 `logs/`，所有任务记忆写入 `<data_root>/task_memory/{goal_id}/`） |
+| `generation_endpoint` | 本地模型 chat completions 端点 |
+| `embedding_endpoint` | 本地模型 embeddings 端点 |
+| `local_chat_endpoint` | 本地对话端点 |
+| `task_timeout_sec` | 任务超时（秒），默认 1800 |
+
+### 2.5 Linux 部署：IRC Bridge 自动启动、配置与运维
+
+本节覆盖 Linux（Devuan）环境下 agent 的系统级启动流程、IRC Bridge 配置、寻呼响应机制和输出控制。IRC Bridge 是 **C++ 内置线程**，合并在 `codex_lan_agent` binary 中，不跑 Python / 胶水进程。
+
+#### 2.5.1 系统重启后的启动流程
+
+```bash
+bash /H/aisrc/lan-agent/start-agent.sh start
+```
+
+**start-agent.sh 执行顺序**：
+
+| 步骤 | 动作 | 对应代码 |
+|------|------|----------|
+| ① | 环境变量加载：`PATH` / `LD_LIBRARY_PATH` / `AGENT_DIR` | start-agent.sh L16-18 |
+| ② | 从 cfg 读 `irc_ws_host`，判断是否需要本机 UnrealIRCd（只有 `127.0.0.1/localhost` 才启） | start-agent.sh L22-29 |
+| ③ | 检查 loopback 接口，DOWN 则 `sudo ip link set lo up` | start-agent.sh L33-37 |
+| ④ | 本地 IRC 模式：检查 UnrealIRCd 进程，缺失则启动 | start-agent.sh L40-48 |
+| ⑤ | 检查 PID file，agent 已在跑则跳过 | start-agent.sh L50-52 |
+| ⑥ | `nohup ./codex_lan_agent serve --config codex_lan_agent.cfg --machine-code E651-9C30-F7F6-520F > /H/usr/aisrc/lan-agent.log 2>&1 &` | start-agent.sh L57-60 |
+| ⑦ | 写 PID file → sleep 3 → 验证进程存活 → 打印 tail -5 日志 | start-agent.sh L61-70 |
+
+**产物位置**：
+
+| 类型 | 路径 |
+|------|------|
+| binary | `/H/aisrc/lan-agent/build/codex_lan_agent` |
+| cfg | `/H/aisrc/lan-agent/codex_lan_agent.cfg` |
+| PID file | `/H/usr/aisrc/lan-agent.pid` |
+| 日志 | `/H/usr/aisrc/lan-agent.log` |
+| LLM 调用日志 | `/H/aisrc/lan-agent/logs/*.log` |
+| UnrealIRCd | `/H/aisrc/IRC/unrealircd/` |
+
+**控制命令**：
+
+```bash
+bash /H/aisrc/lan-agent/start-agent.sh start     # 启动
+bash /H/aisrc/lan-agent/start-agent.sh stop      # 停止（kill + kill -9）
+bash /H/aisrc/lan-agent/start-agent.sh restart   # 重启
+bash /H/aisrc/lan-agent/start-agent.sh status    # 查状态（pid / 端口 / tail 日志）
+tail -f /H/usr/aisrc/lan-agent.log               # 实时日志
+```
+
+**rebuild（改了源码后）**：
+
+```bash
+export PATH=/H/usr/aisrc/usr/bin:/usr/bin:/bin
+export LD_LIBRARY_PATH=/H/usr/aisrc/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+cd /H/aisrc/lan-agent/build
+cmake --build . --target codex_lan_agent -j$(nproc)
+bash /H/aisrc/lan-agent/start-agent.sh restart    # cfg 改了也需要重启
+```
+
+**手动前台启动（排查时用）**：
+
+```bash
+bash /H/aisrc/lan-agent/start-agent.sh stop
+export PATH=/H/usr/aisrc/usr/bin:/usr/bin:/bin
+export LD_LIBRARY_PATH=/H/usr/aisrc/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+export AGENT_DIR=/H/aisrc/lan-agent
+cd /H/aisrc/lan-agent/build
+./codex_lan_agent serve \
+  --config /H/aisrc/lan-agent/codex_lan_agent.cfg \
+  --machine-code E651-9C30-F7F6-520F
+# stderr 直接看到 [irc-bridge] 所有 debug log
+```
+
+#### 2.5.2 完整 IRC 配置
+
+配置文件：`/H/aisrc/lan-agent/codex_lan_agent.cfg`，所有 `irc_*` 键在 bridge 启动时一次性加载。**改 cfg 后必须重启 agent**（bridge 不热加载）。
+
+```ini
+# ============================================
+# IRC Bridge 配置（Phase 1 全字段）
+# ============================================
+
+# 主开关
+irc_enabled=true
+
+# WS 连接（nginx 代理模式 vs 直连 UnrealIRCd）
+#   直连本机 UnrealIRCd :8067 → irc_ws_host=127.0.0.1 irc_ws_port=8067 irc_ws_path=/
+#   走 nginx proxy_pass /ws → irc_ws_host=192.168.5.100 irc_ws_port=80 irc_ws_path=/ws
+irc_ws_host=192.168.5.100
+irc_ws_port=80
+irc_ws_path=/ws
+
+# Bridge 自身 IRC 身份
+irc_bot_nick=codex-bridge
+irc_bot_user=codex-bridge
+
+# 默认频道（启动后自动 JOIN）
+irc_default_channel=#main
+
+# 出向控制
+irc_output_enabled=true
+irc_output_max_chars=450              # 每条 PRIVMSG 最大字符数，超出自动分片
+irc_line_continuation= ↪              # 分片续行标记（会被 UTF-8 sanitize 保留）
+irc_push_rate_limit_per_min=15        # 每分钟最多发几条（防 flood）
+
+# Agent 路由（@mention 前缀 → MCP method）
+# 左边是 IRC 里用户打 @xxx 触发的关键词
+# 右边是 TryHandleRegisteredMcpTool 里注册的真实 MCP method 名
+irc_agent.codex=lan_agent_run_local_chat
+irc_agent.trae=lan_agent_run_local_chat
+irc_agent.lan=lan_agent_run_cxparser_flow
+irc_agent.rag=lan_agent_rag_review_observe
+irc_agent.default=lan_agent_run_local_chat   # 兜底
+
+# 出向格式字符串模板（{agent_label} 运行时替换）
+irc_prefix_success=[{agent_label}] ✅ 
+irc_prefix_error=[{agent_label}] ❌ 
+irc_prefix_progress=[{agent_label}] ⏳ 
+```
+
+**路由查找算法**：用户发 `@codex ping 测试` → 正则提取 `mention=codex` + `task=ping 测试` → `irc.agent_routes["codex"]` → `"lan_agent_run_local_chat"`。关键词找不到时 fallback 到 `irc_agent.default`。
+
+**⚠️ method 名必须精确匹配**：cfg 里写的 method 名必须和 `TryHandleRegisteredMcpTool` 里注册的完全一致。查可用的 method：
+
+```bash
+grep -oP '"lan_agent_\w+"' /H/aisrc/lan-agent/src/main.cpp | sort -u
+```
+
+#### 2.5.3 寻呼响应方法（完整链路）
+
+```
+IRC 频道 #main（浏览器 WebIRC / IRC 客户端）
+  │  用户发：@codex ping 测试
+  ▼
+UnrealIRCd（nginx proxy ws://host:80/ws → UnrealIRCd :8067）
+  │  广播 WS text frame 给频道成员
+  ▼
+codex-lan-agent 内置线程（IrcBridgeThread.cpp）
+  │  RecvBuffer::ReadTextFrame() — WS frame 解码 + opcode 校验
+  │  SplitIrcLines() → std::regex_match(kPrivmsgRe)
+  │      匹配 :from!user@host PRIVMSG #main :@mention task
+  │  SanitizeIrcText() — UTF-8 校验 + 控制字符过滤
+  │  std::regex_match(kMentionRe) — 提取 mention 前缀
+  │  irc.agent_routes[mention] — 查 MCP method
+  │  GetMcpDispatch()(cfg, method, params_view, &result)
+  │      ↑ Meyers singleton，main() 里显式 SetIrcMcpToolHandler 注册
+  │  main() captureless lambda → TryHandleRegisteredMcpTool()
+  ▼
+MCP 工具分发（135 个）
+  │  CommandResult { exit_code, stdout_json, status }
+  ▼
+SendChannelMsg()
+  │  SanitizeIrcText() — 出向过滤
+  │  SplitIrcOutput() — 按 irc_output_max_chars 分片 + line_continuation
+  │  EncodeWsClientFrame(0x1, "PRIVMSG #main :...\r\n")
+  ▼
+UnrealIRCd → 广播到 #main → 浏览器看到回复
+```
+
+**三种自动回复**（由 `irc_prefix_*` 控制）：
+
+| 触发时机 | 前缀 | 内容 |
+|----------|------|------|
+| PRIVMSG 匹配 @mention 并路由成功 | `irc_prefix_progress` | `⏳ @<nick> 已收到「<task>」`（即时 ACK） |
+| MCP dispatch 返回 `handled=true` + `result.exit_code==0` | `irc_prefix_success` | `✅ <result.summary>`（tool 成功时） |
+| MCP dispatch 返回 `handled=true` + `exit_code≠0` | `irc_prefix_error` | `❌ <result.summary>`（tool 失败时） |
+| MCP dispatch 返回 `handled=false` | `irc_prefix_error` | `❌ 未注册的 MCP method: <method>` |
+| GetMcpDispatch() == nullptr | `irc_prefix_error` | `❌ MCP dispatch handler 未注册` |
+
+**输入触发规则**（必须全部满足才响应）：
+
+1. IRC 协议行匹配 `^:(\S+)!\S+\s+PRIVMSG\s+(\S+)\s+:(.*)$`
+2. 目标频道 == `irc_default_channel`（cfg 里配的那个）
+3. 消息体匹配 `^@(\w+)\s+(.+)$`（@前缀 + 空格 + 任务内容）
+4. `irc_output_enabled=true`
+
+**不响应的情况**：私聊、其他频道、没有 @mention、mention 关键词没配且 default 未启用、输出被禁用。
+
+#### 2.5.4 输出配置与过滤机制
+
+##### 2.5.4.1 输出控制参数
+
+| 参数 | 默认 | 作用 |
+|------|------|------|
+| `irc_output_enabled` | `true` | 总开关，关了 bridge 变成只听不说 |
+| `irc_output_max_chars` | `450` | 单条 PRIVMSG 最大字节数（不是字符数！IRC 协议 512 硬限制），超出自动分片 |
+| `irc_line_continuation` | ` ↪` | 分片续行标记，插到前一片末尾，会被 `SanitizeIrcText` 保留（必须是合法 UTF-8） |
+| `irc_push_rate_limit_per_min` | `15` | 每分钟最多发送条数（防止 UnrealIRCd flood 踢出） |
+
+##### 2.5.4.2 SanitizeIrcText 过滤器（输入 + 输出双向启用）
+
+IRC 协议和 WebSocket 都是字节流，需要对乱码、控制字符、NULL 字节做清洗。bridge 内置 `SanitizeIrcText()` 在两个方向各调用一次：
+
+**过滤规则**：
+
+| 输入类型 | 处理方式 | 位置 |
+|----------|----------|------|
+| NULL 字节 `0x00` | 删除 | 双向 |
+| 控制字符 `0x01-0x1F`（保留 `\r\n\t`） | 删除 | 双向 |
+| DEL `0x7F` | 删除 | 双向 |
+| ASCII 可打印 `0x20-0x7E` | 原样保留 | 双向 |
+| 合法多字节 UTF-8（2/3/4 字节） | 原样保留 | 双向 |
+| 孤立 continuation 字节 `0x80-0xBF` | 替换为 `'?'` | 双向 |
+| Overlong 编码（如 `C0 80` 是 NUL 的非法表示） | 替换为 `'?'` | 双向 |
+| 不完整 UTF-8 序列 | 替换为 `'?'` | 双向 |
+| `0xF5-0xFF`（> U+10FFFF） | 替换为 `'?'` | 双向 |
+
+**已验证**：中文 `你好世界`、日文 `ハロー`、emoji `🌍🔥` → 全部保留；控制字符 `\x01\x07\x00` + 非法 `C0\x80\x80` → 全部删除/替换。
+
+**应用点**：
+- 输入方向：`from_nick` 和 `message` 在 regex 提取后立即 sanitize，**先清洗再路由**
+- 输出方向：SendChannelMsg() 在分片之前 sanitize，分片后每片也走 WS mask → 保证 WebSocket frame 只含干净 payload
+
+##### 2.5.4.3 UTF-8 序列校验细节
+
+`IsUtf8Valid()` 做标准的 RFC 3629 校验：
+
+```
+起始字节  后续字节数  合法首字节范围
+0xxxxxxx  0          0x00-0x7F  (ASCII)
+110xxxxx  2 字节     0xC2-0xDF  (排除 C0 C1 overlong)
+1110xxxx  3 字节     0xE0-0xEF  (E0 排除 E0 A0 BF 以下)
+11110xxx  4 字节     0xF0-0xF4  (排除 F5-FF → > U+10FFFF)
+```
+
+continuation 字节必须是 `10xxxxxx`（`0x80-0xBF`）。任何违规都把该位置替换为 `'?'`（0x3F），继续清洗后续字节，保证输出总长度可控且每个字节可打印。
+
+##### 2.5.4.4 分片与续行
+
+```
+原始文本（假设 1200 字节）
+  → SanitizeIrcText(max_chars * 3 = 1350)
+  → SplitIrcOutput(450, " ↪")
+      chunk 1: "前 432 字节 ↪"     (带续行标记)
+      chunk 2: "中 432 字节 ↪"
+      chunk 3: "末 336 字节"         (不带续行标记)
+  → 每个 chunk 前加 "PRIVMSG #main :" + \r\n
+  → EncodeWsClientFrame(0x1, irc_line)  (带 mask)
+  → send() → UnrealIRCd
+```
+
+##### 2.5.4.5 WS frame_len bug 修复（历史教训）
+
+Phase 1 早期存在一个 frame_len 计算 bug：只看了 `byte1 & 0x7F == 126` 这个 extended length 标记，**没从 data[2..3] 读真实的 16-bit plen**，导致 frame_len 算少了，payload 残留被误当成下一帧 header（bridge 收到 payload 里的 ASCII `63 6f` → decode 成 opcode=0x03 reserved）。修复代码位于 `RecvBuffer::ReadTextFrame()`：
+
+```cpp
+// 先读 header_end（考虑 mask bit）
+size_t header_end = 2;
+if (plen == 126) header_end = 4;
+else if (plen == 127) header_end = 10;
+if (byte1 & 0x80) header_end += 4;
+// 读真实 plen
+if (plen == 126) plen = ((uint16_t)buf[2] << 8) | buf[3];
+else if (plen == 127) plen = read 8 bytes;
+size_t frame_len = header_end + plen;  // 现在对了
+```
+
+#### 2.5.5 架构速查
+
+```
+                ┌──────────────────────────────────────┐
+IRC 客户端      │   nginx :80 /ws → UnrealIRCd :8067   │
+(浏览器/WebIRC) │                                        │
+                └─────────── WebSocket text frames ─────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────┐
+│              codex_lan_agent serve (:18080 MCP)          │
+│                                                          │
+│   ┌─────────────────────────────────────────────────┐    │
+│   │   IrcBridgeThread (C++ 内置线程)                  │    │
+│   │                                                    │
+│   │   WsConnect(host, port, path, timeout)             │    │
+│   │   RecvBuffer::ReadTextFrame(fd, &text_buf)         │    │
+│   │     └ DecodeWsFrame() → opcode=0x01 (text)        │    │
+│   │   SplitIrcLines() → kPrivmsgRe regex               │    │
+│   │   SanitizeIrcText()  ← 输入方向过滤               │    │
+│   │   kMentionRe regex → irc.agent_routes[mention]     │    │
+│   │   GetMcpDispatch()(cfg, method, params, &result)   │    │
+│   │     ↑ Meyers singleton                             │    │
+│   │     ↑ main() 里显式 SetIrcMcpToolHandler           │    │
+│   │   SanitizeIrcText()  ← 输出方向过滤               │    │
+│   │   SplitIrcOutput(max_chars, continuation)          │    │
+│   │   EncodeWsClientFrame(0x1, PRIVMSG + \r\n)         │    │
+│   └─────────────────────────────────────────────────┘    │
+│                         │                                │
+│   McpToolDispatch.h ←─── try/catch 分发 135 MCP 工具    │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 2.5.5 Phase 1.5 — 本地 intent + 结论字段提取（2026-10-10 下午）
+
+Phase 1 上线后发现 bridge 对一些"自身状态查询"类请求回答不好，且回复里 dump 了完整 JSON（含调试字段）。Phase 1.5 加了 **4 个本地 intent handler** 和 **reply formatter 重写**，共修 5 个 bug。
+
+##### 2.5.5.1 4 个本地 intent（零依赖，不经过 LLM）
+
+用户发 `@codex-bridge <关键词>` 匹配关键词后，bridge **完全本地回答**——不需要 MCP、不需要 LLM、不需要任何外部服务。
+
+| Intent | 触发关键词（大小写不敏感） | 本地回答 | 依赖 |
+|--------|---------------------------|---------|------|
+| 🏓 ping | `ping`, `alive`, `在吗`, `活着`, `在线`, `你好` | `🏓 pong — bridge 在线（ws→host:port/path，#channel）` | 零依赖 |
+| 📁 scope | `关联`, `范围`, `scope`, `项目还是全局`, `哪个项目` | `📁 scope = 项目级 (workspace_root=/H/aisrc/lan-agent)` | 零依赖 |
+| ⚙️ status | `配置`, `cfg`, `endpoint`, `8080`, `8095`, `8096`, `状态` | 3 个 endpoint **TCP connect 探针**（200ms 超时）+ bridge + MCP dispatch 注册状态，带 🟢/🔴 | 无 LLM 依赖，只用 3 次 socket connect |
+| 🧭 help | `帮助`, `help`, `怎么用`, `routes`, `用法` | 用法说明 + 已注册 routes 列表 | 零依赖 |
+
+**路由优先级**（在 MCP dispatch 之前）：
+```
+PRIVMSG → sanitize → kPrivmsgRe → from_nick≠bot_nick → kMentionRe
+  → TryHandleBridgeLocalIntent()：匹配 → 本地回答 + continue（跳过 MCP）
+                                  不匹配 → 查 irc.agent_routes → MCP dispatch
+```
+
+**关键修复（5 个 bug）**：
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 10 | `@codex-bridge 你活着吗` → bridge **完全没反应** | `kMentionRe=(\w+)` 不匹配连字符 `-`，IRC nick `codex-bridge` 在 `-` 处 regex 失败 | 改成 `([\w-]+)` 支持 IRC nick 合法字符 |
+| 11 | fallback 报 `❌ 未注册 MCP method: lan_agent_local_chat` | hardcoded fallback method 名写少了 `_run_`；且不读 cfg 的 `irc_agent.default` | fallback 先查 `irc.agent_routes["default"]`，兜底才写对的 `"lan_agent_run_local_chat"` |
+| 12 | 用户复制粘贴 bridge 的错误消息（含 `@mention`）→ bridge 形成反馈环 | bridge 不区分自己发的和别人发的 PRIVMSG | `if (from_nick == irc.bot_nick) continue;` 跳过自身消息 |
+| 13 | 所有 @mention 一律返回 exit=42（deterministic fallback 之前） | bridge 构造 MCP params 时 `scope="default"`（硬编码字符串），而 `RunLocalChat` 的 deterministic fallback 只在 scope 是真实目录时触发 | scope 改成 `g_agent_cfg.workspace_root`（cfg 里配的真实目录）→ fallback 扫描该目录生成确定性项目摘要 |
+| 14 | Bridge 回复 `result_object={"status":"FAILED","summary":"...","failure_mode":...}` — 把完整 JSON dump 到频道 | reply formatter 遍历所有 `result.fields` 并 dump 成 `k=v` 对，包括 `result_object`（JSON 套娃）、`log_path`、`evidence_ref` 等内部调试字段 | **只抽结论字段**：成功 → `direct_answer → body → summary → result`（LLM 直接输出）；失败 → `summary → error`（一句话 + exit_code） |
+
+##### 2.5.5.2 scope 语义（项目级，硬绑定 workspace_root）
+
+RunLocalChat(config, scope, question, ...) 的 scope 参数 **始终传入 workspace_root**（cfg 里配的真实目录路径），不存在"全局"模式。bridge 构造 MCP params 时硬传：
+
+```cpp
+// IrcBridgeThread.cpp 主循环
+params_view["scope"] = g_agent_cfg.workspace_root;  // "/H/aisrc/lan-agent"
+params_view["question"] = task;
+```
+
+两个 AI provider 都 down 时（8080 + 8095 都 offline），RunLocalChat 内部的 deterministic fallback 会扫描 workspace_root 目录生成项目结构摘要——**永远可用，零 LLM 依赖**。
+
+##### 2.5.5.3 进度回复机制
+
+bridge 在处理 PRIVMSG 时按以下顺序发回复：
+
+| 阶段 | 回复 | 条件 |
+|------|------|------|
+| 即时 ACK | `⏳ @<nick> 已收到「<task>」` | 任何 PRIVMSG 匹配 @mention 后立即发（1ms 内） |
+| dispatch 完成 | `✅ <结论>` 或 `❌ <错误信息> (exit=<code>)` | MCP dispatch 返回后 |
+| **长任务超时提示** | `⏳ @<nick> 执行中…（已用时 10s）` | MCP dispatch 同步执行超过 10 秒（LLM 调用、目录扫描等） |
+| 最终结果 | 同上，dispatch 完成后立即覆盖 | 返回后发 ✅/❌ |
+
+> **注意**：超时提示是在 bridge 主循环里用非阻塞方式检查——dispatch 执行前记录 start_time，dispatch 返回后判断耗时。这个机制在 **Phase 1.5 hardcoded intent** 和 **Phase 2 cfg 驱动 RouteTable** 两种路径里都生效。
+
+---
+
+#### 2.5.6 Phase 2 — cfg 驱动路由引擎（通用外部响应桥路）
+
+**用户定位**：IRC Bridge 不是 lan-agent 专属前端，而是 **通用外部响应桥路**——下游可以接任何东西（MCP、HTTP webhook、直连 LLM、本地规则），新增路由/intent 只改 cfg，不改 C++、不 recompile。
+
+##### 2.5.6.1 4 种路由类型
+
+| type | 下游 | 实现状态 | cfg 示例 |
+|------|------|---------|----------|
+| `local` | 本地 cfg 规则（关键词匹配 + 变量替换） | ✅ **已实现（Step 1）** | `irc_route.ping.type=local` |
+| `mcp` | lan-agent 内置 MCP tool dispatch | ⏳ 暂 fallback 到 legacy `irc_agent.*` | `irc_route.codex.type=mcp`（留接口） |
+| `http` | 外部 HTTP webhook（任意服务） | ⏳ 留接口 | `irc_route.external.type=http` |
+| `llm` | 直连 OpenAI ChatCompletions（绕开 lan-agent） | ⏳ 留接口 | `irc_route.ollama.type=llm` |
+
+##### 2.5.6.2 RouteTable 执行优先级
+
+```
+PRIVMSG → sanitize → kPrivmsgRe → from_nick≠bot_nick → kMentionRe
+  → irc.routes.empty()? → 是 → legacy TryHandleBridgeLocalIntent + agent_routes（100% 兼容老 cfg）
+  → irc.routes 非空 → MatchRouteTable(mention, task)：
+      优先级 1: 遍历所有 type=local 的 route，keywords 匹配 → ExecLocalRoute（变量替换 → SendChannelMsg）
+      优先级 2: mention 精确匹配 route name → 走对应 type
+      优先级 3: route name == "default" 兜底 → 走对应 type
+      全部未命中 → fallback 到 legacy agent_routes + MCP dispatch
+```
+
+##### 2.5.6.3 cfg 新语法
+
+```ini
+# ============================================
+# Phase 2: cfg 驱动 RouteTable（4 种 type）
+# 新增路由/intent 只改 cfg，不改 C++ + 不 recompile
+# ============================================
+
+# ---------- type=local（纯 cfg 规则，零依赖）----------
+irc_route.ping.type=local
+irc_route.ping.keywords=ping,alive,在吗,活着,在线,你好,活着吗
+irc_route.ping.reply=🏓 pong — bridge 在线（ws=${irc.ws_host}:${irc.ws_port}${irc.ws_path}/${irc.channel}）
+
+irc_route.scope.type=local
+irc_route.scope.keywords=关联,范围,scope,项目还是全局,哪个项目,隔离
+irc_route.scope.reply=📁 scope=项目级 (workspace_root=${workspace_root})
+
+irc_route.status.type=local
+irc_route.status.keywords=配置,cfg,endpoint,llm,provider,8080,8095,8096,能用,可用,状态,status
+# reply 支持 ${probe:host:port} — bridge 做 TCP connect 探针（200ms 超时）
+irc_route.status.reply=⚙️ local_chat=${probe:127.0.0.1:8080}, generation=${probe:127.0.0.1:8095}, embedding=${probe:127.0.0.1:8096}, MCP=${mcp.dispatch}, bridge=🟢
+
+irc_route.help.type=local
+irc_route.help.keywords=帮助,help,怎么用,怎么触发,哪些命令,支持什么,routes,命令,触发,用法,使用
+irc_route.help.reply=🧭 @<mention> <任务>→MCP | ping/scope/status/help→本地
+
+# ---------- type=mcp（lan-agent 内置工具）----------
+# 暂留接口，Step 2 实现
+# irc_route.codex.type=mcp
+# irc_route.codex.method=lan_agent_run_local_chat
+# irc_route.codex.scope=${workspace_root}
+
+# ---------- type=http（外部 webhook）----------
+# 暂留接口，Step 3 实现
+# irc_route.external.type=http
+# irc_route.external.url=http://127.0.0.1:9000/irc-callback
+# irc_route.external.timeout_ms=5000
+
+# ---------- type=llm（直连 OpenAI ChatCompletions，绕开 lan-agent）----------
+# 暂留接口，Step 4 实现
+# irc_route.ollama.type=llm
+# irc_route.ollama.endpoint=http://127.0.0.1:11434/v1
+# irc_route.ollama.model=qwen2.5:7b
+```
+
+##### 2.5.6.4 变量替换器（${xxx}）
+
+cfg 的 reply template 里支持 `${变量}` 语法，bridge 在运行时替换成实时值：
+
+| 变量 | 来源 | 示例值 |
+|------|------|--------|
+| `${workspace_root}` | `RunAgentConfig.workspace_root` | `/H/aisrc/lan-agent` |
+| `${irc.ws_host}` | `IrcCfg.ws_host` | `192.168.5.100` |
+| `${irc.ws_port}` | `IrcCfg.ws_port` | `80` |
+| `${irc.ws_path}` | `IrcCfg.ws_path` | `/ws` |
+| `${irc.channel}` | `IrcCfg.channel` | `#main` |
+| `${irc.bot_nick}` | `IrcCfg.bot_nick` | `codex-bridge` |
+| `${mcp.dispatch}` | `GetMcpDispatch() != nullptr` | 🟢 / 🔴 |
+| `${probe:host:port}` | **TCP connect 探针**（200ms 超时） | 🟢 / 🔴 |
+
+##### 2.5.6.5 向后兼容
+
+cfg 驱动 RouteTable 和 legacy 路径并行工作：
+- cfg 里**没写** `irc_route.*` → `irc.routes` 为空 → RouteTable 跳过 → TryHandleBridgeLocalIntent + `irc_agent.*` 100% 工作
+- cfg 里**写了** `irc_route.*` → RouteTable 优先匹配 local routes → mention 精确匹配 route → default → **全部未命中**时 fallback 到 `irc.agent.*`
+
+**当前本机 cfg 同时包含两种写法**（Phase 2 测试中）——4 个 `irc_route.*` type=local route 覆盖了 ping/scope/status/help，legacy `irc_agent.*` 覆盖业务 query。
+
+##### 2.5.6.6 4 种回复路径全景
+
+```
+                        PRIVMSG @codex-bridge ping
+                                   │
+     ┌─────────────────────────────┼──────────────────────────────┐
+     │                             │                              │
+  路径 1                        路径 2                         路径 3
+  cfg 驱动                    legacy hardcoded               legacy agent_routes
+  type=local                  TryHandleBridgeLocalIntent    MCP dispatch
+  ┌────────────┐              ┌────────────┐                 ┌────────────┐
+  │ MatchRoute │              │ TaskHasKeyw │                 │ irc.agent_ │
+  │ Table()    │              │ ord()       │                 │ routes     │
+  │ ExecLocal  │              │ SendChannel │                 │ GetMcpDisp │
+  │ Route()    │              │ Msg()       │                 │ atch()     │
+  │ Substitut  │              └────────────┘                 │ RunLocalC  │
+  │ eVars()    │                                              │ hat()      │
+  └────────────┘                                              │ Determinist│
+                                                               │ ic Fallback│
+                                                               └────────────┘
+  零依赖，ms级返回           零依赖，ms级返回                  依赖 LLM，秒级
+  （cfg keywords）            （C++ if-else）                  （两个 endpoint 都 down → 扫描目录摘要）
+```
+
+---
+
+## 3. MCP 协议接入
+
+### 3.1 传输方式
+
+- **协议**：JSON-RPC 2.0
+- **传输**：Streamable HTTP（`POST /mcp`）
+- **无需 OAuth**：本地部署，`auth_required=false`
+
+### 3.2 基础请求格式
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "tools/list",
+  "params": {}
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "2",
+  "method": "tools/call",
+  "params": {
+    "name": "lan_agent_build_cfg",
+    "arguments": {
+      "source_file": "D:/path/to/file.cpp",
+      "project_root": "D:/path/to/project"
+    }
+  }
+}
+```
+
+### 3.3 IDE / Agent 接入
+
+在支持 MCP 的 IDE 或 Agent 中配置：
+
+```json
+{
+  "mcpServers": {
+    "codex-lan-agent": {
+      "url": "http://127.0.0.1:18080/mcp",
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+### 3.4 PowerShell 快速验证
+
+```powershell
+# 验证服务存活 + 工具列表
+$body = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+$response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8"
+$response.result.tools.Count  # 应输出工具总数
+```
+
+### 3.5 推荐调用闭环：Intent Acceptance + Fast Path
+
+`codex-lan-agent` 的推荐入口不是让大模型直接拆很多工具调用，而是先调用 `lan_agent_accept_intent`，由 MCP 判断当前任务是否可以本地承接、是否需要小模型语义缩减、是否必须回到大模型拆解。
+
+推荐请求：
+
+```json
+{
+  "name": "lan_agent_mcp_route",
+  "arguments": {
+    "mode": "call",
+    "target_tool_name": "lan_agent_accept_intent",
+    "model_profile": "large-llm",
+    "arguments": {
+      "user_intent": "read file",
+      "file_path": "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/README.md",
+      "auto_execute_direct": true,
+      "output_mode": "compact",
+      "max_stdout_chars": 4000
+    }
+  }
+}
+```
+
+MCP 返回的关键字段：
+
+| 字段 | 语义 |
+|---|---|
+| `executor_decision` | 执行决策：`direct_mcp` / `direct_mcp_plan` / `semantic_atomic` / `delegate_to_llm` / `blocked` |
+| `auto_execute_direct` | 请求参数。为 `true` 时，允许 MCP 对只读白名单工具做内部快速执行 |
+| `execution_performed` | 是否已经在 `lan_agent_accept_intent` 内部完成工具调用 |
+| `executed_tool_name` | 已自动执行的内部工具名 |
+| `small_model_allowed` | 当前任务是否适合下放本地小模型 |
+| `evidence_ref` / `result_ref` | 完整证据日志或结果引用，compact 响应也必须保留 |
+
+执行分支：
+
+```text
+大模型 → lan_agent_accept_intent(auto_execute_direct=true, output_mode=compact)
+      ├─ direct_mcp：只读白名单工具可在 MCP 内部直接执行
+      ├─ direct_mcp_plan：返回计划，由大模型按 plan_steps_json 继续调用 MCP
+      ├─ semantic_atomic：调用 lan_agent_semantic_reduce，本地小模型只做原子语义缩减
+      ├─ delegate_to_llm：复杂目标回到大模型拆解
+      └─ blocked：缺参数，先补齐再重试
+```
+
+第一版 fast path 只允许只读、低风险工具自动执行：
+
+- `lan_agent_health`
+- `lan_agent_probe_text_file`
+- `lan_agent_read_text_file`
+- `lan_agent_search_text`
+- `lan_agent_list_directory`
+- `lan_agent_get_task`
+- `lan_agent_task_log`
+- `lan_agent_resolve_task_result`
+
+写文件、构建、测试、任意命令执行不会走 `auto_execute_direct`。这些任务仍然返回 `direct_mcp_plan` 或 `delegate_to_llm`，由大模型按计划继续调用 MCP。这样保留 Ran-like 的快速和直观，同时保留 MCP 的路径约束、CLIPS guard、日志与审计链。
+
+
+---
+
+## 4. 工具清单与参数
+### 4.0 完整工具清单概览（135 个）
+
+`McpProtocolOperations.h` 的 `BuildMcpToolsListResponse` 共注册 **135 个** MCP 工具。默认模式（`UseFullMcpToolSurface()=false`）下 `tools/list` 只返回 `lan_agent_mcp_route` 单一网关入口；设置环境变量 `CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full/all/legacy/153` 后暴露全部 135 个工具。按功能类别分布如下：
+
+| 类别 | 工具数 | 代表工具 | 说明 |
+|---|---|---|---|
+| 网关路由 | 1 | `lan_agent_mcp_route` | 默认唯一可见入口（overview/route/call） |
+| Overview/Discovery | 12 | `lan_agent_mcp_overview` / `lan_agent_runtime_overview` / `lan_agent_rag_overview` / `lan_agent_patch_overview` / `lan_agent_remote_session_semantic_catalog` | 能力发现与运行时概览 |
+| Profile/CLI/Case 执行 | 4 | `lan_agent_run_cli_profile` / `lan_agent_run_case` / `lan_agent_enqueue_case` | CLI profile 与 case 编排 |
+| 本地模型/RAG/会话 | 14 | `lan_agent_run_local_chat` / `lan_agent_run_rag_flow` / `lan_agent_ventriloquist_reply` / `lan_agent_remote_session_new_turn` / `lan_agent_allocate_remote_chat_session` / `lan_agent_build_semantic_execution_card` / `lan_agent_enqueue_local_chat` | llama.cpp 远程会话与 RAG 集成 |
+| OptFile 配置 | 3 | `lan_agent_optfile_read` / `lan_agent_optfile_write_preview` / `lan_agent_optfile_apply_write` | 配置文件读写 |
+| Dialog Slice | 2 | `lan_agent_record_dialog_slice` / `lan_agent_analyze_dialog_slices` | 对话切片入库与分析 |
+| Semantic Action | 1 | `lan_agent_execute_semantic_action` | 语义动作解析与执行 |
+| Basic/Task 运维 | 5 | `lan_agent_basic_comm_smoke` / `lan_agent_get_task` / `lan_agent_task_log` / `lan_agent_snapshot_diff` | 任务查询与 smoke |
+| 构建/测试 | 8 | `lan_agent_configure_project` / `lan_agent_build_target` / `lan_agent_run_ctest_target` / `lan_agent_preflight_build_target` / `lan_agent_discover_ctest_tests` | CMake/CTest 执行与预检 |
+| CLIPS 决策 | 4 | `lan_agent_clips_decide` / `lan_agent_clips_chain_template` / `lan_agent_rag_clips_meta` / `lan_agent_rag_clips_run` | 规则引擎调用（详见第 16 节） |
+| RAG Storage/Review | 3 | `lan_agent_rag_storage_lookup` / `lan_agent_rag_review_observe` / `lan_agent_rag_storage_page` | RAG 存储查询与审查 |
+| Remote Events/Logs | 4 | `lan_agent_discover_logs` / `lan_agent_tail_control_events` / `lan_agent_list_recent_remote_events` / `lan_agent_query_remote_task_result_refs` | 远程事件与日志 |
+| 文件编辑（安全受控） | 11 | `lan_agent_preview_patch` / `lan_agent_apply_single_file_patch` / `lan_agent_apply_diff_patch` / `lan_agent_write_text_file` / `lan_agent_format_code_file` / `lan_agent_revert_single_file_patch` / `lan_agent_verify_single_file_patch` / `lan_agent_get_patch_audit_trail` / `lan_agent_get_supervision_status` | patch 审计链 + 格式化 |
+| CxParser/Clang Indexer | 4 | `lan_agent_run_clang_indexer` / `lan_agent_list_cxparser_flows` / `lan_agent_validate_cxparser_flow` / `lan_agent_run_cxparser_flow` | cxparser 流编排 |
+| Task Memory | 14 | `lan_agent_task_memory_freeze` / `lan_agent_task_memory_resume_and_execute` / `lan_agent_task_memory_new_chat_round_selftest` / `lan_agent_task_memory_rocksdb_mirror` / `lan_agent_task_memory_migration_acceptance` | 长任务记忆（详见 4.3） |
+| File Access | 17 | `lan_agent_probe_text_file` / `lan_agent_read_text_file` / `lan_agent_tail_text_file` / `lan_agent_list_directory` / `lan_agent_read_directory_files` / `lan_agent_scan_text_ranges` / `lan_agent_delete_text_range_window_atomic` / `lan_agent_prepare_edit_windows` | 文件读取/扫描/原子编辑 |
+| Profile Catalog | 1 | `lan_agent_profile_catalog` | profile 目录 |
+| CMM 桥接 | 12 | `lan_agent_cmm_index_repository` / `lan_agent_cmm_search_code` / `lan_agent_cmm_query_graph` / `lan_agent_cmm_trace_path` / `lan_agent_cmm_get_architecture` / `lan_agent_cmm_delete_project` | codebase-memory-mcp 桥接（详见 4.11） |
+| Semantic Grid | 6 | `lan_agent_semantic_grid_ingest_text` / `lan_agent_semantic_grid_build` / `lan_agent_semantic_grid_query` / `lan_agent_semantic_grid_context_bundle` | 长文本语义网格（详见 4.2/第 8 节） |
+| Clang AST/CFG/CallGraph/DFG/Slice | 9 | `lan_agent_run_clang_ast_parser` / `lan_agent_build_cfg` / `lan_agent_build_call_graph` / `lan_agent_build_dfg` / `lan_agent_build_program_slice` + 5 个 `query_*_artifact` | Clang 代码分析（详见 4.1） |
+| **合计** | **135** | | |
+
+> **维护约定**：新增或删除工具时，必须同步更新本表工具数与本节合计。工具命名统一前缀 `lan_agent_`，完整工具名清单可通过 `tools/list`（完整模式）或 Python 脚本扫描 `McpProtocolOperations.h` 中的 `"name":"lan_agent_*"` 获得。
+
+### 4.1 代码分析工具（核心 10 个）
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_run_clang_ast_parser` | Clang AST 解析，返回函数/类/调用引用 | `source_file` |
+| `lan_agent_build_cfg` | 控制流图构建（基本块+边+圈复杂度） | `source_file` |
+| `lan_agent_query_cfg_artifact` | CFG artifact 二次查询 | `artifact_json_path` 或 `artifact_summary_path` |
+| `lan_agent_build_call_graph` | 调用图构建 | `source_file` |
+| `lan_agent_query_call_graph_artifact` | CallGraph artifact 二次查询 | `artifact_json_path` 或 `artifact_summary_path` |
+| `lan_agent_build_dfg` | 数据流图构建（AST statement-level def/use） | `source_file` |
+| `lan_agent_query_dfg_artifact` | DFG artifact 二次查询 | `artifact_json_path` 或 `artifact_summary_path` |
+| `lan_agent_build_program_slice` | 程序切片（backward/forward） | `source_file`, `symbol` |
+| `lan_agent_query_program_slice_artifact` | Slice artifact 二次查询 | `artifact_json_path` 或 `artifact_summary_path` |
+
+### 4.2 语义网格工具（6 个）
+
+语义网格工具负责长文本的解构、五层语义金字塔构建、检索、原文溯源、上下文重构和多轮增量更新。
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_semantic_grid_ingest_text` | 将长文本解构为语义片段 fragments | `source_text` 或 `source_file` |
+| `lan_agent_semantic_grid_build` | 从 fragments/source_text 构建 L1-L5 语义金字塔 | `source_text` 或 `fragments_json` 或 `artifact_summary_path` |
+| `lan_agent_semantic_grid_query` | 按 layer/keyword/fuzzy/regex 查询语义网格 | `artifact_summary_path` |
+| `lan_agent_semantic_grid_trace_source` | 从任意语义节点追溯回原文 fragment | `artifact_summary_path`, `node_id` |
+| `lan_agent_semantic_grid_context_bundle` | 根据任务意图生成 LLM 上下文 bundle | `artifact_summary_path` |
+| `lan_agent_semantic_grid_incremental_update` | 多轮增量追加，支持 content_hash 去重 | `artifact_summary_path`, `source_text` |
+
+### 4.3 Task Memory 工具（14 个）
+
+Task Memory 工具负责长任务状态的 MCP 服务端持久化：把模型上下文中的"任务进度/下一步调用/已验证步骤/关键切片"外移到文件对象层，使全新模型只需读取 `latest_resume_context.json` 即可续接。
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_task_memory_freeze` | 冻结一次长任务当前状态：写 `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `index_manifest.json` / `rag_thread_migration/*` | `goal_id` |
+| `lan_agent_task_memory_append_step` | 追加一条已验证 continuation step 到 `step_ledger.jsonl`，并刷新 `latest_resume_context.json` | `goal_id` |
+| `lan_agent_task_memory_execute_continuation_budget` | 在 MCP 服务端执行 N 步 allowlisted continuation（默认 dry-run 写预算计划，`execute=true` 才真正执行）；预算耗尽时返回 `next_call_json`、`completion_claim_allowed=false` | `goal_id` |
+| `lan_agent_task_memory_resume_context` | 读取 `latest_resume_context.json`，作为新模型的首读入口（默认禁止读全历史） | `goal_id` |
+| `lan_agent_task_memory_resume_and_execute` | **fresh-chat 一次性续接入口**：读 `latest_resume_context.json` → 在 MCP 内执行 bounded continuation budget → 刷新任务记忆；返回终止验证字段或本工具自身的 `next_call_json`，直到 `terminal_state=true`。比手动 `resume_context` + `execute_continuation_budget` 链式调用更直接 | `goal_id` |
+| `lan_agent_task_memory_build_kv_snapshot` | 把 goal/latest/trace/slice/budget 索引到 `kv_snapshot/index.jsonl`，键 schema 与后续 RocksDB 后端一致 | `goal_id` |
+| `lan_agent_task_memory_kv_lookup` | 在文件 KV 快照上按 key 或 `kind=latest\|trace\|slice\|budget\|...` 查询 | `goal_id` |
+| `lan_agent_task_memory_rocksdb_mirror` | 把文件 KV 快照镜像到可选 RocksDB 读后端（`CODEX_LAN_AGENT_WITH_ROCKSDB=ON` 时启用）；写 `rocksdb_mirror_manifest.json`；**不替换文件对象层源真地位** | `goal_id` |
+| `lan_agent_task_memory_rocksdb_lookup` | 在 RocksDB 镜像上按 key 或 selector 查询（仅在 `rocksdb_mirror` 完成后可用） | `goal_id` |
+| `lan_agent_task_memory_rocksdb_parity_check` | 对同一 selector 比对文件 KV 与 RocksDB 镜像结果；pass 证明镜像读路径一致 | `goal_id` |
+| `lan_agent_task_memory_migration_assess` | 评估某 goal 是否可进入下一后端阶段：报告文件对象/KV 快照/RocksDB 状态、源真策略、是否可换源 | `goal_id` |
+| `lan_agent_task_memory_structure_manifest` | 写 `memory_structure.json`，固化"新模型首读 → 二读 → 查询读 → 全历史读禁用"契约 | `goal_id` |
+| `lan_agent_task_memory_migration_acceptance` | 在 MCP 内一站式跑完整迁移验收链（freeze → budget → kv → mirror → parity → manifest），返回 `migration_acceptance_status=ACCEPTED/PARTIAL` | — |
+
+### 4.4 MCP 单一网关入口：`lan_agent_mcp_route`
+
+`lan_agent_mcp_route` 是**聊天层唯一可见的 MCP 工具**——把所有内部 MCP 工具（代码分析、语义网格、Task Memory、文件访问等）隐藏在自身之后。本地模型只需看到这 1 个工具，通过三种模式与 MCP 交互。启用条件：`UseFullMcpToolSurface()=false`（默认），此时 `tools/list` 只返回 `lan_agent_mcp_route`。
+
+#### 三种模式
+
+| mode | 行为 | 关键返回字段 |
+|---|---|---|
+| `overview` | 返回 MCP 能力指引（不执行工具） | `mcp_route_mode=overview`、`tool_use_decision=guidance_only`、`chain_state=no_execution_started`、`visible_tool_count=1`、`visible_tool_name=lan_agent_mcp_route` |
+| `route` | CLIPS 规则推断路由目标，构造 `required_tool_arguments_json` | `mcp_route_mode=route`、`route_target`、`required_tool_name`、`required_tool_arguments_json`、`next_call_json`、`chain_state=needs_tool_call`、`semantic_model_clamp=tool_call_only` |
+| `call` | 通过内部注册表查找 `target_tool_name` 并执行（递归保护：禁止 `mcp_route` 调自身） | `mcp_route_mode=call`、`routed_tool_name`、`internal_execution_performed=true`、`current_tool_chain_node`，透传内部工具所有 result 字段 |
+
+#### 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `mode` | string | `overview` / `route` / `call`。省略时：有 `request_text`/`primary_intent`/`file_path`/`source_file` 任一非空 → 默认 `route`，否则 `overview` |
+| `request_text` | string | 自然语言请求（route 模式） |
+| `primary_intent` | string | 主意图（route 模式） |
+| `target_tool_name` | string | call 模式要执行的内部工具名 |
+| `arguments` | object | call 模式传给 `target_tool_name` 的参数对象 |
+| `arguments_json` | string | call 模式的参数 JSON 字符串（`arguments` 的替代形式） |
+| `goal_id` / `trace_id` | string | 任务追踪标识 |
+| `max_steps` | integer | 续跑步数上限 |
+
+#### 典型调用流程
+
+```
+1. mode=route（或省略 mode + 提供自然语言请求）
+   → MCP 返回 required_tool_name=lan_agent_delete_text_range_window_atomic
+              required_tool_arguments_json={...}
+
+2. mode=call, target_tool_name=lan_agent_delete_text_range_window_atomic,
+   arguments=<上一步的 required_tool_arguments_json>
+   → MCP 执行内部工具，返回 result 字段 + chain_state
+
+3. 根据 chain_state / terminal_state / verification_ok 判断继续或终结
+   → 非终态：回到步骤 1 或 2 继续调用
+   → 终态：terminal_state=true + completion_claim_allowed=true → 可输出自然语言结论
+```
+
+#### 安全约束
+
+- **递归保护**：`target_tool_name=lan_agent_mcp_route` 时返回 `recursive_mcp_route_blocked`
+- **未注册工具**：返回 `internal_tool_not_found`（404）
+- **安全分级**：`safety_class=mcp_gateway_route`、`risk=medium`、`trigger=mcp_route`
+
+### 4.5 文件访问工具组（4 个）
+
+文件访问工具组负责远程工作区/日志目录的文件读取和目录列举，是本地模型 inspect 远程文件系统的主要通道。
+
+| 工具 | 功能 | 必需参数 | risk |
+|---|---|---|---|
+| `lan_agent_read_text_file` | 分页读文本文件（默认 500 行/页），支持 line 和 byte-offset 分页；`has_more=true` 时自动返回 `next_start_line` 续读 | `file_path` | low |
+| `lan_agent_tail_text_file` | 读文件尾部 N 行（默认 120），适合轮询最新构建/看门狗日志 | `file_path` | low |
+| `lan_agent_list_directory` | 列目录（默认 200 条）；传 `trace_id` 时自动写目录读取 manifest，返回 `next_batch_tool_name=lan_agent_read_directory_files` | `directory_path` | low |
+| `lan_agent_read_directory_files` | 按 `file_extensions_csv` 批读目录内匹配文件，单页+多文件接力直到 `batch_completion=complete`；内部复用 `read_text_file` | `directory_path` | low |
+
+#### 目录批读链
+
+```
+lan_agent_list_directory(trace_id=X)
+    │  写 manifest → next_batch_tool_name=lan_agent_read_directory_files
+    ▼
+lan_agent_read_directory_files(file_index=0, trace_id=X)
+    │  内部调用 read_text_file → 单文件单页
+    │  返回 next_file_index / next_start_line / next_call_json
+    ▼
+lan_agent_read_directory_files(file_index=N, start_line=M, trace_id=X)
+    │  循环直到 batch_completion=complete
+    ▼
+完成（analysis_allowed=true）
+```
+
+> **注意**：当 `analysis_allowed=false` 或 `batch_completion=incomplete` 时，**不要重新列目录**，继续该链直到 manifest 所有文件读完。
+
+#### `lan_agent_read_text_file` 参数
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `file_path` | string | — (required) | 文件路径 |
+| `max_lines` | integer | 500 | 每页行数 |
+| `start_line` | integer | 1 | 起始行 |
+| `start_byte_offset` | integer | 0 | 字节偏移（大文件单行体场景） |
+| `primary_intent` | string | — | 主意图 |
+| `trace_id` / `request_id` | string | — | 追踪标识 |
+
+> 描述中明确推荐：对于注释清理/编辑流，应优先使用 `lan_agent_scan_text_ranges` + `lan_agent_prepare_edit_windows`，而非 `read_text_file`。
+
+### 4.6 Task Memory 自检工具：`lan_agent_task_memory_new_chat_round_selftest`
+
+`lan_agent_task_memory_new_chat_round_selftest` 是**新会话轮续接语义的自检工具**——在单次调用中编排 `freeze` → `resume_and_execute` → `delete_next_text_range_atomic`（通过 continuation budget runner），验证"换新对话"场景下 MCP 仅凭 `goal_id` 就能恢复并完成端到端任务，不依赖旧模型上下文。
+
+#### 参数
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `goal_id` | string | 可选，缺省生成 `new-chat-round-selftest-<timestamp>` |
+| `trace_id` | string | 可选，缺省等于 goal_id |
+| `max_steps` | integer | 可选，服务端上限 16，默认 5 |
+
+#### 执行流程
+
+1. 生成 `goal_id` / `mcp_conversation_id` / `mcp_round_id`
+2. 写测试样本文件 `<log_root>/task_memory_new_chat_round_selftest/<goal_id>.cpp`（含待删注释）
+3. 构造 `next_call_json` 指向 `lan_agent_delete_next_text_range_atomic`
+4. 调用 `BuildTaskMemoryFreezeResult` 冻结归档 continuation
+5. 调用 `BuildTaskMemoryResumeAndExecuteResult` 用 goal_id-only 语义恢复执行
+6. 验证 `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` / `comment_removed` / `mcp_round_established`
+
+#### 关键返回字段
+
+| 字段 | 含义 |
+|---|---|
+| `record_model` | `mcp_task_memory_new_chat_round_selftest_response_v1` |
+| `selftest_pass` | bool，全部验证通过为 true |
+| `llama_cpp_role` | `relay_only`（llama.cpp 被显式标记为中继） |
+| `chat_context_reset_required` | `true`（客户端需自行 reset host chat） |
+| `chat_context_reset_acknowledged` | `false until client ack` |
+| `mcp_context_independence_verified` | `true`（MCP 上下文独立性已验证） |
+| `fresh_entry_tool_name` | `lan_agent_task_memory_resume_and_execute` |
+| `fresh_entry_arguments_scope` | `goal_id_only_plus_budget_controls` |
+
+#### 产物文件
+
+```
+<log_root>/task_memory_new_chat_round_selftest/
+├── <goal_id>.cpp                                          ← 测试样本
+├── <goal_id>.json                                         ← selftest 报告
+└── mcp_conversations/<goal_id>/round_0001.json            ← MCP round manifest
+```
+
+### 4.7 通用参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `source_file` | string | 目标 C/C++ 源文件路径（正斜杠） |
+| `project_root` | string | 项目根目录，用于自动发现 `compile_commands.json` |
+| `compile_db_dir` | string | `compile_commands.json` 所在目录 |
+| `compilation_database_path` | string | `compile_commands.json` 完整路径 |
+| `extra_include_dirs` | string | JSON 数组字符串，额外 include 目录 |
+| `extra_defines` | string | JSON 数组字符串，额外宏定义 |
+| `output_dir` | string | artifact 输出目录（写 `*.json` / `*.dot` / `summary.json`） |
+| `include_dot` | boolean | 是否在响应中包含 DOT 文本 |
+| `focus_symbol` | string | 聚焦符号，提取邻域子图 |
+| `neighborhood_depth` | integer | 邻域遍历深度，默认 1 |
+| `neighborhood_direction` | string | `incoming` / `outgoing` / `both`，默认 `both` |
+| `max_nodes` | integer | 返回最大节点数，0=不限 |
+| `max_edges` | integer | 返回最大边数，0=不限 |
+| `offset_functions` / `offset_edges` | integer | 分页偏移 |
+| `max_functions` | integer | CFG 返回最大函数数 |
+| `include_path_metadata` | boolean | 是否计算 path-sensitive 元数据（CFG 分支/环） |
+| `max_interprocedural_bindings` | integer | 过程间绑定候选最大数，默认 512 |
+
+### 4.8 语义网格参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `source_text` | string | 内联长文本（ingest/build/incremental） |
+| `source_file` | string | 文本/markdown 文件路径（ingest/build/incremental） |
+| `source_kind` | string | 来源类型，如 `md`/`txt`/`complex_markdown`/`incremental_markdown` |
+| `split_strategy` | string | 切分策略：`markdown`(默认) / `paragraph` / `sentence` / `sliding_window` |
+| `max_fragment_chars` | integer | 单个片段软上限字符数，默认 900 |
+| `sliding_overlap_chars` | integer | `sliding_window` 模式的重叠字符数 |
+| `max_fragments` | integer | 最大片段数，默认 512 |
+| `domain` | string | L2 领域提示，默认 `general` |
+| `grid_id` | string | 可选显式 grid id |
+| `fragments_json` | string | ingest 返回的 fragments JSON 字符串 |
+| `artifact_summary_path` | string | summary.json 路径，用于二次查询/增量更新 |
+| `artifact_grid_json_path` | string | semantic_grid.json 路径 |
+| `artifact_fragments_json_path` | string | fragments.json 路径 |
+| `node_id` | string | 语义节点 ID（query/trace_source） |
+| `layer` | string | L1_META / L2_DOMAIN / L3_FLOW / L4_ATOM / L5_RAW |
+| `keyword` / `query` | string | 搜索关键词 |
+| `fuzzy_match` | boolean | 启用 token/子序列模糊匹配 |
+| `regex_match` | boolean | 将 keyword 当作正则表达式 |
+| `relation_type` | string | contains / source_trace / sequence / synonym / complement / depend / exclude / reference |
+| `direction` | string | both / in/up / out/down |
+| `offset` / `limit` | integer | 分页参数 |
+| `task_intent` | string | 上下文重构的任务意图 |
+| `flow_stage` | string | 上下文重构的流程阶段过滤 |
+| `max_chars` | integer | 上下文 bundle 最大字符数 |
+| `dedupe_existing` | boolean | 增量更新时按 content_hash 去重，默认 true |
+
+### 4.9 Task Memory 参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `goal_id` | string | 任务目标稳定 ID（仅 `[A-Za-z0-9._-]`，其余字符自动替换为 `_`）；空值降级为 `default_goal` |
+| `trace_id` | string | 单次执行追踪 ID（同一 `goal_id` 可有多条 trace） |
+| `step_id` | string | 步骤 ID（append_step 写入 `step_ledger.jsonl`） |
+| `step_index` | integer | 步骤序号 |
+| `step_kind` | string | 步骤类型（如 `tool_call`/`analysis`/`review`） |
+| `current_tool` | string | 当前调用的 MCP 工具名 |
+| `status` | string | 步骤状态（`success`/`partial`/`failed`/`pending` 等） |
+| `summary` | string | 步骤自然语言摘要 |
+| `result_ref` | string | 步骤结果引用路径（artifact 路径或 JSON 文件） |
+| `evidence_ref` | string | 步骤证据引用路径 |
+| `next_call_json` | string | 下一步 MCP 调用 JSON（`{"name":"...","arguments":{...}}`） |
+| `has_more` | boolean | 是否还有后续步骤 |
+| `terminal_state` | boolean | 是否终态（任务完成） |
+| `completion_claim_allowed` | boolean | 是否允许声明任务完成 |
+| `compact_summary` | string | 紧凑摘要（写 `latest_resume_context.json`） |
+| `remaining_work` | string | 剩余工作描述 |
+| `current_state_markdown` | string | 当前状态 Markdown（freeze 用） |
+| `key_slices_jsonl` | string | 关键切片 JSONL（freeze 用） |
+| `incremental_index_manifest_json` | string | 增量索引清单 JSON |
+| `migration_handover_markdown` | string | 迁移交接 Markdown |
+| `max_steps` / `step_budget` | integer | continuation budget 步数上限 |
+| `dry_run` | boolean | 默认 true，只写预算计划不执行 |
+| `execute` | boolean | 必须为 true 且 `dry_run=false` 才真正执行 |
+| `key` | string | KV 显式键（kv_lookup / rocksdb_lookup / parity_check） |
+| `kind` | string | KV selector：`goal\|latest\|resume_context\|trace\|trace_step\|slice\|budget\|trace_budget` |
+| `prefix` | boolean | 前缀匹配 |
+| `limit` / `offset` | integer | KV 查询分页 |
+| `include_value` | boolean | 是否返回 value（默认 true） |
+| `rocksdb_path` | string | 显式 RocksDB 目录（默认 `task_memory/<goal_id>/rocksdb_native`） |
+| `max_final_steps` | integer | migration_acceptance 最终 continuation budget，默认 8 |
+
+### 4.10 compile_commands.json 发现顺序
+
+1. 显式 `compilation_database_path` → 直接使用
+2. 显式 `compile_db_dir` → 拼接 `compile_commands.json`
+3. `project_root` + 常见构建目录 → 自动搜索 `build/`, `AIbuild/`, `cmake-build-*/`
+4. 均未找到 → 降级为无编译数据库模式（`compile_db_mode=none`，复杂文件可能失败）
+
+### 4.11 CMM 工具清单（codebase-memory-mcp 桥接）
+
+CMM（Codebase Memory MCP）工具通过 `codex_lan_agent` 桥接到独立的 `codebase-memory-mcp` 服务，提供基于**预建索引**的项目级代码图查询能力。使用前需先调用 `lan_agent_cmm_index_repository` 建立索引。
+
+| 工具 | 功能 | 必需参数 |
+|---|---|---|
+| `lan_agent_cmm_list_projects` | 列出 CMM 已索引的所有项目 | — |
+| `lan_agent_cmm_index_status` | 查询指定项目的索引状态 | `project` |
+| `lan_agent_cmm_index_repository` | 索引一个仓库到 CMM | `repo_path`, `name` |
+| `lan_agent_cmm_delete_project` | 从 CMM 删除已索引项目 | `project` |
+| `lan_agent_cmm_search_code` | 代码文本搜索（支持正则、文件过滤） | `project` |
+| `lan_agent_cmm_search_graph` | 图节点搜索（按 label/kind/relationship） | `project` |
+| `lan_agent_cmm_query_graph` | 图查询（类 Cypher 查询） | `project`, `query` |
+| `lan_agent_cmm_trace_path` | 调用链/依赖链路径追踪 | `project` |
+| `lan_agent_cmm_get_code_snippet` | 按 qualified_name 获取代码片段 | `project` |
+| `lan_agent_cmm_get_graph_schema` | 获取项目图数据库 schema | `project` |
+| `lan_agent_cmm_get_architecture` | 项目架构分析（模块依赖、分层） | `project` |
+| `lan_agent_cmm_detect_changes` | 分支变更检测与影响分析 | `project` |
+
+#### CMM 通用参数说明
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `project` | string | CMM 项目名称或绝对路径（自动归一化） |
+| `query` / `pattern` | string | 搜索查询字符串或正则模式 |
+| `file_pattern` | string | 文件 Glob 过滤（如 `*.cpp`） |
+| `path_filter` | string | 路径正则过滤（如 `cximage/`） |
+| `limit` | integer | 返回结果数量上限，默认 10 |
+| `offset` | integer | 分页偏移 |
+| `context` | integer | 代码上下文行数 |
+| `mode` | string | `compact` / `full` / `files` |
+| `depth` | integer | 路径追踪深度 |
+| `direction` | string | 路径方向 |
+
+#### CMM 索引建立示例
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "cmm-index"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_cmm_index_repository"
+        arguments = @{
+            repo_path = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxvision_repo"
+            name = "cxvision"
+            include = @("*.cpp", "*.h", "*.hpp")
+            exclude = @("third_party/", "build/")
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 300
+```
+
+#### CMM 代码搜索示例
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "cmm-search"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_cmm_search_code"
+        arguments = @{
+            project = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxvision_repo"
+            query = "center_x"
+            path_filter = "cximage/"
+            file_pattern = "*.cpp"
+            limit = 20
+            context = 3
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 60
+```
+
+---
+
+## 5. 接入本地模型后的操作语义
+
+### 5.1 语义模型
+
+本地模型（LLM）作为**调用方**，通过 MCP 协议与 `codex_lan_agent` 交互。完整的操作语义链：
+
+```
+用户意图
+  → 本地模型理解意图，选择 MCP 工具
+  → 构造 JSON-RPC tools/call 请求
+  → codex_lan_agent 执行 Clang 分析
+  → 返回 structuredContent（JSON + 元数据）
+  → 本地模型解读结果，生成自然语言报告或下一步操作
+```
+
+### 5.2 操作语义分层
+
+| 层级 | 操作 | 语义 |
+|---|---|---|
+| L0 | `tools/list` | 发现可用工具和能力（默认只返回 `lan_agent_mcp_route` 单一网关入口） |
+| GW | `lan_agent_mcp_route` | **单一网关入口**：mode=overview/route/call 三模式收敛所有内部工具 |
+| L1 | `lan_agent_run_clang_ast_parser` | 获取文件级 AST 概览（函数列表、类结构、调用引用） |
+| L2 | `lan_agent_build_cfg` | 获取函数级控制流（基本块、分支、圈复杂度） |
+| L3 | `lan_agent_build_call_graph` | 获取文件级调用关系 |
+| L4 | `lan_agent_build_dfg` | 获取数据流（def/use 边、过程间绑定） |
+| L5 | `lan_agent_build_program_slice` | 获取符号级切片（backward/forward） |
+| L6 | `lan_agent_query_*_artifact` | 从已写入的 artifact 二次查询，无需重跑 Clang |
+| SG | `lan_agent_semantic_grid_*` | 长文本语义网格：解构、归纳、检索、溯源、上下文重构、增量 |
+| TM | `lan_agent_task_memory_*` | 长任务记忆：freeze / append_step / continuation budget / **resume_and_execute（fresh-chat 一次性续接）** / kv snapshot / rocksdb mirror / parity check / structure manifest / migration acceptance / **new_chat_round_selftest（续接自检）** |
+| FA | `lan_agent_read_text_file` / `tail_text_file` / `list_directory` / `read_directory_files` | 文件访问：分页读 / 尾部读 / 列目录 / 批读目录文件 |
+
+### 5.3 模型决策规则
+
+本地模型应遵循以下决策规则：
+
+1. **先 discovery，再 analysis**：先调用 `tools/list` 确认工具可用。
+2. **先 AST，再 deep analysis**：先解析 AST 获取文件结构概览，再决定是否构建 CFG/DFG/Slice。
+3. **先 build，再 query**：首次分析调用 `build_*` 写入 artifact；后续分页/聚焦查询调用 `query_*_artifact`。
+4. **复杂项目必传 `project_root`**：确保 `compile_commands.json` 被发现，否则复杂文件解析失败。
+5. **大文件分页**：使用 `offset_*` / `max_*` 控制返回量，避免单次响应过大。
+6. **超时意识**：DFG/Slice 对复杂文件可能需要 180-300s，模型应设置足够超时。
+7. **语义网格用于非代码文本**：长文本/规则文档/经验框架使用 `semantic_grid_*` 工具链，不走 Clang 工具。
+8. **增量更新用链式 summary**：每轮增量使用上一轮返回的 `artifact_summary_json_path` 作为下一轮输入。
+9. **长任务先 freeze 再 resume**：进入上下文压力或需要换模型时，先 `task_memory_freeze` 落盘当前状态；新模型首读 `task_memory_resume_context` 而不是回放全历史。
+10. **continuation 不在模型侧循环**：当 `has_more=true` 且 `completion_claim_allowed=false` 时，调 `task_memory_execute_continuation_budget(execute=true)` 让 MCP 服务端按预算推进，避免模型上下文无限膨胀。
+11. **RocksDB 镜像不替换源真**：`rocksdb_mirror` 完成后必须 `rocksdb_parity_check` 通过才允许在 read path 上使用，`safe_to_replace_source_of_truth` 必须保持 `false`。
+
+### 5.4 典型模型对话流程
+
+```
+用户：分析 FastMatch.cpp 中 center_x 的数据流
+
+模型内部决策：
+  1. tools/list → 确认 lan_agent_build_dfg 可用
+  2. lan_agent_run_clang_ast_parser(source_file=FastMatch.cpp, project_root=cxvisionai)
+     → 确认文件可解析，获取函数列表
+  3. lan_agent_build_dfg(source_file=FastMatch.cpp, project_root=cxvisionai,
+                         focus_symbol=center_x, neighborhood_depth=2)
+     → 获取 center_x 的数据流子图
+  4. 解读 dfg_json 中的节点和边，生成自然语言报告
+
+模型输出：
+  "center_x 在 FastMatch.cpp 中被定义于第 45 行（learn 阶段），
+   在第 78 行被使用（match 阶段），
+   过程间绑定：learn → match 通过参数传递..."
+```
+
+### 5.5 语义网格对话流程（长文本分析）
+
+```
+用户：将这份规则文档解构，并检索其中关于"约束"的语义节点
+
+模型内部决策：
+  1. tools/list → 确认 lan_agent_semantic_grid_build 可用
+  2. lan_agent_semantic_grid_build(source_text=<规则文档>, domain="rule_doc")
+     → 返回 fragment_count, node_count, edge_count, layer_distribution
+  3. lan_agent_semantic_grid_query(artifact_summary_path=<build 返回的 path>,
+                                    layer="L4_ATOM", keyword="约束", fuzzy_match=true)
+     → 返回 matched_nodes_json, match_mode=fuzzy
+  4. 从 matched_nodes 取第一个 node_id
+  5. lan_agent_semantic_grid_trace_source(artifact_summary_path=<同上>,
+                                          node_id=<上一步的 node_id>)
+     → 返回 source_fragments_json，包含原文 content_text 和 section_path
+  6. lan_agent_semantic_grid_context_bundle(artifact_summary_path=<同上>,
+                                            task_intent="约束 规则",
+                                            fuzzy_match=true, max_nodes=8)
+     → 返回 context_bundle_json + prompt_sections，供模型直接消费
+
+模型输出：
+  "该规则文档被解构为 11 个语义片段，构建出 27 个语义节点。
+   关于'约束'的语义节点位于 L4_ATOM 层，对应原文片段：
+   '禁止把推理约束和经验描述混在同一个原子节点中'。
+   上下文 bundle 已生成，包含 8 个相关节点和 prompt 文本..."
+```
+
+### 5.6 多轮增量对话流程
+
+```
+用户：再追加一段新经验，并确保不重复已有内容
+
+模型内部决策：
+  1. 使用上一轮 build 的 artifact_summary_path
+  2. lan_agent_semantic_grid_incremental_update(
+       artifact_summary_path=<base/summary.json>,
+       source_text=<新增经验文本>,
+       dedupe_existing=true)
+     → 返回 added_fragment_count, skipped_duplicate_fragment_count,
+       delta_fragments_json, delta_nodes_json
+  3. 如需查询新增内容：
+     lan_agent_semantic_grid_query(
+       artifact_summary_path=<incremental 返回的新 summary.json>,
+       keyword="<新增主题>", fuzzy_match=true)
+  4. 如重复提交相同文本：
+     added_fragment_count=0, skipped_duplicate_fragment_count>0 → 确认去重生效
+
+模型输出：
+  "已追加 4 个新片段，新增 8 个语义节点（delta）。
+   如重复提交相同内容，系统会跳过 4 个重复片段，节点数不变。"
+```
+
+### 5.7 长任务记忆续接流程
+
+```
+场景：本地模型已处理 30 步 RAG 长任务，上下文接近窗口上限，需要换一个新模型续接。
+
+旧模型退出前：
+  1. lan_agent_task_memory_freeze(
+       goal_id="rag-repo-scan-v1",
+       trace_id="trace-20260809-001",
+       current_state_markdown=<当前状态 markdown>,
+       compact_summary="已完成 8/12 个仓库扫描，剩余 4 个待 ingest...",
+       remaining_work="ingest repo #9-#12, build global index, run parity check",
+       next_call_json='{"name":"lan_agent_semantic_grid_incremental_update","arguments":{...}}',
+       terminal_state=false,
+       completion_claim_allowed=false)
+     → 写入 logs/task_memory/rag-repo-scan-v1/latest_resume_context.json
+     → 追加 step_ledger.jsonl / slices.jsonl / index_manifest.json
+
+新模型启动后（无需读全历史）：
+  1. lan_agent_task_memory_resume_context(goal_id="rag-repo-scan-v1")
+     → 返回 compact_summary, next_call_json, remaining_work, terminal_state
+  2. 按 next_call_json 继续调用 MCP 工具
+  3. 每完成一步：lan_agent_task_memory_append_step(goal_id=..., step_kind="tool_call",
+       status="success", summary="...", has_more=true, completion_claim_allowed=false)
+  4. 若需要服务端自动推进 N 步：
+     lan_agent_task_memory_execute_continuation_budget(
+       goal_id="rag-repo-scan-v1", dry_run=false, execute=true, max_steps=5)
+     → MCP 服务端执行 5 步 allowlisted continuation，写 step_ledger，
+       返回 completion_claim_allowed=false + 新的 next_call_json
+  5. 任务完成后：terminal_state=true, completion_claim_allowed=true
+```
+
+> **fresh-chat 简化路径**：若 `goal_id` 已 freeze 过，新会话直接调一次
+> `lan_agent_task_memory_resume_and_execute(goal_id=..., max_steps=10)`
+> 即可，无需手动走 `resume_context` + `execute_continuation_budget` 链。详见 9.4.1 / 9.9。
+
+### 5.8 local AI 上下文治理（Overview 字段）
+
+`lan_agent_mcp_overview` 工具返回一组 `local_ai_*` 治理字段，约束本地模型在 MCP 协作中的上下文使用、会话关闭与任务交接行为。这些字段与 Task Memory 配套，构成"模型上下文最小化 + 跨会话干净交接"的完整契约。
+
+| 字段 | 作用 |
+|---|---|
+| `local_ai_context_policy` | 模型上下文必须 task-minimal：只含 current goal / current file / 一个 next MCP call / completion gate / artifact refs；**禁止** paste `tools/list` schemas / 全历史对话 / 全日志 / 全 artifact JSON 进 prompt |
+| `local_ai_conversation_close_policy` | 每个 interrupted/finished 会话必须保留 `conversation_close_status`；新会话先调 `next_chat_status_check_arguments_json` 或 `lan_agent_task_memory_resume_context`，再执行续接工作 |
+| `local_ai_context_bootstrap_json` | `record_model=mcp_context_bootstrap_v1`，显式列出 `include`（user_goal / goal_id / trace_id / current_file / required_tool_name / required_tool_arguments_json / clean_chat_close_allowed / new_chat_entry_arguments_json / completion_gate / result_ref / evidence_ref）与 `exclude`（full_tools_list / tool_schemas / old_chat_history / full_file_content / full_log_content / full_artifact_json），`lookup_policy=use refs and MCP query tools on demand` |
+| `local_ai_long_loop_policy` | 长循环场景：freeze 一次 task_memory；新会话直接调 `lan_agent_task_memory_resume_and_execute` 续接（不再要求手动链式调用） |
+| `local_ai_completion_gate` | 只有 `terminal_state=true` + `completion_claim_allowed=true` + `final_answer_allowed=true` + `verification_ok=true` 才能声明完成；`clean_chat_close_allowed=true` 仅代表当前会话可安全交接，**不代表任务完成** |
+| `local_ai_guidance_json` | 结构化指引 v1，含 `context` / `file_ops` / `comment_cleanup` / `long_loop` / `fresh_chat_resume` / `clean_handoff` / `conversation_close_status` / `completion_gate` 八个子段 |
+
+**关键语义**：
+- `clean_chat_close_allowed=true` ≠ 任务完成 —— 仅代表当前会话可以安全停止并把工作交给下一个会话。
+- `new_chat_entry_arguments_json` —— 由 `latest_resume_context.json` 回填，新会话首调用入口（通常指向 `lan_agent_task_memory_resume_and_execute`）。
+- `handoff_completion_claim=not_task_complete` —— 交接时禁止使用任务完成的措辞。
+
+---
+
+## 6. 完整使用案例
+
+### 案例一：简单文件 CFG 构建
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "cfg-simple"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_build_cfg"
+        arguments = @{
+            source_file = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/test_simple.cpp"
+            include_dot = $false
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+$response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 60
+$content = $response.result.structuredContent
+Write-Host "status=$($content.status)"                    # success
+Write-Host "total_functions=$($content.total_functions)"  # 2
+Write-Host "total_blocks=$($content.total_blocks)"        # 7
+Write-Host "total_edges=$($content.total_edges)"          # 7
+```
+
+### 案例二：复杂项目 AST 解析
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "ast-fastmatch"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_run_clang_ast_parser"
+        arguments = @{
+            source_file = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxvision_repo/cximage/FastMatch.cpp"
+            project_root = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai"
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+$response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 120
+$content = $response.result.structuredContent
+# status=success
+# compile_db_mode=compile_commands_json
+# resolved_compile_db_dir=D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\build
+# filtered_to_source_file=true
+# function_count=2600+
+```
+
+### 案例三：DFG 构建 + 过程间绑定
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "dfg-fastmatch"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_build_dfg"
+        arguments = @{
+            source_file = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/cxvision_repo/cximage/FastMatch.cpp"
+            project_root = "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai"
+            focus_symbol = "center_x"
+            neighborhood_depth = 2
+            neighborhood_direction = "both"
+            include_dot = $false
+            max_nodes = 80
+            max_edges = 120
+            max_interprocedural_bindings = 256
+            output_dir = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/lan_agent_analysis_client_bundle"
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+$response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 300
+$content = $response.result.structuredContent
+# status=success
+# analysis_level=ast_statement_v1
+# dfg_precision=ast_statement_def_use_v1
+# ast_readwrite_ref_count=177
+# interprocedural_binding_status=callsite_argument_return_candidates_available
+# interprocedural_binding_count=256
+```
+
+### 案例四：程序切片 + Path-sensitive 元数据
+
+```powershell
+$body = @{
+    jsonrpc = "2.0"
+    id = "slice-path"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_build_program_slice"
+        arguments = @{
+            source_file = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/test_simple.cpp"
+            symbol = "result"
+            direction = "backward"
+            include_path_metadata = $true
+            include_dot = $false
+            max_nodes = 20
+            max_edges = 40
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+$response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 120
+$content = $response.result.structuredContent
+# status=success
+# slice_precision=ast_statement_def_use_cfg_callgraph_v1
+# path_sensitive_status=cfg_branch_metadata_available
+# path_sensitive_precision=cfg_branch_successor_candidate_v1
+# path_condition_candidate_count=4
+# control_dependency_candidate_count=4
+# cyclic_function_candidate_count=1
+```
+
+### 案例五：Task Memory 冻结 + 续接 + KV 快照
+
+```powershell
+# 1. 冻结当前长任务状态
+$freezeBody = @{
+    jsonrpc = "2.0"
+    id = "tm-freeze"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_freeze"
+        arguments = @{
+            goal_id = "rag-repo-scan-v1"
+            trace_id = "trace-20260809-001"
+            compact_summary = "已完成 8/12 仓库扫描，剩 4 个待 ingest"
+            remaining_work = "ingest repo #9-#12, build global index"
+            next_call_json = '{"name":"lan_agent_semantic_grid_incremental_update","arguments":{...}}'
+            terminal_state = $false
+            completion_claim_allowed = $false
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$freeze = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $freezeBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# latest_resume_context_path=.../task_memory/rag-repo-scan-v1/latest_resume_context.json
+# step_ledger_path=.../step_ledger.jsonl
+
+# 2. 新模型首读 resume_context
+$resumeBody = @{
+    jsonrpc = "2.0"
+    id = "tm-resume"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_resume_context"
+        arguments = @{ goal_id = "rag-repo-scan-v1" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$resume = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $resumeBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# 返回 compact_summary / next_call_json / remaining_work / terminal_state
+
+# 3. 构建 KV 快照（为 RocksDB 镜像做准备）
+$kvBody = @{
+    jsonrpc = "2.0"
+    id = "tm-kv"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_build_kv_snapshot"
+        arguments = @{ goal_id = "rag-repo-scan-v1" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$kv = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $kvBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# kv_snapshot_index_path=.../kv_snapshot/index.jsonl
+# kv_record_count>0
+
+# 4. 按 selector 查询 KV
+$lookupBody = @{
+    jsonrpc = "2.0"
+    id = "tm-lookup"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_kv_lookup"
+        arguments = @{ goal_id = "rag-repo-scan-v1"; kind = "latest" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$lookup = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $lookupBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, hit=true, value_json contains latest_resume_context
+```
+
+#### 5.a fresh-chat `resume_and_execute` 续接闭环（真实对话·删除 Image.cpp 注释）
+
+以下来自真实 gemma-4-E4B 会话（会话 ID `aef8967e`，任务：删除 `Image.cpp` 中全部注释，4690 行 / 155 KB / 241 条注释，预计超过本地模型上下文窗口）。展示了"首帧探测 → 遇到长循环 → freeze → budget_run(10 步) → 新会话 resume_and_execute"的完整闭环，模型每一步严格遵循 MCP 返回的 `required_tool_arguments_json`，**没有手动构造参数**。
+
+```
+Turn 1  User:  删除 Image.cpp 中所有注释
+      Model: lan_agent_probe_text_file(file=Image.cpp, primary_intent=delete_comments)
+      MCP:   recommended_next_tool=delete_text_range_window_atomic
+             next_call_json={
+               name:lan_agent_delete_text_range_window_atomic,
+               arguments:{start_line:1, max_lines:200, scan_mode:comments, ...}
+             }
+
+Turn 2  Model: lan_agent_delete_text_range_window_atomic(按 next_call_json 原样调用)
+      MCP:   has_more=true, total_range_count_before=241 (共 241 条注释)
+             completion_guard=NON_TERMINAL_RESULT  ← 长循环闸门
+             required_tool_name=lan_agent_task_memory_freeze  ← 强制 freeze
+             required_tool_arguments_json={
+               goal_id:"trace-delete_window-20260810_102404",
+               current_goal:"continue comment cleanup until completion gate",
+               current_tool:"lan_agent_delete_text_range_window_atomic",
+               terminal_state:false, completion_claim_allowed:false,
+               next_call_json:"下一个 delete 窗口调用 (start_line:201)"
+             }
+
+Turn 3  Model: lan_agent_task_memory_freeze(按 required_tool_arguments_json 原样调用)
+      MCP:   semantic_outcome=task_memory_frozen
+             task_memory_root=.../logs/task_memory/trace-delete_window-20260810_102404
+             latest_resume_context.json, step_ledger.jsonl, slices.jsonl 已写入
+             clean_chat_close_allowed=true, conversation_close_status=handoff_ready_not_complete
+             ← 注意：conversation_close_allowed≠任务完成
+             next_call_json → lan_agent_task_memory_execute_continuation_budget(goal_id=..., max_steps=10)
+
+Turn 4  Model: lan_agent_task_memory_execute_continuation_budget(按 next_call_json)
+      MCP:   executed_step_count=10, budget_exhausted=true
+             last_verified_step=10  ← 已跑 10 次 bounded 200-line delete 窗口
+             last_tool=lan_agent_delete_text_range_window_atomic
+             last_status=needs_continue, terminal_state=false
+             budget_run_id=budget-73adc8b4aaacc6c4
+             ← 新会话续接路径：
+             new_chat_entry_tool_name=lan_agent_task_memory_resume_and_execute
+             new_chat_entry_arguments_json={
+               name:lan_agent_task_memory_resume_and_execute,
+               arguments:{goal_id:"trace-delete_window-20260810_102404", max_steps:10, execute:true}
+             }
+             conversation_close_status=handoff_ready_not_complete
+             next_chat_must_verify_fields=[
+               terminal_state, completion_claim_allowed, final_answer_allowed,
+               verification_ok, clean_chat_close_allowed, conversation_close_status,
+               new_chat_entry_arguments_json
+             ]
+
+=== 模型切换 / 重启会话（读取上面的 new_chat_entry_arguments_json 即续接，不重读旧对话）===
+
+Turn 5  Model: lan_agent_task_memory_resume_and_execute(按 new_chat_entry_arguments_json)
+      MCP:   resume_execute_mode=read_resume_context_and_execute_budget
+             inner_record_model=mcp_task_memory_execute_continuation_budget_response_v1
+             last_verified_step=20   ← 累计 20 次 delete 调用
+             budget_status=blocked, blocked (遇到跨 200-line 边界的长注释块,
+             block_reason=NEXT_FLOW_SAFETY_CLASS_NOT_READY,
+             提示需用 lan_agent_delete_next_text_range_atomic 精修单步删除)
+             terminal_state=false
+             required_tool_name=lan_agent_task_memory_resume_and_execute
+             required_tool_arguments_json=(相同参数，再次调用本工具)
+             ← 模型继续重复调用 resume_and_execute，直到 terminal_state=true
+```
+
+**关键点：**
+1. 模型**始终按 MCP 返回的 `required_tool_arguments_json` 原样调用**，不需要自己构造任何参数；
+2. `budget_run_id` / `last_verified_step` 每轮续接都会累加；
+3. `conversation_close_allowed=true` **不代表** `terminal_state=true`，只是当前会话可以安全关闭交接给下一个；
+4. `new_chat_entry_arguments_json` 指向 `lan_agent_task_memory_resume_and_execute`，新模型首调即续接，无需读取旧对话历史。
+
+---
+
+### 案例六：RocksDB 镜像 + 一致性校验
+
+```powershell
+# 1. 镜像 KV 快照到 RocksDB（需 CODEX_LAN_AGENT_WITH_ROCKSDB=ON 编译）
+$mirrorBody = @{
+    jsonrpc = "2.0"
+    id = "tm-mirror"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_rocksdb_mirror"
+        arguments = @{ goal_id = "rag-repo-scan-v1" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$mirror = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $mirrorBody -ContentType "application/json; charset=utf-8" -TimeoutSec 120).result.structuredContent
+# status=success
+# rocksdb_mirror_manifest_path=.../rocksdb_mirror_manifest.json
+# source_of_truth=file_object_store  (始终保持)
+# safe_to_replace_source_of_truth=false
+
+# 2. 一致性校验（同一 selector 比对文件 KV vs RocksDB）
+$parityBody = @{
+    jsonrpc = "2.0"
+    id = "tm-parity"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_rocksdb_parity_check"
+        arguments = @{ goal_id = "rag-repo-scan-v1"; kind = "latest" }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$parity = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $parityBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# parity_status=pass
+# safe_to_replace_source_of_truth=false  (校验通过也不允许换源真)
+```
+
+### 案例七：一站式迁移验收（MCP-native）
+
+```powershell
+# 单次调用跑完整迁移验收链：freeze → budget → kv → mirror → parity → manifest
+$accBody = @{
+    jsonrpc = "2.0"
+    id = "tm-accept"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_task_memory_migration_acceptance"
+        arguments = @{ max_final_steps = 8 }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$acc = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $accBody -ContentType "application/json; charset=utf-8" -TimeoutSec 300).result.structuredContent
+# 预期字段：
+# migration_acceptance_status=ACCEPTED
+# acceptance_status=complete
+# semantic_outcome=TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
+# source_of_truth=file_object_store
+# active_read_backend=rocksdb_native_mirror
+# write_backend=file_object_store
+# safe_to_replace_source_of_truth=false
+# parity_required_for_native_reads=true
+```
+
+### 案例八：真实对话·删除 C++ 源文件多余回车换行（单步短任务闭环）
+
+会话 ID `14ae0da8`（gemma-4-E4B，2 turns）。目标：`Image.cpp` 有多余空行和格式问题，请求"删除多余回车换行"。展示了**短任务的 completion_gate 打开流程**（1 次工具调用 → verification_ok=true → 可直接 claim 完成，无需 Task Memory）。
+
+```
+Turn 1  User:  删除 Image.cpp 中多余的回车换行
+      Model: lan_agent_format_code_file(source_file=Image.cpp, dry_run=false)
+             ← 模型从工具语义直接选定 clang-format，未做多余探测
+
+      MCP  result_envelope (精简):
+        - old_hash=866862e0d1e2dfa0         ← 文件原哈希
+        - new_hash=071113de9d943dd6         ← 格式化后哈希（不同=实际有改动）
+        - source_bytes=140563 → formatted_bytes=132938   ← 减少 7.6 KB (5.4%)
+        - would_change=true, changed=true   ← 确认发生真实改动
+        - backup_path=.../code_format/Image.cpp_.../Image.cpp.before
+        - formatter_path=VS2022 clang-format (fallback_style=LLVM, style=file)
+        - CLIPS 后处理（mcp_result_guard.clp）:
+            risk=medium → safety_class=controlled → execution_class=controlled
+            decision=allow, verification=verified
+            matched_rule=default-mcp-result-verified
+            2 CLIPS facts asserted, alarm=false
+
+        - 最终闸门（completion_gate）:
+            verification_status=verified
+            verification_ok=true
+            terminal_state=true
+            task_done=true
+            completion_claim_allowed=true
+            final_answer_allowed=true
+            outcome=PASS
+            supervision_status=closed_loop_complete
+            acceptance_status=complete
+            ai_conclusion_valid=true
+
+Turn 2  Model: "Image.cpp 已格式化，删除了多余回车换行，文件已验证。"
+              ← 模型直接输出自然语言总结（final_answer_allowed=true 放行）
+```
+
+**关键不变量：**
+1. `verification_ok=true` 是 `final_answer_allowed=true` 的前置条件；
+2. 没有 freeze / resume_context / budget，因为 1 步完成且 `terminal_state=true`；
+3. `lan_agent_format_code_file` 直接写盘 + 留备份（`backup_path`），可审计回滚；
+4. `clips_post_result_chain_clips_required=true` → 所有文件写操作都会经 CLIPS 规则引擎做安全分级，风险 medium 以下且 verification_ok=true 才放行。
+
+### 案例九：真实对话·删除 C++ 源文件全部注释（长任务多会话 Task Memory 续接）
+
+会话 ID `aef8967e`（gemma-4-E4B，29 turns，覆盖 `trace_id=trace-delete_window-20260810_102404`）。目标：4690 行 / 155 KB / 241 条注释的 `Image.cpp`，预期超过本地模型上下文。展示了**"探测 → 长循环闸门触发 → freeze → budget_run(10 步) → fresh-chat resume_and_execute（再跑 10 步）"**的完整闭环。
+
+**执行全景统计（来自对话 turn timing）：**
+
+| 阶段 | 工具名 | Turn | 说明 |
+|---|---|---|---|
+| 1 探测 | `lan_agent_probe_text_file` | T1 | 推荐使用 `delete_text_range_window_atomic`，推荐窗口 200 行 |
+| 2 首窗口 | `lan_agent_delete_text_range_window_atomic` | T2 | `has_more=true`，共 241 条注释待删；**completion_guard=NON_TERMINAL_RESULT**，闸门强制要求 freeze，禁止模型 claim / 输出自然语言 |
+| 3 冻结 | `lan_agent_task_memory_freeze` | T3 | 写 `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `rag_thread_migration/*`；`clean_chat_close_allowed=true`（**但** `conversation_close_status=handoff_ready_not_complete` ≠ 任务完成）；返回 `new_chat_entry_tool_name=lan_agent_task_memory_resume_and_execute` |
+| 4 Budget(10) | `lan_agent_task_memory_execute_continuation_budget` | T4 | 跑了 10 次 bounded delete 调用，写 `budget_runs/budget-73adc8b4aaacc6c4.json`；`last_verified_step=10`；`budget_exhausted=true` 仍 `terminal_state=false` |
+| 5 Resume+Exec | `lan_agent_task_memory_resume_and_execute` | T5 | **fresh-chat 入口**：读 `latest_resume_context` 再跑 10 步，累计 `last_verified_step=20`；写入 `budget_runs/budget-89f4c850fd0031c7.json`；遇到跨窗口边界的长注释块（`block_reason=NEXT_FLOW_SAFETY_CLASS_NOT_READY`），Budget `blocked` → 返回 `required_tool_name=self`（继续调 `resume_and_execute`）→ 预算耗尽 → T6~T29 继续调 `delete_next_text_range_atomic` / `delete_window` 直到 241 条注释全部清除 |
+| 6+ 续接 | `delete_next_text_range_atomic` + `delete_window` 交替 | T7~T29 | 边界长注释用单步精修，其余 200 行窗口用批量删除 |
+
+**Task Memory 产物（来自 MCP 返回的实际文件路径）：**
+
+```
+logs/task_memory/trace-delete_window-20260810_102404/
+├── latest_resume_context.json          ← 每轮 freeze / budget / resume_and_execute 都会刷新
+├── step_ledger.jsonl                   ← 每步追加（共 ≥20 条已验证 step 条目）
+├── slices.jsonl                        ← freeze 时写入 key slice（summary, trace_id, dedup_hash）
+├── index_manifest.json                 ← 增量索引清单
+├── memory_structure.json               ← (后续写) 结构契约 bootstrap
+├── rag_thread_migration/
+│   ├── 1_current_state.md
+│   ├── 2_key_slices.jsonl
+│   ├── 3_incremental_index_manifest.json
+│   └── 4_migration_handover.md
+├── budget_runs/
+│   ├── budget-73adc8b4aaacc6c4.json    ← Turn 4 execute_continuation_budget: 10 steps
+│   └── budget-89f4c850fd0031c7.json    ← Turn 5 resume_and_execute: 10 steps (blocked on boundary)
+ kv_snapshot/index.jsonl              ( build_kv_snapshot)
+ rocksdb_native/                      ( rocksdb_mirror,  WITH_ROCKSDB=ON)
+ rocksdb_mirror_manifest.json
+```
+
+** 1:1 **
+1. **`completion_guard=NON_TERMINAL_RESULT`** `lan_agent_delete_text_range_window_atomic`  `has_more=true`  MCP  clamp  `tool_call_only`
+2. **freeze  budget  resume_and_execute **
+   - `freeze` +  next call  budget runner
+   - `execute_continuation_budget` MCP  N  allowlisted  10 64 `budget_runs/*.json`****
+   - `resume_and_execute``fresh-chat`  =  resume_context +  budget runner / ""
+3. **  **`clean_chat_close_allowed=true` **** `terminal_state=true + completion_claim_allowed=true + final_answer_allowed=true + verification_ok=true`  claim 
+4. **blocked **budget runner " 200-line " `blocked` `delete_next_text_range_atomic` `NEXT_FLOW_SAFETY_CLASS_NOT_READY` 
+
+---
+
+## 7. Artifact 
+
+### 7.1 
+
+```
+                          
+                          
+build_dfg                        query_dfg_artifact
+   dfg.json           
+   dfg.dot                         (offset_edges / max_edges)
+   summary.json        (focus_symbol / neighborhood_depth)
+                                     (output_dir)
+```
+
+### 7.2 
+
+```powershell
+#  summary.json  DFG
+$body = @{
+    jsonrpc = "2.0"
+    id = "dfg-query"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_query_dfg_artifact"
+        arguments = @{
+            artifact_summary_path = "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/lan_agent_analysis_client_bundle/summary.json"
+            focus_symbol = "center_x"
+            neighborhood_depth = 2
+            include_dot = $false
+            max_nodes = 60
+            max_edges = 80
+        }
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+
+$response = Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 60
+$content = $response.result.structuredContent
+# status=success
+# artifact_json_path_resolved_from=artifact_summary_path
+# artifact_parser_status=success
+```
+
+### 7.3 
+
+|  |  |
+|---|---|
+| `offset_functions` | CFG N  |
+| `max_functions` | CFG N  |
+| `offset_edges` | DFG/CallGraph/Slice N  |
+| `max_edges` | DFG/CallGraph/Slice N  |
+| `max_nodes` |  N  |
+
+---
+
+## 8. 
+
+### 8.1 
+
+Semantic Grid** Clang **
+
+- ****
+- **** L1-L5 
+- ****`context_bundle` 
+- **** `content_hash` 
+- ****`trace_source`  `section_path` 
+
+### 8.2 
+
+```
+L1_META        1 
+   L2_DOMAIN 1  domain 
+        L3_FLOW  / fragment_type 
+             L4_ATOM   fragment 
+                  L5_RAW   content_text
+```
+
+****
+- `contains`L1L2L3L4L5
+- `source_trace`L4  L5 
+- `sequence` L4 
+
+### 8.3 Fragment 
+
+ fragment 
+
+|  |  |
+|---|---|
+| `fragment_id` | `frag_1`, `frag_2`, ... |
+| `source_file` |  |
+| `source_kind` | `md` / `txt` / `complex_markdown` / `incremental_markdown` |
+| `section_path` | Markdown  ` > ` |
+| `content_hash` | FNV-1a hash |
+| `source_line_start` / `source_line_end` |  |
+| `fragment_type` | `boundary_rule` / `condition_statement` / `action_step` / `term_definition` |
+| `content_text` |  |
+| `keyword_tags` |  |
+
+### 8.4  +  +  + 
+
+```powershell
+# 1. 
+$buildBody = @{
+    jsonrpc = "2.0"
+    id = "sg-build"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_build"
+        arguments = @{
+            source_text = "# `n## `n..."
+            source_kind = "complex_markdown"
+            split_strategy = "markdown"
+            max_fragments = 64
+            domain = "rule_doc"
+            output_dir = "D:/tmp/sg_base"
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$build = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $buildBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# fragment_count=11, node_count=28, edge_count=34
+# layer_distribution: L1_META=1, L2_DOMAIN=1, L3_FLOW=4, L4_ATOM=11, L5_RAW=11
+# artifact_summary_json_path exists
+
+# 2. fuzzy 
+$queryBody = @{
+    jsonrpc = "2.0"
+    id = "sg-query"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_query"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path
+            layer = "L4_ATOM"
+            keyword = "section priority"
+            fuzzy_match = $true
+            limit = 12
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$query = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $queryBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, match_mode=fuzzy, node_count > 0
+# matched_nodes_json exists
+
+# 3. 
+$firstNodeId = ($query.matched_nodes_json | ConvertFrom-Json)[0].node_id
+$traceBody = @{
+    jsonrpc = "2.0"
+    id = "sg-trace"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_trace_source"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path
+            node_id = $firstNodeId
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$trace = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $traceBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, source_fragment_count > 0
+# source_fragments_json contains content_text, section_path, content_hash
+
+# 4. 
+$bundleBody = @{
+    jsonrpc = "2.0"
+    id = "sg-bundle"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_context_bundle"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path
+            task_intent = "  priority source trace"
+            fuzzy_match = $true
+            max_nodes = 12
+            max_chars = 5000
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$bundle = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $bundleBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success, node_count > 0
+# context_bundle_json contains prompt_text
+# context_sections_json contains section_priority, section_weight
+# prompt_sections exists
+```
+
+### 8.5 
+
+```powershell
+#  1 
+$inc1Body = @{
+    jsonrpc = "2.0"
+    id = "sg-inc1"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_incremental_update"
+        arguments = @{
+            artifact_summary_path = $build.artifact_summary_json_path  #  base  summary
+            source_text = "## `n fragment id ..."
+            source_kind = "incremental_markdown"
+            split_strategy = "markdown"
+            max_fragments = 32
+            dedupe_existing = $true
+            output_dir = "D:/tmp/sg_inc1"
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$inc1 = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $inc1Body -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# incoming_fragment_count=4, added_fragment_count=4
+# new_fragment_count=15 (base 11 + new 4)
+# new_node_count=36 (base 28 + delta 8)
+# delta_fragments_json exists, delta_nodes_json exists
+
+# 
+$dupBody = @{
+    jsonrpc = "2.0"
+    id = "sg-dup"
+    method = "tools/call"
+    params = @{
+        name = "lan_agent_semantic_grid_incremental_update"
+        arguments = @{
+            artifact_summary_path = $inc1.artifact_summary_json_path  #  inc1  summary
+            source_text = "## `n fragment id ..."  # 
+            source_kind = "incremental_markdown"
+            split_strategy = "markdown"
+            dedupe_existing = $true
+            output_dir = "D:/tmp/sg_dup"
+        }
+    }
+} | ConvertTo-Json -Depth 16 -Compress
+
+$dup = (Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $dupBody -ContentType "application/json; charset=utf-8" -TimeoutSec 60).result.structuredContent
+# status=success
+# incoming_fragment_count=4, added_fragment_count=0
+# skipped_duplicate_fragment_count=4   
+# new_fragment_count=15 (), new_node_count=36 ()
+```
+
+### 8.6 Artifact 
+
+```
+output_dir/
+ semantic_grid.json       fragments + nodes + edges
+ nodes.json               
+ edges.json               
+ summary.json             artifact_*_path 
+ delta_fragments.json      incremental_update
+ delta_nodes.json          incremental_update
+```
+
+** summary ** `incremental_update`  `artifact_summary_json_path`  `artifact_summary_path` 
+
+### 8.7 
+
+|  |  |  |
+|---|---|---|
+| substring |  |  |
+| fuzzy | `fuzzy_match=true` | token  /  |
+| regex | `regex_match=true` | icase |
+
+****`offset` / `limit` / `has_more` / `next_offset_or_null` / `pagination_status`
+
+---
+
+## 9. Task Memory 
+
+### 9.1 
+
+ RAG
+
+1. ****30+ 
+2. ****/
+3. ****
+
+Task Memory "" MCP  `latest_resume_context.json` 
+
+### 9.2 
+
+ Task Memory  `<data_root>/task_memory/{goal_id}/`
+
+```
+<data_root>/task_memory/{goal_id}/
+ latest_resume_context.json    compact_summary + next_call_json + new_chat_entry_arguments_json
+ step_ledger.jsonl              JSON
+ slices.jsonl                  key slices
+ index_manifest.json           
+ memory_structure.json         structure_manifest 
+ current_state.md               Markdownfreeze 
+ handover.md                    Markdown
+ rag_thread_migration/         RAG 
+    ...
+ budget_runs/                  continuation budget execute_continuation_budget / resume_and_execute 
+    budget-{checksum}.json     budget run record_model=mcp_continuation_budget_run_v1 step_events[]
+ kv_snapshot/                   KV build_kv_snapshot 
+    index.jsonl
+ rocksdb_native/                RocksDB rocksdb_mirror 
+    ...
+ rocksdb_mirror_manifest.json  RocksDB 
+```
+
+### 9.3  bootstrap 
+
+`structure_manifest`  `memory_structure.json`
+
+|  |  |  |
+|---|---|---|
+| **** | `latest_resume_context.json` |  `compact_summary` / `next_call_json` / `remaining_work` / `terminal_state` |
+| **** | `memory_structure.json` |  |
+| **** | `lan_agent_task_memory_rocksdb_lookup`native mirror ready  |  RocksDB  |
+| **** | **`forbidden_by_default`** |  `step_ledger.jsonl` |
+
+### 9.4 
+
+#### 9.4.1 fresh-chat  goal_id 
+
+ goal  freeze  `task_memory/{goal_id}/latest_resume_context.json` **** `resume_context` + `execute_continuation_budget`
+
+```json
+{
+  "name": "lan_agent_task_memory_resume_and_execute",
+  "arguments": { "goal_id": "< goal_id>", "max_steps": 10 }
+}
+```
+
+ `latest_resume_context.json`   bounded continuation budget     `budget_runs/budget-{checksum}.json`
+
+- `continue_required=true`   `required_tool_arguments_json`  `terminal_state=true`
+- `budget_requires_frozen_resume_context=true`   freeze `lan_agent_task_memory_freeze`
+- `terminal_state=true`   `verification_ok=true`  final claim
+
+#### 9.4.2 
+
+**** [TASK_MEMORY_MIGRATION_ACCEPTANCE.md](TASK_MEMORY_MIGRATION_ACCEPTANCE.md)
+
+1. `lan_agent_task_memory_freeze`   `latest_resume_context.json` / `step_ledger.jsonl` / `slices.jsonl` / `index_manifest.json` / `rag_thread_migration/*`
+2. `lan_agent_task_memory_resume_context`  �读（或直接用 9.4.1 的 `resume_and_execute`）
+3. `lan_agent_task_memory_execute_continuation_budget` —— 执行 allowlisted bounded continuation；非终态预算耗尽必须返回 `terminal_state=false` / `completion_claim_allowed=false` / `final_answer_allowed=false`
+4. `lan_agent_task_memory_build_kv_snapshot` —— 构建文件 KV 快照（源真仍是文件对象层）
+5. `lan_agent_task_memory_rocksdb_mirror` —— 镜像 KV 快照到原生 RocksDB（`CODEX_LAN_AGENT_WITH_ROCKSDB=ON` 时）；RocksDB 角色为 `mirror_read_backend`，**不替换源真**
+6. `lan_agent_task_memory_rocksdb_parity_check` —— 原生读路径必须通过 parity check，`safe_to_replace_source_of_truth` 必须保持 `false`
+7. `lan_agent_task_memory_structure_manifest` —— 写 `memory_structure.json`，固化 bootstrap 契约
+
+### 9.5 不可协商不变量
+
+以下不变量在任何场景下都必须保持，违反即视为迁移失败：
+
+| 不变量 | 值 |
+|---|---|
+| `source_of_truth` | `file_object_store` |
+| `write_backend` | `file_object_store` |
+| `native_backend_role` | `mirror_read_backend` |
+| `safe_to_replace_source_of_truth` | `false` |
+| `parity_required_for_native_reads` | `true` |
+| `required_model_read` | `latest_resume_context.json` |
+
+### 9.6 MCP-native 验收（推荐路径）
+
+启动 MCP 服务后，其他 AI 客户端应优先使用 MCP 原生验收工具：
+
+```json
+{
+  "name": "lan_agent_task_memory_migration_acceptance",
+  "arguments": {
+    "max_final_steps": 8
+  }
+}
+```
+
+预期 MCP 返回字段：
+
+```text
+migration_acceptance_status=ACCEPTED
+acceptance_status=complete
+semantic_outcome=TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
+source_of_truth=file_object_store
+active_read_backend=rocksdb_native_mirror
+write_backend=file_object_store
+safe_to_replace_source_of_truth=false
+parity_required_for_native_reads=true
+```
+
+此路径在 MCP 内部运行完整验收链，无需客户端 PowerShell 脚本，是仅通过 MCP 连接的其他 AI 客户端的正确路径。
+
+### 9.7 外部 Smoke 命令（仅 CI/运维用）
+
+PowerShell 脚本仅作为 HTTP MCP 端点和已部署进程的运维/CI smoke 测试：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\run_task_memory_migration_acceptance.ps1
+```
+
+预期终态行：
+
+```text
+TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS
+```
+
+### 9.8 KV 快照键 schema
+
+`build_kv_snapshot` 按以下键 schema 把文件对象索引到 `kv_snapshot/index.jsonl`，与后续 RocksDB 后端一致：
+
+| key 模式 | 含义 |
+|---|---|
+| `goal/{goal_id}` | goal 元信息 |
+| `latest/{goal_id}` | 最新 resume_context 指针 |
+| `trace/{trace_id}/{step_id}` | 单步 trace 记录 |
+| `slice/{slice_id}` | 关键切片记录 |
+| `budget/{budget_run_id}` | continuation budget 运行记录 |
+
+`kv_lookup` / `rocksdb_lookup` 支持显式 `key` 或 `kind` selector（`goal` / `latest` / `resume_context` / `trace` / `trace_step` / `slice` / `budget` / `trace_budget`）。
+
+### 9.9 fresh-chat 一次性续接：`resume_and_execute` 详解
+
+`lan_agent_task_memory_resume_and_execute` 是 fresh-chat 场景下的单一入口工具，把"读 resume context + 跑 continuation budget + 刷新任务记忆"压缩成一次调用，避免新会话手动链式调用 `resume_context` + `execute_continuation_budget`。
+
+#### 参数
+
+| 参数 | 类型 | 必需 | 默认 | 说明 |
+|---|---|---|---|---|
+| `goal_id` | string | 是 | — | 已归档任务的 goal ID |
+| `trace_id` | string | 否 | 继承自 resume_context | 追踪 ID |
+| `max_steps` | integer | 否 | 10 | MCP 续跑步数上限，server policy 上限 64 |
+| `step_budget` | integer | 否 | — | `max_steps` 别名 |
+| `dry_run` | boolean | 否 | `false` | 仅规划预算（区别于 `execute_continuation_budget` 的默认 `true`） |
+| `execute` | boolean | 否 | `true` | 是否真正执行白名单续跑（区别于 `execute_continuation_budget` 的默认 `false`） |
+
+#### 返回字段
+
+| 字段 | 含义 |
+|---|---|
+| `record_model` | `mcp_task_memory_resume_and_execute_response_v1` |
+| `inner_record_model` | 委派的 budget 子结果的 record_model |
+| `resume_execute_entry` | 恒为 `"true"` |
+| `resume_execute_mode` | `read_resume_context_and_execute_budget`（执行）或 `read_resume_context_and_plan_budget`（dry_run） |
+| `max_steps` | 实际生效的步数上限（clamp 到 1~64） |
+| `goal_id` / `trace_id` / `budget_run_id` / `budget_status` | 透传自 budget 子结果 |
+| `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` | 终止与验证字段（透传） |
+| `required_next_action_type` / `required_tool_name` / `required_tool_arguments_json` / `next_call_json` | 仅 `continue_required=true` 分支出现，`required_tool_name` 为本工具自身 |
+| `resume_recovery_status` / `resume_recovery_tool_name` / `resume_recovery_instruction` | 仅 `budget_requires_frozen_resume_context=true` 分支出现，指引先调 `lan_agent_task_memory_freeze` |
+
+#### 三种分支
+
+1. **`continue_required=true`**（非终态预算耗尽）—— 模型按返回的 `required_tool_arguments_json` 再次调用本工具，直到 `terminal_state=true`。**禁止**改写参数或插入其他工具调用。
+2. **`budget_requires_frozen_resume_context=true`**（归档缺失）—— 上一任务未 freeze，先调 `lan_agent_task_memory_freeze` 写入 `latest_resume_context.json`，再回到本工具。
+3. **`terminal_state=true`**（终态）—— 仍需 `verification_ok=true` 才能 final claim；否则按 `next_action` 字段指引修复验证。
+
+#### 产物文件
+
+每次调用写入 `task_memory/{goal_id}/budget_runs/budget-{checksum}.json`，内容为 `record_model=mcp_continuation_budget_run_v1` 的 budget run 记录（含 `step_events[]` 数组、`executed_step_count`、`budget_exhausted`、`blocked`、`block_reason`）。同时每步追加到 `step_ledger.jsonl`，并刷新 `latest_resume_context.json`。
+
+---
+
+## 10. 测试脚本与一键验证
+
+### 10.1 一键脚本 1：模板回归
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_analysis_templates_1_11.ps1
+```
+
+覆盖：`tools/list`、AST、CFG、CallGraph、DFG、Slice、artifact query、分页、path-sensitive metadata。
+
+### 10.2 一键脚本 2：复杂项目分析
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\analysis_client_examples.ps1 `
+  -SourceFile D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo\cximage\FastMatch.cpp `
+  -ProjectRoot D:\Codex-WorkDir\Sean_WorkDir\cxvisionai `
+  -FocusSymbol center_x
+```
+
+覆盖：复杂项目（FastMatch.cpp）完整分析链，DFG/Slice 的 `focus_symbol` 邻域提取、过程间绑定验证。
+
+> **注意**：DFG 对复杂文件可能需要 180-300s，脚本默认超时 180s。如超时，手动以 300s 超时重跑。
+
+### 10.3 手动 MCP 调用模板
+
+```powershell
+function Invoke-McpTool {
+    param([string]$Name, [hashtable]$Arguments, [int]$TimeoutSec = 120)
+    $body = @{
+        jsonrpc = "2.0"
+        id = $Name
+        method = "tools/call"
+        params = @{ name = $Name; arguments = $Arguments }
+    } | ConvertTo-Json -Depth 16 -Compress
+    Invoke-RestMethod -Uri "http://127.0.0.1:18080/mcp" -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec $TimeoutSec
+}
+```
+
+### 10.4 一键脚本 3：语义网格基础 Smoke
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_semantic_grid_smoke.ps1
+```
+
+覆盖：`tools/list`（6 工具注册）、`ingest_text`（解构）、`build`（L1-L5 金字塔）、`query`（fuzzy 查询）、`trace_source`（原文溯源）、`context_bundle`（上下文重构）。
+
+### 10.5 一键脚本 4：复杂文本 + 多轮增量 Smoke
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\run_semantic_grid_complex_incremental_smoke.ps1
+```
+
+覆盖：复杂 markdown 基础构建、增量追加（+4 fragments）、fuzzy 查询、重复增量去重（dedupe）、上下文重构（section_priority）。
+
+### 10.6 一键脚本 5：Task Memory 迁移验收 Smoke
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\scripts\run_task_memory_migration_acceptance.ps1
+```
+
+覆盖：MCP-native 迁移验收链（freeze → continuation budget → kv snapshot → rocksdb mirror → parity check → structure manifest），预期终态行 `TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS`。
+
+> 也可直接通过 MCP 调用 `lan_agent_task_memory_migration_acceptance` 工具完成同等验收（推荐其他 AI 客户端使用此路径）。
+
+---
+
+## 11. 测试结论
+
+### 11.1 环境
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent` |
+| 构建目录 | `AIbuild\Release` |
+| 测试目标文件 | `cximage\FastMatch.cpp`（复杂项目） + `test_simple.cpp`（简单文件） |
+| compile_commands.json | `D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\build\compile_commands.json` |
+
+### 11.2 工具可用性
+
+| 工具 | 状态 | 结论 |
+|---|---|---|
+| `tools/list` | 可用 | 工具总数已注册（含 Clang/语义网格/CMM/Task Memory 等多组） |
+| `lan_agent_run_clang_ast_parser` | 可用 | `status=success`, `compile_db_mode=compile_commands_json` |
+| `lan_agent_build_cfg` | 可用 | `status=success`, 50 函数 / 262 块 / 262 边 |
+| `lan_agent_query_cfg_artifact` | 可用 | `artifact_json_path_resolved_from=artifact_summary_path` |
+| `lan_agent_build_call_graph` | 可用 | 80 节点 / 72 边 / 2427 调用引用 |
+| `lan_agent_query_call_graph_artifact` | 可用 | artifact 二次查询成功 |
+| `lan_agent_build_dfg` | 可用 | `analysis_level=ast_statement_v1`, 177 readwrite refs |
+| `lan_agent_query_dfg_artifact` | 可用 | `artifact_parser_status=success` |
+| `lan_agent_build_program_slice` | 可用 | `slice_precision=ast_statement_def_use_cfg_callgraph_v1` |
+| `lan_agent_query_program_slice_artifact` | 可用 | artifact + source_lines 二次查询成功 |
+| `lan_agent_task_memory_*` (14 工具) | 可用 | freeze/resume/budget/kv/rocksdb/parity/manifest/acceptance/resume_and_execute/selftest 全链通过 |
+
+### 11.3 核心断言结果（Clang 分析工具）
+
+| 断言 | 结果 |
+|---|---|
+| `status=success` | PASS |
+| `compile_db_mode=compile_commands_json` | PASS |
+| `resolved_compile_db_dir` 非空 | PASS |
+| `filtered_to_source_file=true` | PASS |
+| DFG `analysis_level=ast_statement_v1` | PASS |
+| DFG `dfg_precision=ast_statement_def_use_v1` | PASS |
+| DFG `ast_readwrite_ref_count >= 0` | PASS (177) |
+| DFG `interprocedural_binding_status=callsite_argument_return_candidates_available` | PASS |
+| `interprocedural_bindings_json` 可解析 | PASS |
+| binding 包含 `argument_symbols` / `argument_bindings` / `result_symbols` / `callee_return_symbols` | PASS |
+| Slice `analysis_level=ast_statement_v1` | PASS |
+| Slice `slice_precision=ast_statement_def_use_cfg_callgraph_v1` | PASS |
+| `source_lines_json` 可解析 | PASS |
+| `path_sensitive_status=cfg_branch_metadata_available` | PASS |
+| `path_sensitive_precision=cfg_branch_successor_candidate_v1` | PASS |
+| `path_conditions_json` / `control_dependencies_json` / `cyclic_functions_json` 可解析 | PASS |
+| artifact query `artifact_json_path_resolved_from=artifact_summary_path` | PASS |
+| artifact query `artifact_parser_status=success` | PASS |
+
+### 11.4 语义网格测试结果
+
+#### 基础 Smoke (`run_semantic_grid_smoke.ps1`)
+
+| 断言 | 结果 |
+|---|---|
+| 6 个 semantic grid 工具全部注册 | PASS |
+| `ingest_text` fragment_count > 0 | PASS (11 fragments) |
+| `build` node_count > fragment_count | PASS (27 nodes > 11 fragments) |
+| `build` edge_count > 0 | PASS (34 edges) |
+| `build` layer_distribution 包含 L1-L5 | PASS |
+| `query` node_count > 0 | PASS (1 node) |
+| `trace_source` source_fragment_count > 0 | PASS (1 fragment) |
+| `context_bundle` node_count > 0 | PASS (8 nodes) |
+| `context_bundle` 包含 prompt_text | PASS |
+
+#### 复杂增量 Smoke (`run_semantic_grid_complex_incremental_smoke.ps1`)
+
+| 断言 | 结果 |
+|---|---|
+| 基础 build 成功 | PASS (28 nodes, 34 edges) |
+| `semantic_grid_json` 包含 `section_path` | PASS |
+| `semantic_grid_json` 包含 `content_hash` | PASS |
+| `layer_distribution` 包含 L1_META/L2_DOMAIN/L3_FLOW/L4_ATOM/L5_RAW | PASS |
+| 增量追加 added_fragment_count > 0 | PASS (+4 fragments) |
+| 增量追加 new_fragment_count > previous | PASS (15 > 11) |
+| 增量追加 delta_node_count > 0 | PASS (36 > 28, delta=8) |
+| `delta_fragments.json` 存在 | PASS |
+| `delta_nodes.json` 存在 | PASS |
+| fuzzy 查询 match_mode=fuzzy | PASS |
+| fuzzy 查询 node_count > 0 | PASS |
+| 重复增量 added_fragment_count=0 | PASS |
+| 重复增量 skipped_duplicate_fragment_count > 0 | PASS (4) |
+| 重复增量 new_fragment_count 不变 | PASS (15=15) |
+| 重复增量 new_node_count 不变 | PASS (36=36) |
+| `context_bundle` 包含 section_priority | PASS |
+| `prompt_sections` 包含 Semantic Grid Context | PASS |
+| artifact_summary_path 链式传递 | PASS (base→inc1→dup) |
+| artifact 文件全部存在 | PASS |
+
+### 11.5 Task Memory 迁移验收结果
+
+| 断言 | 结果 |
+|---|---|
+| 12 个 task_memory 工具全部注册 | PASS |
+| `freeze` 写入 `latest_resume_context.json` | PASS |
+| `freeze` 追加 `step_ledger.jsonl` | PASS |
+| `resume_context` 返回 compact_summary + next_call_json | PASS |
+| `execute_continuation_budget` (dry_run) 写入预算计划 | PASS |
+| `build_kv_snapshot` 生成 `kv_snapshot/index.jsonl` | PASS |
+| `kv_lookup` 按 `kind=latest` 命中 | PASS |
+| `rocksdb_mirror` 写入 `rocksdb_mirror_manifest.json` | PASS |
+| `rocksdb_lookup` 按 selector 命中 | PASS |
+| `rocksdb_parity_check` 返回 `parity_status=pass` | PASS |
+| `structure_manifest` 写入 `memory_structure.json` | PASS |
+| `migration_acceptance` 返回 `migration_acceptance_status=ACCEPTED` | PASS |
+| `source_of_truth=file_object_store` 全程保持 | PASS |
+| `safe_to_replace_source_of_truth=false` 全程保持 | PASS |
+| `parity_required_for_native_reads=true` 全程保持 | PASS |
+| 外部 Smoke 脚本终态行 `TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS` | PASS |
+
+### 11.6 已知限制
+
+| 限制 | 详情 | 规避 |
+|---|---|---|
+| DFG 复杂文件耗时 | FastMatch.cpp DFG build 需 180-300s | 设置 `TimeoutSec=300` |
+| 端口占用 | 旧进程残留导致新实例启动失败 | 启动前 `Stop-Process` |
+| compile_commands.json 依赖 | 无编译数据库时复杂文件解析失败 | 确保 `project_root` 指向含 `build/compile_commands.json` 的目录 |
+| RocksDB 镜像可选 | 默认构建不含 RocksDB 后端 | 编译时加 `-DCODEX_LAN_AGENT_WITH_ROCKSDB=ON` |
+| Task Memory 文件增长 | 长任务 `step_ledger.jsonl` 持续增长 | 按 `goal_id` 归档，必要时 `freeze` 后清理旧 trace |
+
+### 11.7 最终状态
+
+**[Verified]** — MCP 工具链可用于复杂项目分析，全部核心断言通过。
+
+**[Verified]** — 语义网格工具链支持复杂文本解构、L1-L5 语义金字塔构建、fuzzy/regex 查询、原文溯源、上下文重构、多轮增量追加与 content_hash 去重，全部断言通过。
+
+**[Verified]** — Task Memory 工具链支持长任务状态冻结、跨模型 resume、bounded continuation budget、文件 KV 快照、RocksDB 镜像、parity check 一致性校验、structure manifest 契约固化、一站式 migration acceptance，全部不变量保持，验收终态 `TASK_MEMORY_MIGRATION_ACCEPTANCE_PASS`。
+
+---
+
+## 12. CMM 工具状态
+
+CMM 工具通过 `codex_lan_agent` 桥接 `codebase-memory-mcp` 服务，已在 MCP 工具列表中注册。使用前需确保：
+1. `codebase-memory-mcp` 服务已独立运行。
+2. 目标项目已通过 `lan_agent_cmm_index_repository` 完成索引。
+
+CMM 工具状态：`[Implemented]` — Schema 已注册，依赖外部 CMM 服务实际可用性。
+
+---
+
+## 13. Clang 分析工具 vs CMM 工具功能对比
+
+### 13.1 核心差异
+
+| 维度 | Clang 分析工具 (L0-L6) | CMM 工具 (`lan_agent_cmm_*`) |
+|---|---|---|
+| **数据时效** | 实时解析源文件 | 基于预建索引（需先 `index_repository`） |
+| **分析深度** | AST statement-level（语句级） | 图节点/关系级（函数、类、文件级） |
+| **适用范围** | 单文件级（`source_file`） | 整个项目级（`project`/`repo`） |
+| **底层引擎** | Clang/LLVM AST | codebase-memory-mcp 图数据库 |
+| **典型耗时** | 简单文件 1-5s，复杂文件 180-300s | 毫秒级（索引已建） |
+
+### 13.2 功能对照表
+
+| 功能需求 | Clang 工具 | CMM 工具 | 说明 |
+|---|---|---|---|
+| **工具/项目发现** | `tools/list` (L0) | `cmm_list_projects` | 发现可用工具 vs 发现已索引项目 |
+| **AST 解析** | `run_clang_ast_parser` (L1) | — | Clang 独有：函数列表、类结构、调用引用 |
+| **控制流图 (CFG)** | `build_cfg` (L2) | — | Clang 独有：基本块、分支边、圈复杂度 |
+| **调用图** | `build_call_graph` (L3) | `cmm_search_graph` / `cmm_trace_path` | Clang 实时单文件；CMM 项目级预建图 |
+| **数据流图 (DFG)** | `build_dfg` (L4) | — | Clang 独有：def/use 边、过程间绑定 |
+| **程序切片** | `build_program_slice` (L5) | — | Clang 独有：backward/forward 符号级切片 |
+| **Path-sensitive 元数据** | `build_dfg/slice` + `include_path_metadata` | — | Clang 独有：CFG 分支条件、控制依赖 |
+| **代码搜索** | — | `cmm_search_code` | CMM 独有：文本/正则搜索、文件过滤 |
+| **图查询** | — | `cmm_query_graph` | CMM 独有：Cypher-like 图查询 |
+| **路径追踪** | — | `cmm_trace_path` | CMM 独有：调用链/依赖链追踪 |
+| **代码片段获取** | — | `cmm_get_code_snippet` | CMM 独有：按 qualified_name 定位代码 |
+| **架构分析** | — | `cmm_get_architecture` | CMM 独有：模块依赖、分层分析 |
+| **变更检测** | — | `cmm_detect_changes` | CMM 独有：对比分支差异 |
+| **索引管理** | — | `cmm_index_repository` / `cmm_delete_project` | CMM 独有：项目索引生命周期 |
+| **Artifact 二次查询** | `query_*_artifact` (L6) | — | Clang 独有：分页/聚焦查询无需重跑 |
+
+### 13.3 使用场景对比
+
+| 场景 | 推荐工具 | 原因 |
+|---|---|---|
+| 分析单个函数的控制流 | `build_cfg` (L2) | AST 级精确 CFG，含基本块和分支 |
+| 分析变量 `center_x` 的数据流 | `build_dfg` (L4) | statement-level def/use |
+|  | `build_program_slice` (L5) |  backward/forward  |
+|  `learn()` | `cmm_search_graph` / `cmm_trace_path` |  |
+|  TODO/FIXME | `cmm_search_code` |  |
+|  | `cmm_get_architecture` |  |
+|  | `cmm_detect_changes` |  git diff +  |
+|  | `query_*_artifact` (L6) |  Clang |
+
+### 13.4 
+
+```
+
+
+1. CMM
+   cmm_search_code(query="center_x")  
+
+2. Clang
+   build_dfg(source_file=FastMatch.cpp, focus_symbol="center_x")
+    
+
+3. Artifact Query
+   query_dfg_artifact(artifact_summary_path=...)
+    
+```
+
+****CMM ****Clang ****
+
+---
+
+## 14. 
+
+### 14.1  / 
+
+```
+Could not establish connection
+```
+
+**** 18080 
+
+****
+```powershell
+Get-Process codex_lan_agent -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 1
+# 
+```
+
+### 14.2  tools/list 
+
+**** schema  `McpProtocolOperations.h`  `BuildMcpToolsListResponse` 
+
+**** [src/McpProtocolOperations.h](src/McpProtocolOperations.h)  schema 
+
+### 14.3 
+
+****`compile_commands.json` 
+
+****
+1.  `project_root` 
+2.  `<project_root>/build/compile_commands.json` 
+3.  CMake `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`
+
+### 14.4 DFG/Slice 
+
+**** 300s `max_nodes` / `max_edges` / `max_interprocedural_bindings`
+
+### 14.5 MinGW 
+
+ MSVC MinGW
+
+```powershell
+cmake -B AIbuild -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+cmake --build AIbuild
+```
+
+> MinGW  Clang Tooling  MSVC
+
+### 14.6 
+
+****`dedupe_existing`  `true` `artifact_summary_path` 
+
+****
+1.  `dedupe_existing=true` true
+2.  `artifact_summary_path`  `incremental_update`  `artifact_summary_json_path`
+3.  `summary.json`  `artifact_semantic_grid_json_path` 
+
+### 14.7  query 
+
+****keyword  layer 
+
+****
+1.  `fuzzy_match=true` 
+2.  `layer` 
+3.  `regex_match=true` 
+
+### 14.8 Task Memory resume_context 
+
+****`goal_id`  goal  `task_memory_freeze`
+
+****
+1.  `goal_id`  `freeze`  `[A-Za-z0-9._-]` `_`
+2.  `lan_agent_task_memory_freeze(goal_id=...)` 
+3.  `<data_root>/task_memory/{goal_id}/latest_resume_context.json` 
+
+### 14.9 RocksDB 
+
+**** `-DCODEX_LAN_AGENT_WITH_ROCKSDB=ON`  `rocksdb_mirror` 
+
+****
+1. `cmake -B AIbuild -DCODEX_LAN_AGENT_WITH_ROCKSDB=ON`
+2.  `build_kv_snapshot`  `rocksdb_mirror`
+3.  `rocksdb_mirror_manifest.json` 
+4. RocksDB  `kv_lookup` 
+
+### 14.10 parity_check 
+
+**** KV  RocksDB  `rocksdb_mirror` 
+
+****
+1.  `build_kv_snapshot`  KV
+2.  `rocksdb_mirror`  RocksDB
+3.  `rocksdb_parity_check` `parity_status=pass`
+4. ****""  `safe_to_replace_source_of_truth`  `false`
+
+
+---
+
+## 15. 89  811
+
+>  2026-08-09  2026-08-11  4 " MCP ""AI Agent "
+
+### 15.1 
+
+ 4 ****" MCP "** AI Agent **
+
+|  | 89 | 811 |  |
+|---|---|---|---|
+| MCP  | 135  |  + 134  | **** |
+| Task Memory | 12  | 14  | **** |
+| CLIPS  |  |  MCP  | **** |
+|  |  | /// | **** |
+| CI/CD |  |  Release  | **** |
+|  |  |  | **** |
+
+### 15.2 MCP 
+
+#### 15.2.1 
+
+`McpProtocolOperations.h`  `UseFullMcpToolSurface()` 
+
+```cpp
+//  false lan_agent_mcp_route
+//  CODEX_LAN_AGENT_MCP_TOOL_SURFACE=full/all/legacy/153 
+```
+
+****`lan_agent_mcp_route`
+
+- `mode=overview`
+- `mode=route` `tool_use_decision` / `current_tool_chain_node` / `required_tool_name` / `required_tool_arguments_json`
+- `mode=call` MCP 
+
+#### 15.2.2 
+
+" 135 "" + "
+
+- **** 134  schema
+- **** CLIPS 
+- ****
+- ****`terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok` 
+
+### 15.3 Task Memory 
+
+#### 15.3.1 `lan_agent_task_memory_resume_and_execute` 13 
+
+****
+
+```
+
+   latest_resume_context   bounded continuation budget   task memory
+    terminal verification fields  next action
+```
+
+
+
+-  `dry_run=false` / `execute=true` `dry_run=true` 
+-  freeze  budget  kv  mirror 
+-  `goal_id` 
+- ""
+
+#### 15.3.2 `lan_agent_task_memory_new_chat_round_selftest` 14 
+
+ MCP-owned continuation semantics
+
+-  MCP round manifest
+- freeze 
+-  `resume_and_execute`  goal_id-only 
+-  bounded step
+-  `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `verification_ok`
+- ****`chat_context_reset_acknowledged`  false 
+
+#### 15.3.3 Task Memory 
+
+```
+89freeze  resume  budget  kv_snapshot  rocksdb_mirror  parity  manifest  acceptance
+         8 
+
+811resume_and_execute(goal_id)  
+          goal_id MCP 
+```
+
+### 15.4 CLIPS 
+
+ CLIPS "" README  MCP 
+
+|  |  |
+|---|---|
+| `lan_agent_clips_decide` |  MCP request/result facts allow/block/route + verified/not_verified +  |
+| `lan_agent_clips_chain_template` |  CLIPS `mcp_tool_chain`  pre-call/post-result  |
+| `lan_agent_rag_clips_meta` |  `/rag/clips/meta` fact_bundle + serialized_assertions |
+| `lan_agent_rag_clips_run` |  `/rag/clips/run` request_id/trace_id/query_id +  |
+
+****CLIPS ""**** CLIPS CLIPS fact 5 49  defrulesalience  [ 16 ](#16-clips-)
+
+### 15.5 
+
+#### 15.5.1 
+
+
+
+**/**
+
+- `lan_agent_configure_project`CMake 
+- `lan_agent_build_target` preflight_ref
+- `lan_agent_run_ctest_target` CTest
+- `lan_agent_preflight_build_target` / `preflight_run_ctest_target`
+- `lan_agent_discover_ctest_tests`CTest 
+- `lan_agent_prepare_build_dir` / `check_build_dir`
+
+****
+
+- `lan_agent_write_text_file`//
+- `lan_agent_preview_patch`
+- `lan_agent_apply_single_file_patch` / `apply_diff_patch`
+- `lan_agent_verify_single_file_patch`hash + /
+- `lan_agent_revert_single_file_patch`
+- `lan_agent_format_code_file`clang-format  dry_run
+- `lan_agent_ensure_directory`
+
+****
+
+-  patch /
+-  `scan_text_ranges(max_ranges_per_call=1)`  `prepare_edit_windows(max_windows_per_call=1)`  
+- preview  apply  verify  revert patch_id 
+
+#### 15.5.2 /RAG 
+
+- `lan_agent_run_local_chat` / `enqueue_local_chat`
+- `lan_agent_run_rag_flow` / `enqueue_rag_flow`RAG 
+- `lan_agent_ventriloquist_reply` AI  direct_answer/evidence/next_action/confidence
+- `lan_agent_remote_session_new_turn` / `append_turn`llama.cpp 
+- `llama.observer_smoke` CODEX  local MCP  local llama.cpp 
+
+### 15.6 CI/CD 
+
+#### 15.6.1 
+
+```
+Layer 1  LLVM/Clang 18.1.8 toolchain
+    llvmorg-18.1.8 
+   X86 target only tests/examples/benchmarks/docs/tools
+    key: llvm-18.1.8-static-flat-msvc-ninja-v3
+    LLVM //
+   save-always: 
+
+Layer 2  codex_lan_agent 
+    flat LLVM_ROOT {include, lib}
+    codex_lan_agent LLVM 
+    CODEX_LAN_AGENT_ENABLE_CLANG_AST=ON
+    CODEX_LAN_AGENT_WITH_ROCKSDB=ON
+```
+
+#### 15.6.2  RocksDB 11.0.4 
+
+-  key`rocksdb-11.0.4-static-msvc-md-v1`
+-  release tarball snappy/lz4/zlib/zstd/bzip2/tbb
+- `/MD` CRT 
+- Release  RocksDB`task_memory_rocksdb_mirror/lookup/parity_check` 
+
+#### 15.6.3 
+
+- ** vendor **LLVM  RocksDB 
+- Release ZIP  `codex_lan_agent.exe` + config + README `.lib`/`.dll`
+- `.gitignore`  `CMakeLists.txt` / `src/**` / `.github/workflows/**`
+-  `*.exe *.dll *.lib *.obj *.o *.a` /  /  / `third_party/` / `vendor/`
+
+### 15.7 
+
+
+
+|  |  |
+|---|---|
+| `semantic_action_map` |  |
+| `semantic_action_resolve` |    |
+| `semantic_action_validate` |  |
+| `semantic_action_prepare` | resolve + validate  |
+| `semantic_action_tool_call` |  MCP tools/call JSON  |
+| `lan_agent_execute_semantic_action` |  task_id/result_ref/evidence_ref |
+
+ `intent_dispatch_prepare` MCP  legacy fallback
+
+### 15.8  research-mcp 
+
+""
+
+|  | research-mcp | codex-lan-agent |
+|---|---|---|
+|  | MCP over HTTP/stdio | MCP over Streamable HTTP +  |
+|  | L1/L2/L3  |  + 134  + CLIPS  |
+| / | SQLite  |  + RocksDB  + parity check |
+|  |  +  |  + RocksDB  + parity check |
+| / | Entity Mapper +  | Semantic Grid + dialog_slice + task_memory |
+| CI/CD | GitHub Actions  |  Release  |
+|  |  | CLIPS  |
+|  |  |  + // |
+
+****
+
+1. `resume_and_execute`  research-mcp 
+2. CLIPS 
+3.  +  research-mcp 
+4.  CI  research-mcp  Release 
+
+### 15.9 
+
+#### 15.9.1 
+
+- `TaskMemoryOperations.h`  `D:/Codex-WorkDir/Sean_WorkDir/llama.cpp-b8851/...`
+- Windows WinHTTP + MSVC + WebView2
+- DFG  180-300s
+
+#### 15.9.2 
+
+1. **** 135 
+2. ****
+3. **CLIPS **`clips_rules/`  8  `.clp` 5 49  defrule  16 ""
+4. ****//
+5. **README ** 4.0 "135 "�工具表与 `McpProtocolOperations.h` 实际注册一致；新增/删除工具时必须同步更新 4.0 节合计（原"滞后风险"已缓解）
+
+### 15.10 结论
+
+#### 15.10.1 演进判断
+
+`codex-lan-agent` 正在从**"代码理解基础设施"**快速演变为**"AI Agent 本地操作系统"**。
+
+核心标志：
+
+- **工具表面收敛**：135 扁平 → 单网关路由，模型认知负担降低
+- **执行闭环形成**：分析 → 决策（CLIPS）→ 执行（构建/测试/编辑）→ 验证 → 记忆（Task Memory）
+- **长任务自动化**：`resume_and_execute` 一键续接，模型无需理解内部链路
+- **工程化成熟**：两层缓存 CI，纯网络构建，Release 可直接下载使用
+
+#### 15.10.2 最有价值的三个变化
+
+1. **`resume_and_execute`**：把 Task Memory 从"多步手动编排"简化为"一键自动续接"，这是长任务记忆从概念验证到实用化的关键一步
+2. **网关路由模式**：单入口 + 隐藏内部工具 + CLIPS 决策校验，这是 AI Agent 工具调用从"模型自由选择"到"受控决策执行"的架构范式转变
+3. **两层缓存 CI**：LLVM 工具链与业务构建解耦，业务源码变化不触发 LLVM 重编译，Release 构建时间从 ~2 小时降到 ~分钟级
+
+
+---
+
+## 16. CLIPS 规则体系详解
+
+CLIPS 专家系统是 codex-lan-agent 的**工具调用决策层**——所有 MCP 工具调用（在完整工具表面模式下）都会经过 CLIPS 规则引擎做 pre-call allow/block/route 决策和 post-result 验证，确保模型不会绕过安全约束声明任务完成。规则源码全部位于 [src/clips_rules/](src/clips_rules/)，共 8 个 `.clp` 文件、5 个规则域、49 条 `defrule`、8 个 `deftemplate`。
+
+### 16.1 目录结构
+
+```
+src/clips_rules/
+├── templates/
+│   ├── mcp_fact_templates.clp      ← 核心 fact 模板（5 个 deftemplate）
+│   └── cmm_fact_templates.clp      ← CMM 扩展 fact 模板（3 个 deftemplate）
+├── rules/
+│   ├── mcp_tool_guard.clp          ← MCP pre-call allow/block/route（13 条 defrule）
+│   ├── mcp_result_guard.clp        ← MCP post-result 验证（16 条 defrule）
+│   ├── cmm_init_guard.clp          ← CMM 初始化与搜索工作流守卫（15 条 defrule）
+│   ├── cxparser_preflight_guard.clp ← cxparser 驱动的 build/test 预检（2 条 defrule）
+│   └── slice_ingest_guard.clp      ← slice 入库质量/去重（3 条 defrule）
+├─ graphs/
+    cmm_init_flow.clp            CMM 7  defrule
+    mcp_guard_flow.clp           slice-node  guard 
+ profiles/
+     default_guard_profile.clp    guard profile 
+```
+
+### 16.2 Fact deftemplate
+
+CLIPS pattern matching fact  [templates/mcp_fact_templates.clp](src/clips_rules/templates/mcp_fact_templates.clp)
+
+| deftemplate |  |  slot |
+|---|---|---|
+| `mcp_tool_request` |  factpre-call  | `tool_name` / `primary_intent` / `file_path` / `probe_ready` / `explicit_user_intent` / `single_step_required` / `max_items_per_call` / `requires_revert_plan` |
+| `mcp_tool_result` |  factpost-result  | `tool_name` / `terminal_state` / `completion_claim_allowed` / `final_answer_allowed` / `has_more` / `continue_required` / `analysis_allowed` / `batch_completion` / `result_hash` / `schema_version` / `ai_conclusion_valid` / `result_ref` / `evidence_ref` |
+| `mcp_tool_chain` |  fact | `chain_phase`pre_call / post_result/ `request_type`file_mutation / analysis_review / generic_mcp_tool/ `risk` / `safety_class` / `execution_class` |
+| `slice_ingest_fact` |  fact | `dedup_status` / `canonical_slice_id` / `dup_of` |
+| `cxparser_fact` | cxparser  fact | `parse_status` / `symbol_status` / `target_status` / `preflight_status` |
+| `clips_decision` | ** fact** assert  | `domain` / `target` / `decision`allow / block / route/ `verification`verified / not_verified/ `reason_code` / `next_action` / `route_target` / `matched_rule` |
+
+CMM  fact[templates/cmm_fact_templates.clp](src/clips_rules/templates/cmm_fact_templates.clp)`cmm_project_state` / `cmm_search_request` / `cmm_workflow_stage`
+
+### 16.3  1`mcp_tool_guard`pre-call allow/block/route
+
+[rules/mcp_tool_guard.clp](src/clips_rules/rules/mcp_tool_guard.clp)13  defrule**** `mcp_tool_request` fact salience  `clips_decision`
+
+####  block 
+
+|  | salience |  | reason_code |
+|---|---|---|---|
+| `block-single-file-patch-apply-without-explicit-intent` | 89 | apply/revert patch  `explicit_user_intent=false` | `missing_patch_intent` |
+| `block-stepwise-file-tool-multi-item-request` | 88 | `single_step_required=true`  `max_items_per_call1` | `multi_item_file_step_not_allowed` |
+| `block-broad-file-mutation-for-stepwise-editing-intent` | 88 | write/patch  + `primary_intent=comment_cleanup/text_cleaning/localized_edit/...` | `bulk_file_mutation_not_allowed_for_stepwise_edit` |
+| `block-multi-file-patch-in-phase1` | 87 | patch  `file_count1` | `multi_file_patch_not_allowed_phase1` |
+| `block-single-file-patch-without-revert-plan` | 86 | apply/revert patch `revert_plan_ready=false` | `missing_patch_revert_plan` |
+| `block-high-risk-write-without-path` | 85 | `file_mutation`  + `file_path=""` | `missing_file_path` |
+
+####  route 
+
+|  | salience |  | route_target |
+|---|---|---|---|
+| `route-code-format-cleanup-to-clang-format` | 85 |  + `primary_intent=code_format` | `lan_agent_format_code_file` |
+| `route-file-text-operations-to-probe-first` | 84 |  + `probe_required=true` + `probe_ready=false` | `lan_agent_probe_text_file` |
+| `route-read-text-file-to-window-delete-for-comment-cleanup` | 84 | `read_text_file` + `primary_intent=comment_cleanup/remove_comments//...` | `lan_agent_delete_text_range_window_atomic` |
+| `route-comment-cleanup-scaffold-to-window-delete` | 83 | `scan_text_ranges`/`prepare_edit_windows` +  | `lan_agent_delete_text_range_window_atomic` |
+| `route-read-text-file-to-range-scan-for-editing-intent` | 82 | `read_text_file` + `primary_intent=text_cleaning/localized_edit/source_edit_planning` | `lan_agent_scan_text_ranges` |
+
+#### 
+
+|  | salience |  |
+|---|---|---|
+| `allow-single-file-patch-preview` | 80 | preview patch allow |
+| `default-mcp-tool-allow` | -100 |  allow + verified |
+
+### 16.4  2`mcp_result_guard`post-result 
+
+[rules/mcp_result_guard.clp](src/clips_rules/rules/mcp_result_guard.clp)16  defrule `mcp_tool_result` fact
+
+#### 
+
+|  | salience |  |  |
+|---|---|---|---|
+| `text-range-delete-result-still-pending-by-has-more` | 49 | delete  `has_more=true` | route`verification=not_verified` |
+| `text-range-delete-result-still-pending-by-continuation` | 48 | delete  `continue_required=true` | route |
+| `directory-batch-read-still-pending` | 48 | `analysis_allowed=false` + `batch_completion=incomplete` | route |
+| `non-terminal-result-forbids-final-answer` | 47 | `terminal_state=false` + `completion_claim_allowed=false` | route final answer |
+| `final-answer-disallowed-by-result` | 46 | `final_answer_allowed=false` | route final answer |
+
+> **** `terminal_state=true` + `completion_claim_allowed=true` + `final_answer_allowed=true` + `verification_ok=true` ****CLIPS  post-result 
+
+#### 
+
+|  | salience |  | reason_code |
+|---|---|---|---|
+| `invalid-direct-answer-json-fragment` | 50 | local_chat/ventriloquist `direct_answer="{"` | `bad_direct_answer_fragment` |
+| `invalid-direct-answer-empty` | 45 | `direct_answer=""` | `empty_direct_answer` |
+| `invalid-direct-answer-label-token` | 44 | `direct_answer="direct_answer"` | `bad_direct_answer_label_token` |
+| `analysis-only-chat-claimed-execution-without-evidence` | 41 | `ai_conclusion_valid=false` + `result_ref/evidence_ref/task_id`  | `analysis_only_execution_claim_without_evidence` |
+| `execution-task-result-missing-traceable-ref` | 39 | execute  + `task_id/result_ref/evidence_ref/log_path`  | `execution_result_missing_traceable_ref` |
+| `audited-write-result-missing-proof` | 38 | file_mutation +  | `write_result_missing_audit_ref` |
+| `invalid-result-missing-hash` | 35 | `result_hash=""` | `result_hash_missing` |
+| `invalid-result-missing-schema` | 34 | `schema_version=""` | `schema_version_missing` |
+| `incomplete-read-result-requires-continuation` | 33 | read/list/run_cxparser `task_completion=incomplete` | `read_chain_incomplete` |
+| `invalid-ai-conclusion-flag` | 40 | `ai_conclusion_valid=false` | `ai_conclusion_invalid` |
+| `default-mcp-result-verified` | -100 |  allow + verified |
+
+### 16.5  3`cmm_init_guard`CMM 
+
+[rules/cmm_init_guard.clp](src/clips_rules/rules/cmm_init_guard.clp)15  defrule CMM ""
+
+#### 
+
+- **`block-cmm-search-before-ensure-indexed`**salience 95 search/query/trace/get_architectureroute  `lan_agent_cmm_index_status`
+- **`route-cmm-ensure-indexed-as-first-step`**salience 93`probe_ready=false`  `index_status`
+- **`block-cmm-search-without-project-parameter`**salience 94 `normalized_project`  `search_code`
+- **`allow-cmm-search-on-verified-project`**salience 85
+- **`handle-cmm-project-not-found-error`**salience 75 route  `list_projects` + `index_repository`
+- **`block-cmm-delete-project-without-intent`**salience 88 `primary_intent=reindex_preparation`
+
+#### CMM [graphs/cmm_init_flow.clp](src/clips_rules/graphs/cmm_init_flow.clp)
+
+```
+init  validate  (indexed?)  ready  search  analyze
+                 (not indexed)                (error)
+              index  validate              error  init (retry)
+```
+
+7  defrule  `cmm_state_machine`  `required_tool` / `guard_condition` / `action`
+
+### 16.6  4`cxparser_preflight_guard`build/test 
+
+[rules/cxparser_preflight_guard.clp](src/clips_rules/rules/cxparser_preflight_guard.clp)2  defrule
+
+- **`block-build-without-preflight`**salience 70`build_target`/`run_ctest_target`  `preflight_status=missing/false/blocked`  block `preflight_build_target`/`preflight_run_ctest_target`  `preflight_ref`
+- **`default-preflight-allow`**salience -100
+
+### 16.7  5`slice_ingest_guard`slice 
+
+[rules/slice_ingest_guard.clp](src/clips_rules/rules/slice_ingest_guard.clp)3  defrule
+
+- **`duplicate-slice-route-canonical`**salience 60`dedup_status=duplicate` +  `canonical_slice_id`  route  canonical slice 
+- **`duplicate-slice-block-status`**salience 55`dedup_status=duplicate`  canonical  block
+- **`default-slice-ingest-allow`**salience -100
+
+### 16.8 CLIPS 
+
+CLIPS  4  MCP  4.x 
+
+| MCP  |  |  |
+|---|---|---|
+| `lan_agent_clips_decide` | / |  5  `domain`  |
+| `lan_agent_clips_chain_template` |  | `mcp_tool_chain` fact  |
+| `lan_agent_rag_clips_meta` |  RAG  |  `/rag/clips/meta` |
+| `lan_agent_rag_clips_run` |  RAG  |  `/rag/clips/run` |
+
+### 16.9 
+
+CLIPS  salience salience 
+
+```
+salience 95  cmm_init_guard block
+salience 89-85  mcp_tool_guard block/route 
+salience 84-80  mcp_tool_guard route 
+salience 70  cxparser_preflight_guard block
+salience 60-55  slice_ingest_guard 
+salience 50-33  mcp_result_guard 
+salience -100   default-allow 
+```
+
+> ****block  salience > route  > default-allow fact  salience `default-*-allow`salience -100fail-open
+
+### 16.10 
+
+ CLIPS 
+
+1.  `.clp`  `defrule` `<action>-<target>-<condition>`
+2.  salienceblock  85-95route  80-84 33-50default -100
+3.  `assert`  `clips_decision` fact `domain` / `target` / `decision` / `verification` / `reason_code` / `next_action` / `matched_rule` 
+4.  fact slot [templates/mcp_fact_templates.clp](src/clips_rules/templates/mcp_fact_templates.clp)  `deftemplate`  slot `"false"`  `""`
+5. C++  `McpToolDispatch.h`  `ClipsDecisionOperations.h`  fact  slot
+6. 
+
+> ****CLIPS  MCP  C++ `BuildClipsDecisionResult`  `src/clips_rules/` `.clp` 
+---
+
+## 17. Fact-Factory LLM  CLIPS 
+
+### 17.1 
+
+Fact-Factory  LLM  Myrmidon/CLIPS **** slot  CLIPS fact 
+
+```
+LLM  JSON  slot 
+        
+0 C++ NLP 
+        
+1CppJieba 
+        
+2marisa-trie
+        
+3WordNet +  cilin_ext.txt
+        
+ tag  + is_dirty  + 
+        
+ CLIPS 
+```
+
+### 17.2 
+
+|  |  |
+|---|---|
+| **** | `is_dirty=true` fact  CLIPS |
+| **** |  tag  dirty CLIPS  |
+| ** slot** |  SQLite + UUID slot  |
+| **/Python/Java** |  +  |
+
+### 17.3 
+
+#### 0ByteSanitizer
+
+- ****[src/fact_factory/ByteSanitizer.h](src/fact_factory/ByteSanitizer.h)
+- ** C++  NLP **
+- **C-CLIPS  segfault **
+
+
+
+|  |  |
+|---|---|
+|  | slot  32 `is_dirty=true` |
+|  |  `\0` |
+|  |  ASCII 0-31  |
+| CLIPS  |  `" ( ) ;`  |
+| UTF-8  |  UTF-8  `is_dirty=true` overlong encoding  |
+
+ API
+
+```cpp
+struct ByteSanitizerConfig {
+    uint32_t max_field_bytes = 32;
+    bool escape_clips_syntax = true;
+    bool strip_control_chars = true;
+    bool validate_utf8 = true;
+};
+
+struct ByteSanitizerResult {
+    std::string sanitized;
+    bool is_dirty = false;
+    std::string reason;
+};
+
+ByteSanitizerResult SanitizeSlotValue(std::string_view raw, const ByteSanitizerConfig & config);
+```
+
+#### 1CppJieba
+
+- ****[src/fact_factory/JiebaTokenizer.h](src/fact_factory/JiebaTokenizer.h)
+- ****[cppjieba](cppjieba/)clone  `https://github.com/Sean-Cai-X/cppjieba`
+- **** HMM 
+- ****`#undef CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE` ClipsDecisionOperations.h  `extern "C"`  CppJieba  `using std::xxx` 
+
+>  `FactFactoryIntegration.cpp`  `CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE`  `extern "C"`  include CppJieba
+
+#### 2marisa-trie
+
+- ****[src/fact_factory/BusinessTrieMatcher.h](src/fact_factory/BusinessTrieMatcher.h)
+- ****marisa-trie `grimoire.cc` Rime 
+- ****1
+
+#### 3SemanticNormalizer
+
+- ****[src/fact_factory/SemanticNormalizer.h](src/fact_factory/SemanticNormalizer.h)
+- ****[src/fact_factory/resources/cilin_ext.txt](src/fact_factory/resources/cilin_ext.txt)892,620 
+  -  HanLP v1.8.6 `data/dictionary/synonym/CoreSynonym.txt`
+  - `=` `Aa01A01=    `
+  - ** HanLP Java/Python **
+- ****WordNet C++ 
+- ****[src/fact_factory/resources/business_supplement.txt](src/fact_factory/resources/business_supplement.txt)
+- ****[src/fact_factory/resources/business_dict.utf8](src/fact_factory/resources/business_dict.utf8)
+
+
+
+1. 
+2. ** 40  tag** CLIPS
+3.  `is_dirty=true` CLIPS 
+4.  `business_supplement.txt` 
+
+### 17.4  Tag 40 
+
+- ****[src/fact_factory/BusinessTagRegistry.h](src/fact_factory/BusinessTagRegistry.h)
+
+|  |  |  tag |
+|---|---|---|
+| Intent | 10 | `comment_cleanup`, `code_format`, `source_edit`, `code_search`, `refactor_file` |
+| RequestType | 8 | `analysis_review`, `read_observe`, `file_mutation`, `execution_task`, `clips_control` |
+| SafetyRisk/ | 4 | `write_audited`, `read_only`, `low`, `high` |
+| Decision | 3 | `allow`, `block`, `route` |
+| Verification | 3 | `verified`, `not_verified`, `invalid` |
+| ExecutionClass | 3 | `read`, `write`, `execute` |
+| ActionVerb | 9 | `probe`, `scan`, `delete`, `insert`, `replace`, `build`, `test` |
+
+ tag `ResolveBusinessTag()` 
+
+### 17.5 
+
+ `inline`  [src/ClipsDecisionOperations.h](src/ClipsDecisionOperations.h) 
+
+|  |  |  |
+|---|---|---|
+| `ApplyFactFactoryNormalizePrimaryIntent(raw_intent)` | primary_intent  | ByteSanitizer  BusinessTagRegistry    |
+| `ApplyFactFactoryByteSanitizeSlot(raw_value, is_token_slot)` | slot  | ByteSanitizertoken slot 64  /  slot 256  |
+
+### 17.6 Pending Continuation 
+
+****`SemanticIntentLexiconEntry`  `std::initializer_list<const char*>`  dangling  CLIPS pending continuation `pending_continuation_active=true` + `pending_required_arguments_json`  segfault 
+
+****
+1.  `std::initializer_list<const char*>`  `std::vector<const char*>`[src/SemanticIntentLexicon.h](src/SemanticIntentLexicon.h)
+2.  `EvaluateClipsDecision`  trace 
+3.  `route_arguments_json`  raw JSON `route_arguments_json_available=false`, `transport=none`
+
+### 17.7 
+
+```
+src/fact_factory/
+ ByteSanitizer.h            0
+ JiebaTokenizer.h           1CppJieba 
+ BusinessTrieMatcher.h      2marisa-trie 
+ SemanticNormalizer.h       3
+ FactFactory.h              
+ BusinessTagRegistry.h      40  tag + 
+ resources/
+     business_dict.utf8      40 CppJieba + marisa-trie 
+     business_supplement.txt 
+     cilin_ext.txt           892KB~7
+```
+
+### 17.8 
+
+|  |  |  |
+|---|---|---|
+| `CODEX_LAN_AGENT_FACT_FACTORY_FULL_PIPELINE` | `#undef` |  4  CppJieba + marisa-trie |
+|  |  |  ByteSanitizer + BusinessTagRegistryheader-only |
+
+> **** `extern "C"` 
+
+---
+
+## 18. optfile 
+
+### 18.1 
+
+`optfile`  Qt  MCP 
+
+- ****[optfile/main.cpp](optfile/main.cpp)
+- ****`optfile.exe`
+- ****Qt5Core`QSaveFile``QCryptographicHash``QJsonDocument`
+
+### 18.2 
+
+```powershell
+optfile.exe --td <target_dir> --tf <test_file> [options]
+```
+
+|  |  |
+|---|---|
+| `--td, --target-dir <path>` |  |
+| `--tf, --test-file <name>` |  |
+| `--locate-text <text>` | / |
+| `--find-line <n>` |  |
+| `--insert-after-anchor <text>` |  |
+| `--replace-start-line <n>` |  |
+| `--replace-end-line <n>` |  |
+| `--replacement-text <text>` | / |
+| `--delete-line <n>` |  |
+| `--delete-content <text>` |  |
+| `--expected-anchor-hash <hash>` |  |
+| `--expected-line-hash <hash>` |  |
+| `--expected-range-hash <hash>` |  |
+| `--show-preview` |  locate  |
+| `--fuzzy-threshold <0-100>` |  60 |
+| `--occurrence <n>` |  N  1 |
+
+### 18.3 
+
+|  |  |  |
+|---|---|---|
+|  | `locate_text_lines_mcp` | / +  +  |
+|  | `find_line_metadata_mcp` |  |
+|  | `insert_after_anchor_atomic_mcp` |  |
+|  | `replace_line_range_atomic_mcp` |  |
+|  | `delete_line_atomic_mcp` |  |
+|  | `delete_content_atomic_mcp` |  |
+
+> **** `QSaveFile`  JSON 
+
+### 18.4 
+
+ `std::cout`  JSON  stdout
+
+```json
+{"status":"success","operation":"locate","file_path":"...","matched_lines":[...],"file_hash":"..."}
+```
+
+ exit code 2
+
+```json
+{"status":"error","error":"anchor not found"}
+```
+
+### 18.5 
+
+optfile  CMake  qmake 
+
+```powershell
+cd D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\optfile
+qmake optfile.pro
+mingw32-make
+#  optfile.exe  Qt5Core.dll  PATH 
+```
+
+---
+
+## 19. Fact-Factory 
+
+### 19.1 
+
+|  |  |
+|---|---|
+|  | `D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent` |
+|  | `build\Release` |
+|  | `codex_lan_agent.exe`38,003,200  |
+|  | `test_config.ini` |
+|  | 18080 |
+| Machine Code | `8EE5-2336-71AE-74DD` |
+|  | 2026-08-13 |
+
+### 19.2 
+
+|  |  |  |
+|---|---|---|
+| TEST 1: Health Check | **PASS** | `ok=true, status=ok, listen_port=18080, outcome=PASS` |
+| TEST 2: MCP Overview | **PASS** | `ok=true, tool_count=1, semantic_action_count=78` |
+| TEST 3: CLIPS decide - observe | **PASS** | `ok=true, exit_code=0, status=success, decision=allow, terminal_state=true, outcome=PASS` |
+| TEST 4: CLIPS decide - pending continuation | **PASS** | `ok=true, exit_code=0, status=success, decision=allow, failure_mode=none, outcome=PASS` |
+| TEST 5: Concurrent Stress (8 mixed) | **PASS** | `PASS=8, FAIL=0`5observe + 3pending |
+
+### 19.3 route  raw JSON
+
+|  |  |  |
+|---|---|---|
+| `route_arguments_json` | `""`len=0 | **PASS** - raw JSON  |
+| `route_arguments_json_available` | `false` | **PASS** |
+| `route_arguments_json_transport` | `none` | **PASS** |
+| `route_arguments_json_ref` | `""` | **PASS** |
+
+### 19.4 Pending Continuation 
+
+ payload 
+
+```json
+{
+  "primary_intent": "run_build",
+  "tool_name": "cmake_build",
+  "pending_continuation_active": "true",
+  "pending_required_tool": "cmake_build",
+  "pending_required_arguments_json": "{\"file_path\":\"D:/test.txt\",\"anchor\":\"line1\",\"new_lines\":\"a\\nb\\nc\"}",
+  "pending_trace_id": "trace-pend-test-...",
+  "pending_hash": "",
+  "pending_trace_match": "true",
+  "continuation_takeover_allowed": "true"
+}
+```
+
+**** `decision=allow, failure_mode=none, outcome=PASS`
+
+>  segfault `SemanticIntentLexiconEntry`  `std::initializer_list`  bug
+
+### 19.5 
+
+ 8 5  observe + 3  pending continuation PASS
+
+```
+Stress result: PASS=8 FAIL=0 (total=8)
+```
+
+### 19.6 Fact-Factory 
+
+|  |  |  |
+|---|---|---|
+| 0 ByteSanitizer | **** | 5  |
+| BusinessTagRegistry | **** | 40  tag +  |
+| 1 CppJieba | **** |  |
+| 2 marisa-trie | **** |  |
+| 3 SemanticNormalizer | **** | cilin_ext.txt 892KB |
+| cilin_ext.txt | **** | 892,620 HanLP v1.8.6 CoreSynonym.txt |
+| Pending Continuation  | **** | `std::initializer_list`  `std::vector` |
+| route  | **** | `route_arguments_json`  |
+
+### 19.7 
+
+1. **optfile stdout **optfile.exe  .NET `Process.StandardOutput`  stdout Qt QCoreApplication 
+2. ****CppJieba + marisa-trie ByteSanitizer + BusinessTagRegistry
+3. **cilin_ext.txt ** 7 <1s
+
+---
+
+## 20. MCP 61  /  < 5 
+
+> `2026-08-13_05-14-13_conv_94642bb5__d_codex_workdir_sea.jsonl`
+> gemma-4-E4B-it-UD-Q5_K-XL
+> `D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo\cxparser`
+
+### 20.1 
+
+ cxparser  **61  C/C++ **
+
+|  |  | primary_intent | flow_id |
+|---|---|---|---|
+| 1 |  | `comment_cleanup` | `directory_comment_cleanup_bounded_window_v1` |
+| 2 |  | `code_format` | `directory_comment_cleanup_bounded_window_v1` |
+
+### 20.2 
+
+ `lan_agent_mcp_route` CLIPS  `lan_agent_list_directory` 
+
+```
+
+  -> lan_agent_mcp_route (route )
+    -> CLIPS route_target=lan_agent_list_directory, chain_state=needs_tool_call
+      -> lan_agent_mcp_route (call , target_tool_name=lan_agent_list_directory)
+        ->  file_count=63, code_file_count=61, file_paths_json=[...61...]
+          -> terminal_state=true, completion_claim_allowed=true
+```
+
+** JSONL timings **
+
+|  | Turn 1  | Turn 2  |  | LLM  |
+|---|---|---|---|---|
+| 1 | **144 ms** | **140 ms** | **284 ms** | 28,768 ms |
+| 2 | **22 ms** | **36 ms** | **58 ms** | 27,981 ms |
+| **** | 166 ms | 176 ms | **342 ms** | 56,749 ms |
+
+> **4  MCP 61  342  5 **  LLM gemma-4-E4B-it-UD-Q5_K-XLMCP 
+
+### 20.3 CLIPS 
+
+ 128+ 
+
+```
+route_target=lan_agent_list_directory
+chain_state=needs_tool_call -> tool_result_returned
+completion_guard=NON_TERMINAL_RESULT: do not claim completion; execute the required next MCP tool call
+terminal_state=true (2)
+verification_ok=true
+audit_field_count=128 (route) / 149 (list)
+```
+
+### 20.4 
+
+ PowerShell 
+
+|  |  |
+|---|---|
+|  | 61 |
+|  `//`  `/* */`  | **0** |
+| `#include` / `namespace` / `class` / `#define`  | **** |
+|  `"<="`, `">="` | **** |
+|  ->  ->  ->  | **PASS** |
+
+### 20.5 
+
+|  | ++ | MCP  |
+|---|---|---|
+|  I/O | 61  |  |
+|  |  | CLIPS 2 turn  |
+|  | ~ | **< 350 ms** |
+|  |  | 128+ / |
+
+---
+
+## 21. 
+
+> codex-lan-agent ** MCPC/C++  Agent **** MCP **
+>
+> "61  342ms"
+> **LLM MCP Runtime **
+
+### 21.1 
+
+|  |  |  |
+|---|---|---|
+| ** MCP ** |  /  LLM | stdio clangd-mcp mcp |
+| ** MCP** | Clang AST /  | **codex-lan-agent** |
+| ** MCP Runtime** |  Agent |  |
+
+
+
+> codex-lan-agent = ** MCP  & **
+
+### 21.2  MCP Runtime 
+
+```
+ ============================================================================
+ |                       MCP Runtime                             |
+ ============================================================================
+ |                                                                           |
+ |  []  stdio  |  streamable-http  |  (future) WebSocket           |
+ |       |              |                        |                           |
+ |       +--------------+------------------------+                           |
+ |                      v                                                    |
+ |  []  lan_agent_mcp_route  ( Schema, )            |
+ |                      |                                                    |
+ |       +--------------+--------------+--------------+--------------+       |
+ |       |              |              |              |              |       |
+ |       v              v              v              v              v       |
+ |  [1]         [2]         [3]         [4]         [N]   |
+ |  codex-code      document       hardware       ops-deploy      ...       |
+ |  Clang AST       Markdown       /JTAG    CI/CD                     |
+ |  CFG/        PDF                                   |
+ |  compile_cmd     RAG                                 |
+ |       |              |              |              |              |       |
+ |       +--------------+--------------+--------------+--------------+       |
+ |                      |                                                    |
+ |  ===================|==== |=================== |
+ |                      v                                                    |
+ |  +------------------------------------------------------------------+     |
+ |  |  CLIPS ,                                 |     |
+ |  |  -  ( /  / )             |     |
+ |  |  -  ( /  diff )          |     |
+ |  |  -  ( "")                     |     |
+ |  |  :  LLM ,                     |     |
+ |  +------------------------------------------------------------------+     |
+ |  |   (Task Memory + step_ledger)                       |     |
+ |  |  -  ( C++/Clang)                            |     |
+ |  |  -  vs                                    |     |
+
+## 25. 2026-08-14 optfile  agent_server_stdout 
+
+### 25.1 
+
+ `optfile.exe` `--replacement-text`  C/C++ 
+
+
+
+|  |  |
+|---|---|
+| `optfile/main.cpp` |  replacement text  base64  |
+| `optfile.exe` |  `C:\Qt\Qt5.14.2\Tools\mingw730_64`  |
+| `src/comm.h` |  `agent_server_stdout.log`  |
+| `src/RemoteInteractionOperations.h` | `/tools`  `/mcp`  `[tool_event]` |
+| `src/main.cpp` | `serve`  |
+
+`optfile` 
+
+|  |  |
+|---|---|
+| `--replacement-text <text>` |  `\n`  |
+| `--decode-escapes` |  `\n` / `\r` / `\t`  |
+| `--replacement-text-base64 <base64>` | C++ JSON  shell  |
+
+ `optfile`  `optfile/main.cpp` `optfile.exe`  `optfile.exe` `--replacement-text-base64`
+
+### 25.2  optfile.exe
+
+
+
+```powershell
+$env:PATH='C:\Qt\Qt5.14.2\Tools\mingw730_64\bin;C:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin;' + $env:PATH
+cd D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\optfile
+& 'C:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin\qmake.exe' optfile.pro -o Makefile
+& 'C:\Qt\Qt5.14.2\Tools\mingw730_64\bin\mingw32-make.exe' release
+Copy-Item .\Release\optfile.exe D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\optfile.exe -Force
+```
+
+
+
+|  |  |
+|---|---|
+| `optfile/Release/optfile.exe` |  |
+| `optfile.exe` |  |
+
+### 25.3 agent_server_stdout.log 
+
+ `serve` 
+
+```text
+--agent-server-stdout-log
+--agent-server-stdout-log-path <path>
+```
+
+
+
+```powershell
+$STAGE_EXE='D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\build_release_x64\stage_x64\bin\codex_lan_agent.exe'
+$CFG='D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\codex_lan_agent.cfg'
+& $STAGE_EXE --config $CFG serve --machine-code 8EE5-2336-71AE-74DD --agent-server-stdout-log
+```
+
+ `codex_lan_agent.cfg`  `log_root` 
+
+```text
+D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\logs\agent_server_stdout.log
+```
+
+
+
+```powershell
+& $STAGE_EXE --config $CFG serve --machine-code 8EE5-2336-71AE-74DD --agent-server-stdout-log-path D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\logs\agent_server_stdout.log
+```
+
+
+
+|  |  |  |
+|---|---|---|
+|  | `[] server_event=...` |  |
+|  | `[tool_event] {...}` |  `/tools`  `/mcp`  |
+
+`[tool_event]` 
+
+|  |  |
+|---|---|
+| `timestamp` |  |
+| `event_type` |  `tool_call` |
+| `tool_name` |  `tool_name` / `visible_tool_name` |
+| `command_name` |  |
+| `entry_name` | HTTP  `POST /tools` |
+| `method` / `path` | HTTP  |
+| `status` / `http_status` |  HTTP  |
+| `duration_ms` |  |
+| `trace_id` / `goal_id` |  ID |
+| `mcp_route_mode` | `lan_agent_mcp_route`  route  `overview` |
+
+`/tools`  `/mcp`  JSON  `name` PowerShell  `curl.exe -d`  JSON  `--data-binary @file` 
+
+### 25.4 
+
+`optfile.exe` 
+
+|  |  |  |
+|---|---|---|
+| `--replacement-text 'A\nB'` |  `A\nB` | PASS |
+| `--replacement-text 'A\nB' --decode-escapes` |  `A` / `B` | PASS |
+| `--replacement-text-base64`  `output << line << "\n";` | C++  | PASS |
+
+`codex_lan_agent` 
+
+```powershell
+$env:CODEX_LLVM_ROOT='D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo\libtorch_module\llvm_x64_install'
+cmake --build D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\build_release_x64 --config Release --target codex_lan_agent
+Copy-Item D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\build_release_x64\Release\codex_lan_agent.exe D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\build_release_x64\stage_x64\bin\codex_lan_agent.exe -Force
+```
+
+Release  `stage_x64\bin\codex_lan_agent.exe` SHA256 
+
+HTTP 
+
+```powershell
+$bodyPath=Join-Path $env:TEMP 'codex_lan_agent_health_body.json'
+[System.IO.File]::WriteAllText($bodyPath,'{"name":"lan_agent_health"}',[System.Text.UTF8Encoding]::new($false))
+curl.exe -s -X POST -H 'Content-Type: application/json' --data-binary "@$bodyPath" http://127.0.0.1:18080/tools
+
+$routeBody=Join-Path $env:TEMP 'codex_lan_agent_route_body.json'
+[System.IO.File]::WriteAllText($routeBody,'{"name":"lan_agent_mcp_route","arguments":{"mode":"overview"}}',[System.Text.UTF8Encoding]::new($false))
+curl.exe -s -X POST -H 'Content-Type: application/json' --data-binary "@$routeBody" http://127.0.0.1:18080/tools
+```
+
+
+
+|  |  |
+|---|---|
+| `lan_agent_health` | `ok:true` |
+| `lan_agent_mcp_route` overview | PASS `request_model_profile=small-llm`  `required_tool_name` |
+| `agent_server_stdout.log`  |  `agent_server_stdout_file_log_enabled`  `startup_complete` |
+| `agent_server_stdout.log`  |  `tool_name":"lan_agent_health"`  `tool_name":"lan_agent_mcp_route"` |
+
+
+
+```text
+[tool_event] {"timestamp":"2026-08-14T14:14:34+08:00","tool_name":"lan_agent_mcp_route","event_type":"tool_call","command_name":"lan_agent_mcp_route","entry_name":"POST /tools","http_status":"200","mcp_route_mode":"overview","result":"mcp_overview"}
+```
+
+---
+ |  +------------------------------------------------------------------+     |
+ |  |   (Semantic Grid )                          |     |
+ |  |  -  /  /  Bundle  ()        |     |
+ |  +------------------------------------------------------------------+     |
+ |  |   IO ()                                   |     |
+ |  |  - : QSaveFile  +  +                     |     |
+ |  |  - (future)  /  /                     |     |
+ |  +------------------------------------------------------------------+     |
+ |  |   (Artifact Store)                                |     |
+ |  |  - ,  +  +               |     |
+ |  +------------------------------------------------------------------+     |
+ |  ========================================================================= |
+ |                                                                           |
+ |  []  SQLite ()  |  RocksDB (KV )  |            |
+ |                                                                           |
+ ============================================================================
+```
+
+### 21.3 
+
+```
+ LLM        (route)      CLIPS                TaskMemory
+     |               |                |               |               |
+     |  1.JSON   |                |               |               |
+     |-------------->|                |               |               |
+     |               | 2.      |               |               |
+     |               |  (slot    |               |               |
+     |               |   )     |               |               |
+     |               |--------------->|               |               |
+     |               |                | 3.     |               |
+     |               |                |  (//   |               |
+     |               |                |   )  |               |
+     |               |  4.:       |               |               |
+     |               |<---------------|               |               |
+     |               |  route_target= |               |               |
+     |               |  codex-code    |               |               |
+     |               |                |               |               |
+     |               | 5.      |               |               |
+     |               |------------------------------->|               |
+     |               |                |               | 6. |
+     |               |                |               |  (Clang AST /  |
+     |               |                |               |    / ) |
+     |               |                |               |               |
+     |               |                |               | 7.step    |
+     |               |                |               |-------------->|
+     |               |                |               |  ()    |
+     |               |  8.+|               |               |
+     |               |<-------------------------------|               |
+     |               |                |               |               |
+     |               | 9.CLIPS  |               |               |
+     |               |       |               |               |
+     |               |--------------->|               |               |
+     |               |  10.    |               |               |
+     |               |<---------------|               |               |
+     |  11.  |                |               |               |
+     |  (128+)|                |               |               |
+     |<--------------|                |               |               |
+     |               |                |               |               |
+     |    pending_continuation:    |               |               |
+     |    LLM 1    |               |               |
+     |    TaskMemory       |               |               |
+```
+
+### 21.4   
+
+|  |  |  |
+|---|---|---|
+| `lan_agent_mcp_route`  | **** |  MCP  stdio + streamable-http |
+| Task Memory + step_ledger | **** |  C++ / |
+| CLIPS  | ** & ** | **** |
+| Semantic Grid  | **** |  RAG  Agent  Bundle  |
+|  IO  | **** |  |
+
+> ** LLM ** Prompt 
+
+### 21.5  MCP   MCP 
+
+#### 1. 
+
+`compile_commands.json`Clang ASTC/C++ CMM 
+
+```
+ MCP Runtime
+ 
+ 
+ 
+ CLIPS 
+  IO / 
+ 
+      [1] codex-code-plugin   Clang 
+      [2] document-agent-plugin
+      [3] hardware-debug-plugin
+```
+
+****
+
+#### 2. 
+
+- **** CLIPS 
+- ****
+
+#### 3.  / 
+
+ MCP 
+
+-  LLM 
+- A  B 
+- CPU Clang 
+
+#### 4.  MCP 
+
+-  streamable-http MCP  stdio
+-  SDK
+
+#### 5. 
+
+-  Artifact  ASTCFGDOT 
+- 
+
+### 21.6 
+
+|  |  |  |  |
+|---|---|---|---|
+| ** 1** | task memory IOCLIPS  |  |    |
+| ** 2** | Clang / |  MCP  C++  +  |    ABI  |
+| ** 3** | HTTP  API |  |    |
+
+### 21.7  research-mcp 
+
+|  |  |
+|---|---|
+| / | **research-mcp** |
+|  | ** MCP Runtime** |
+
+ MCP  +  Agent 
+
+### 21.8 
+
+ MCP 
+
+- 
+- 
+- ** MCP **
+
+ C/C++  Agent ** MCP ** stdio 
+
+---
+
+# 22.  MCP 
+
+> ****
+
+---
+
+## 0. 
+
+ AI AgentMCP  **LLM **
+
+ **   MCP Runtime** AI  **LLM **  **** 
+
+ LLM 
+
+|  |  |
+|---|---|
+|  |  |
+|  |  |
+|  |  |
+|  |  |
+|  |  +  |
+|  |  |
+
+ AI  ****
+
+---
+
+## 1. 
+
+### 1.1 
+
+#### Primary Brain
+> 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** |  |
+
+#### Secondary Brain
+>  MCP  LLM 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** | AI  /  **** |
+
+---
+
+### 1.2 
+
+
+
+####  1
+> 
+
+LLM ****
+
+####  2
+>  LLM 
+
+AI  ** Prompt **
+
+####  3
+>  ****
+
+
+
+####  4
+>  ****
+
+ ****
+
+####  5
+> ****
+- 
+- 
+- 
+
+
+
+---
+
+## 2. 
+
+**** MCP 
+
+|  |  |  |
+|---|---|---|
+| L1 |  |    |
+| L2 |  |    +  |
+| L3 |  |    |
+| L4 |  |    |
+| L5 |  |    |
+
+---
+
+### L1  1
+
+ LLMAI  MCP 
+
+- ****Stdio  / Streamable-HTTP 
+- **** LLM /  /  Agent  / 
+- ****
+
+---
+
+### L2  2
+
+  ** MCP **
+
+|  |  |
+|---|---|
+| **** |  LLM  Token  |
+| **** |  **** + ****  |
+| ****  | ** +  +  + ** |
+|  |  |
+|  |  LLM Prompt  |
+|  |  |
+
+---
+
+### L3  3
+
+****
+
+
+
+|  |  |  |
+|---|---|---|
+| **1. ** |  |  /  |
+| **2. ** | +  |  |
+| **3. ** |  Bundle  |  ** RAG ** |
+| **4.  IO ** |  |  |
+
+---
+
+### L4  4
+
+****
+
+#### 
+
+|  |  |  |
+|---|---|---|
+|   |  | Clang AST / CFG / DFG |
+|   |  +  |  |
+|   |  |  |
+|   |  |  |
+
+****
+-  /  /  /  / 
+-  / 
+
+---
+
+### L5  5
+
+ **** AI 
+
+|  |  |  |
+|---|---|---|
+| **** | JSON / JSONL  | **** |
+| **** | RocksDB / SQLite  |  |
+| **** |  |  |
+
+---
+
+## 3. 
+
+### 3.1 MCP 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** |  /  /  |
+| **** |  LLM  |
+
+---
+
+### 3.2 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** | ** LLM** |
+| **** |  |
+
+> **** LLM 
+
+---
+
+### 3.3 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** | +  |
+| **** |  |
+
+---
+
+### 3.4 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** | L1-L5  |
+| **** |  RAG  |
+
+---
+
+### 3.5  IO 
+
+|  |  |
+|---|---|
+| **** |  |
+| **** |  |
+| **** |  AI  |
+
+---
+
+## 4. 
+
+ ** MCP **
+
+---
+
+### 4.1 
+
+|  |  |  |
+|---|---|---|
+| 1 | **INIT**  |  |
+| 2 | **RUNNING**  |  |
+| 3 | **SUSPENDED**  |  |
+| 4 | **CHECK**  |  |
+| 5 | **COMPLETE**  |  |
+| 6 | **FAILED / ROLLBACK**  |  /  |
+
+
+
+`
+INIT  RUNNING  SUSPENDED 
+                                
+                 CHECK  COMPLETE
+                            
+                             FAILED/ROLLBACK
+`
+
+> ** CHECK  COMPLETE **
+
+---
+
+### 4.2 
+
+
+
+|  |  |
+|---|---|
+| 	ask_id |  |
+| session_id |  |
+| status | 6  |
+| step_index |  |
+| udget_quota |  /  |
+| snapshot_hash |  /  |
+| check_result |  |
+| ledger_path |  |
+
+---
+
+### 4.3 
+
+1. ****
+2. **CHECK  COMPLETE ** CHECK ****  COMPLETE 
+3. **SUSPENDED **
+4. ****
+
+---
+
+## 5. 
+
+### 5.1 
+
+|  |  |
+|---|---|
+| LLM  |  +  LLM  |
+|  |  +  +  |
+|  /  |  |
+| MCP  |  +  +  |
+|  /  /  |  +  |
+|  /  |  IO  +  +  |
+
+**AI **
+
+---
+
+### 5.2 
+
+****LangGraph / AutoGen  LLM  RAG  MCP  
+
+|  |  |  |
+|---|---|---|
+|  MCP  |  | ** AI ** |
+|  | Prompt  | **AI ** |
+|  |  | **** |
+
+---
+
+### 5.3 
+
+
+
+-  ** AI **
+-  ****
+-  ****
+
+> **** AI  +  **** 
+
+---
+
+## 6. 
+
+1. ****  
+    ****
+
+2. ****  
+    ****
+
+3. ****  
+    ****
+
+4. ****  
+   
+
+5. ****  
+    ****
+
+---
+
+## 7. 
+
+** -  MCP **  AI Prompt  MCP ** AI **
+
+ **** 
+
+>  ** AI**  ** AI** 
+
+---
+---
+
+# 23. MCP 
+
+> **** codex-lan-agent  Codex  MCP 
+
+---
+
+## 23.1 
+
+|  |  |
+|---|---|
+|  
+eeds_continue  |  10+  reason_code |
+| lan_agent_mcp_route  | 	erminal_state=false  |
+| lan_agent_list_directory  |  150  |
+|  |  |
+| pending continuation  | logs/mcp_pending_continuations/ 30  |
+|  | codex  |
+
+8  13  16:14 ~ 16:42
+
+`
+status=needs_continue  10+  ()
+status=failed            8  ()
+status=success           3  ()
+`
+
+---
+
+## 23.2 
+
+### Step 1
+
+ logs/mcp_trace_audit_events.jsonl  post_guard_reason_code Top 3 
+
+| reason_code |  |  CLIPS  |
+|---|---|---|
+| 
+on_terminal_result_forbids_final_answer | 10 | 
+on-terminal-result-forbids-final-answer |
+| directory_batch_pending | 6 | directory-batch-read-still-pending |
+| ead_chain_incomplete | 5 | incomplete-read-result-requires-continuation |
+
+### Step 2
+
+ src/clips_rules/rules/mcp_result_guard.clp slot 
+
+** 1
+on_terminal_result_forbids_final_answer **
+
+mcp_result_guard.clp L160~L174
+`clips
+(defrule non-terminal-result-forbids-final-answer
+  (declare (salience 47))
+  (mcp_tool_result (tool_name ?tool)
+                   (terminal_state "false")          ;  
+                   (completion_claim_allowed "false"));  
+  =>
+  (decision "route")                          ;  
+`
+
+C++ [main.cpp#L1547](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/main.cpp#L1547-L1549) 	ool_call_only  	erminal_state=false + completion_claim_allowed=false** decision=route**codex ""    ****
+
+** 2directory_batch_pending **
+
+mcp_result_guard.clp L398~L417 lan_agent_list_directory lan_agent_final_answercodex " 150 "
+
+** 3ead_chain_incomplete **
+
+mcp_result_guard.clp L380~L396 lan_agent_list_directory ""	ask_completion=incomplete codex 
+
+** 4directory-list/read-result-requires-declared-continuation **
+
+mcp_result_guard.clp L208~L272 atch_completion=incomplete 
+ext_call_json""
+
+** 5inal_answer_disallowed_by_result **
+
+ 1  inal_answer_allowed=false  C++ ""
+
+** 6pending continuation **
+
+logs/mcp_pending_continuations/  30  .kv  8  11  oute-mismatched-pending-continuation  pending_continuation_active=true  continuation 
+
+---
+
+## 23.3 
+
+****** 
+ext_call_json**"codex " LLM 
+
+|  |  |  |
+|---|---|---|
+| 
+on-terminal-result-forbids-final-answer | 	erminal_state=false + completion_claim_allowed=false   | ** (next_call_json ?next&:(neq ?next "")) ** |
+| inal-answer-disallowed-by-result | inal_answer_allowed=false   | ** (next_call_json ?next&:(neq ?next "")) ** |
+| directory-list-result-requires-declared-continuation | atch_completion=incomplete   | ** (next_call_json ?next&:(neq ?next "")) ** |
+| directory-read-result-requires-declared-continuation | atch_completion=incomplete   | ** (next_call_json ?next&:(neq ?next "")) ** |
+| incomplete-read-result-requires-continuation |  lan_agent_list_directory | ** lan_agent_list_directory** |
+| directory-batch-read-still-pending |  lan_agent_list_directory + lan_agent_final_answer | **** |
+
+
+-  logs/mcp_pending_continuations/ 30  0 continuation 
+-  src/ClipsDecisionOperations.h  **embedded fallback ** .clp  fallback 
+
+---
+
+## 23.4 
+
+|  |  |  |
+|---|---|---|
+| lan_agent_mcp_route  |  decision=route |  default-mcp-result-verifiedsalience=-100decision=allowcodex  |
+| lan_agent_list_directory  |  150  +  |  allowcodex  |
+|  
+ext_call_json |  |  |
+|  pending continuation  |  continuation takeover  |  |
+
+---
+
+## 23.5 
+
+|  |  |
+|---|---|
+| src/clips_rules/rules/mcp_result_guard.clp | **5  + ** |
+| src/ClipsDecisionOperations.h | **embedded fallback ** |
+| logs/mcp_pending_continuations/*.kv | 30  0 |
+| codex_lan_agent.exe |  header  |
+
+Release CLIPS .clp  LoadClipsFileIfExists  10+  reason_code  needs_continue 
+
+---
+
+## 23.6 
+
+>  4  6 
+
+1. ** 
+ext_call_json **  
+   	erminal_state=false / inal_answer_allowed=false / completion_claim_allowed=false  C++ """" 
+ext_call_json 
+
+2. ****  
+   atch_completion=incomplete lan_agent_read_text_file / lan_agent_read_directory_files / lan_agent_run_cxparser_flowlan_agent_list_directorylan_agent_final_answer
+
+3. **Fallback **  
+   CLIPS  raw string fallback  file_rules ""
+
+4. **pending continuation  TTL**  
+    continuation  24 
+
+---
+# 24. MCP  CLIPS 
+
+> ****codex-lan-agent  Codex  MCP Codex 
+
+---
+
+## 24.1 
+
+|  |  |
+|---|---|
+| Get-Process codex_lan_agent | **** |
+| logs/agent.out.log |  |
+| logs/server_state.json |  |
+| logs/server.lock |  |
+| logs/remote_control_events.jsonl | **393 MB**411,590,492 bytes |
+| logs/mcp_trace_audit_events.jsonl | 7.3 MB |
+| logs/mcp_pending_continuations/ | 0  |
+
+****MCP HTTP  18080 Codex 
+
+---
+
+## 24.2 
+
+###  A IO 
+
+emote_control_events.jsonl  **393 MB** MCP 
+- 
+- 
+-  OOM 
+
+###  BCLIPS Run(env, -1) 
+
+[ClipsDecisionOperations.h](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h) 
+`cpp
+Run(env, -1);  // -1 
+`
+
+ CLIPS  A  B B  ARun(-1) 
+-  EvaluateClipsDecision 
+- HTTP 
+-  Environment 
+- 
+
+###  CCLIPS  fact 
+
+CLIPS  fact (assert ...)  RHS  fact
+- ** fact-factory ** fact
+- ****
+- ****fact 
+
+###  D fact 
+
+C++  ssert_fact lambda  fact  domain  fact  fact  CLIPS  fact 
+
+---
+
+## 24.3 
+
+****fact-factory  factCLIPS  fact decision=allow
+
+###  fact 
+
+|  |  |
+|---|---|
+|  | CLIPS_MAX_FACTS_PER_SESSION = 500 |
+|  | ssert_fact GetNumberOfFacts(env) >= 500   circuit_breaker_facts_exceeded |
+|  | Run act_count_after_run > 500   |
+|  | [ClipsDecisionOperations.h L2254-2257](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2254-L2257) () / L2303-2306 () |
+
+###  fact 
+
+|  |  |
+|---|---|
+|  | std::set<std::string> asserted_signatures fact  256  |
+|  |   ++duplicate_facts_blocked |
+|  | [ClipsDecisionOperations.h L2240-2253](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2240-L2253) |
+
+### 
+
+|  |  |
+|---|---|
+|  | CLIPS_MAX_RULE_FIRINGS = 200 |
+|  | Run(env, -1)  Run(env, CLIPS_MAX_RULE_FIRINGS) |
+|  |  >= 200   circuit_breaker_rules_exceeded |
+|  | [ClipsDecisionOperations.h L2296-2300](file:///D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/src/ClipsDecisionOperations.h#L2296-L2300) |
+
+### 
+
+`
+
+    
+decision.decision = "allow"              // 
+decision.verification = "circuit_breaker_triggered"
+decision.reason_code = "clips_internal_circuit_breaker"
+decision.next_action = "circuit_breaker: clips internal limit exceeded"
+    
+DestroyEnvironment(env)                  //  Environment 
+return decision                          // 
+`
+
+### 
+
+ CLIPS decision  6  mcp_trace_audit_events.jsonl 
+
+|  |  |
+|---|---|
+| act_count_before_run | Run  fact  |
+| act_count_after_run | Run  fact  |
+| ule_firings_actual | Run  |
+| duplicate_facts_blocked |  fact  |
+| circuit_breaker_facts_exceeded |  |
+| circuit_breaker_rules_exceeded |  |
+
+### 
+
+- emote_control_events.jsonl393 MB  0
+- mcp_trace_audit_events.jsonl7.3 MB  0
+-  10 MB 
+
+---
+
+## 24.4 
+
+ codex_lan_agent.exe
+
+|  |  |
+|---|---|
+|  | **** PID=25436 8.7 MB |
+| exe  | 17:12:27 17:11:47 exe |
+| pending continuations | 0  |
+|  |  0 MB |
+| MCP 	ools/list  | ****protocol=2.0tools count=1 |
+
+**** 
+
+1. **CLIPS  fact **   500 fact 
+2. ** fact **  
+3. ****   200  Run
+4. ****  
+
+ decision=allow + circuit_breaker_triggered  Codex 
+
+---
+
+## 24.5  fact-factory 
+
+`
+ LLM / Codex 
+        
+
+  fact-factory       fact
+  0:                  CLIPS 
+  1: CppJieba          
+  2: marisa-trie       
+  3:            
+
+             fact  CLIPS
+
+  CLIPS             fact 
+    assert  fact    
+     
+   : fact   500       
+   :               C++ 
+   :   200        Run 
+     
+
+           
+     decision 
+`
+
+> ****fact-factory  CLIPS  fact
+
+---
+
+---
+
+## Headless 
+
+### 
+
+ Headless  `local_cli` / `lan_agent_run_command` 
+
+```text
+unsupported local_cli command
+```
+
+ `codex-lan-agent` CLI  Headless  Windows  exe `local_cli` 
+
+`local_cli`  `health``chat-status``task-latest``task``log-latest``diff``run-light``build-target``test-result``thread-report``mkdir` exe`cmd.exe``powershell.exe`  `Headless`  `command` 
+
+###  CLI profile 
+
+ `D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/build01/Release/cxvision_imgui_acceptance.exe`  `profile` `lan_agent_run_cli_profile` 
+
+1. � `allowed_roots` 覆盖范围内。当前 `cxvisionai` 应在允许根目录中，例如：
+
+```ini
+allowed_roots=D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent;D:/Codex-WorkDir/Sean_WorkDir/cxvisionai
+```
+
+2. 在 `codex_lan_agent.cfg` 中加入 profile 配置：
+
+```ini
+profile.cxvision_imgui_acceptance="D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/build01/Release/cxvision_imgui_acceptance.exe"
+profile_timeout.cxvision_imgui_acceptance=1800
+profile_stall_timeout.cxvision_imgui_acceptance=120
+```
+
+路径建议使用 `/`，避免 Windows 反斜杠转义问题。如果使用 `\`，需要确认配置解析不会把它当作转义字符处理。
+
+3. 重启 `codex-lan-agent serve`，让配置生效。
+
+4. 通过 MCP 网关调用 profile：
+
+```json
+{
+  "name": "lan_agent_mcp_route",
+  "arguments": {
+    "mode": "call",
+    "target_tool_name": "lan_agent_run_cli_profile",
+    "arguments": {
+      "profile": "cxvision_imgui_acceptance",
+      "args": "",
+      "timeout_sec": 1800,
+      "stall_timeout_sec": 120
+    }
+  }
+}
+```
+
+如果 Headless 需要参数，把参数放入 `args`，例如：
+
+```json
+{
+  "profile": "cxvision_imgui_acceptance",
+  "args": "--headless --timeout 300",
+  "timeout_sec": 1800,
+  "stall_timeout_sec": 120
+}
+```
+
+上线前可先做 dry-run，确认实际命令行和白名单解析结果：
+
+```json
+{
+  "name": "lan_agent_mcp_route",
+  "arguments": {
+    "mode": "call",
+    "target_tool_name": "lan_agent_run_cli_profile",
+    "arguments": {
+      "profile": "cxvision_imgui_acceptance",
+      "args": "--headless",
+      "dry_run": true
+    }
+  }
+}
+```
+
+### 兼容方案：配置化 local_cli run-light action
+
+如果旧线程或旧客户端只能调用 `local_cli` / `lan_agent_run_command`，仍然不要新增任意命令透传。当前支持把固定 `action_id` 通过配置映射到已注册的 CLI profile。
+
+配置格式：
+
+```ini
+profile.cxvision_imgui_acceptance="D:/Codex-WorkDir/Sean_WorkDir/cxvisionai/build01/Release/cxvision_imgui_acceptance.exe"
+profile_timeout.cxvision_imgui_acceptance=1800
+profile_stall_timeout.cxvision_imgui_acceptance=120
+local_cli_run_light.run_cxvision_imgui_acceptance=cxvision_imgui_acceptance
+```
+
+含义：
+
+- `profile.cxvision_imgui_acceptance` 定义真正允许执行的程序入口。
+- `local_cli_run_light.run_cxvision_imgui_acceptance` 把旧调用里的 `action_id` 映射到该 profile。
+- 修改这些配置后需要重启 `codex-lan-agent serve`，但不需要重新
+-  shell `run-light`  cfg 
+
+
+
+```json
+{
+  "name": "lan_agent_mcp_route",
+  "arguments": {
+    "mode": "call",
+    "target_tool_name": "lan_agent_run_command",
+    "arguments": {
+      "command": "run-light",
+      "action_id": "run_cxvision_imgui_acceptance",
+      "args_text": "--headless",
+      "dry_run": true
+    }
+  }
+}
+```
+
+ `dry_run`  `false`
+
+
+2026-08-27 
+
+- `profile.<name>``profile_timeout.<name>``profile_stall_timeout.<name>``local_cli_run_light.<action_id>`  `codex_lan_agent.cfg` Headless/
+-  `codex_lan_agent serve`  `local_cli_run_light` allowlist cfg  serve
+-  `action_id is not in run-light allowlist`
+
+
+
+```ini
+profile.verify_repo_upload_policy=powershell -ExecutionPolicy Bypass -File "D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/scripts/verify_repo_upload_policy.ps1"
+profile_timeout.verify_repo_upload_policy=120
+profile_stall_timeout.verify_repo_upload_policy=30
+local_cli_run_light.verify_repo_upload_policy=verify_repo_upload_policy
+```
+
+
+
+```json
+{
+  "name": "lan_agent_mcp_route",
+  "arguments": {
+    "mode": "call",
+    "target_tool_name": "lan_agent_run_command",
+    "arguments": {
+      "command": "run-light",
+      "action_id": "verify_repo_upload_policy",
+      "args_text": "",
+      "dry_run": false
+    }
+  }
+}
+```
+
+
+### 
+
+-  `unsupported local_cli command` `command`  `local_cli`  `command=run-light`  `action_id` `lan_agent_run_cli_profile`
+-  `action_id is not in run-light allowlist` run-light  `local_cli_run_light.<action_id>`
+-  `run-light action maps to unknown profile` action  `profile.<name>`
+-  `unknown profile` `codex_lan_agent.cfg`  profile serve 
+- / exe  `allowed_roots` 
+-  `profile_timeout.<name>` / `profile_stall_timeout.<name>` `logs/agent_server_stdout.log`  task ledger
+
+ Headless/ `allowed_roots`  `profile.<name>`  `local_cli run-light`  `local_cli_run_light.<action_id>` 
+
+### 小模型/大模型都必须遵守的桌面能力发现规则
+
+`codex-lan-agent` 默认只向 MCP 客户端暴露一个网关工具 `lan_agent_mcp_route`。因此，`tools/list` 中没有单独的 `screenshot`、`click`、`keyboard` 工具，并不代表桌面截图、鼠标控制或图像分析能力不存在。
+
+
+网关选择先看 identity 和路径探测，不要只看返回体里的 `listen_port`：
+
+```text
+Windows 桌面验收入口: codex_lan_agent_18080 / http://127.0.0.1:18080/mcp
+必须能访问: D:/Codex-WorkDir/Sean_WorkDir/cxvisionai
+必须避免: codex_lan_agent_18081 报告 system_id=linux:codexdeb12、environment_name=linux-local、workspace_root=/opt/codex-lan-agent 的入口
+```
+
+如果 identity 或返回字段中出现 `platform=linux`、`workspace_root=/opt/codex-lan-agent`、`system_id=linux:codexdeb12`，即使它同时报告 `listen_port=18080`，也不能用于 Windows GUI、D 盘文件、进程占用、编译或截图任务。此时结论不是 `MANUAL_GUI_NOT_RUN`，而是“当前线程选中了 Linux 网关；需要重新加载 `codex_lan_agent_18080` Windows MCP 工具”。
+
+最小 Windows 网关探测：
+
+```json
+{"mode":"identity"}
+```
+
+```json
+{
+  "mode": "call",
+  "target_tool_name": "lan_agent_list_directory",
+  "arguments": {
+    "directory_path": "D:/Codex-WorkDir/Sean_WorkDir/cxvisionai"
+  }
+}
+```
+
+判定通过条件：目录探测返回 `ok=true`，并且 `normalized_path` / `file_paths` 使用 `D:\\Codex-WorkDir\\Sean_WorkDir\\cxvisionai`。如果返回 `/opt/codex-lan-agent` 或 Windows 路径探测 `exit_code=32`，当前工具注册是错误主机。
+
+
+桌面能力的稳定入口是二级动作面：
+
+```text
+lan_agent_mcp_route -> lan_agent_run_command -> command=run-light -> action_id=<desktop action>
+```
+
+当前桌面动作：
+
+```text
+ui_screenshot, ui_cursor, ui_move, ui_click, ui_key, ui_key_press, ui_type, ui_hotkey, ui_activate_window, ui_get_focused_control, ui_analyze, ui_screenshot_analyze
+```
+
+键盘动作参数：
+
+```text
+ui_key       args_text="--key F4"
+ui_key_press args_text="--key F4"
+ui_hotkey    args_text="--keys CTRL+SHIFT+F4"
+ui_type      args_text="--text hello"
+```
+
+`ui_*` 桌面动作会在 gateway 中自动补齐 bridge 的 `--action` 参数；例如 `action_id=ui_key,args_text="--key F4"` 会实际执行 `--action key --key F4`。如果调用方已经显式传入 `--action` 或 `-a`，gateway 不覆盖。
+
+窗口闭环控制推荐顺序：
+
+```text
+1. ui_activate_window      定位并激活目标窗口
+2. ui_get_focused_control  读取当前前台窗口和焦点控件
+3. ui_screenshot           按窗口或控件 rect 截图
+4. ui_click                按 rect 中心点或分析结果点击
+5. ui_key/ui_hotkey/ui_type 对已聚焦控件发送键盘输入
+6. ui_get_focused_control 或 ui_screenshot_analyze 再读状态，确认操作结果
+```
+
+`ui_activate_window` 支持 `--hwnd <native-handle>`、`--pid <pid>`、`--title <substring>` 和 `--exact`。推荐优先级是：已有 `hwnd` 时用 `--hwnd`；只有进程信息时用 `--pid`；只知道窗口标题时用 `--title`，必要时加 `--exact`。
+
+`ui_get_focused_control` 返回 `foreground_window` 与 `focused_control` 的 `hwnd/title/class_name/pid/thread_id/rect`，还会返回 `caret_rect/caret_hwnd/flags`。后续截图、点击和键盘输入都应基于这些返回字段，而不是凭模型猜坐标。
+
+最小调用模板：
+
+```json
+{
+  "mode": "call",
+  "target_tool_name": "lan_agent_run_command",
+  "arguments": {
+    "command": "run-light",
+    "action_id": "ui_get_focused_control",
+    "args_text": "",
+    "dry_run": false
+  }
+}
+```
+
+窗口激活示例：
+
+```json
+{
+  "mode": "call",
+  "target_tool_name": "lan_agent_run_command",
+  "arguments": {
+    "command": "run-light",
+    "action_id": "ui_activate_window",
+    "args_text": "--title cxvision",
+    "dry_run": false
+  }
+}
+```
+
+如果 `ui_get_focused_control` 返回：
+
+```json
+{
+  "foreground_window": {
+    "hwnd": "656614",
+    "title": "codex-lan-agent",
+    "class_name": "CASCADIA_HOSTING_WINDOW_CLASS",
+    "pid": 6200,
+    "rect": {"left": 221, "top": 68, "width": 1499, "height": 609}
+  },
+  "focused_control": {
+    "hwnd": "525620",
+    "class_name": "Windows.UI.Input.InputSite.WindowClass"
+  }
+}
+```
+
+则下一步应使用确定性参数继续闭环：
+
+```text
+ui_activate_window args_text="--hwnd 656614"
+ui_screenshot      args_text="--x 221 --y 68 --width 1499 --height 609"
+ui_click           args_text="--x 970 --y 372"
+ui_key             args_text="--key F4"
+ui_hotkey          args_text="--keys CTRL+SHIFT+F4"
+ui_type            args_text="--text hello"
+```
+
+关键约束：
+
+- `ui_*` 桌面动作会在 gateway 中自动补齐 bridge 的 `--action` 参数；例如 `action_id=ui_activate_window,args_text="--hwnd 656614"` 会实际执行 `--action activate-window --hwnd 656614`。
+- `ui_get_focused_control` 和 `ui_activate_window` 的 bridge 原始 JSON 写入对应 `logs/cxvision_ui_bridge_*.log`；run-light 返回体里的 `log_path` 是读取证据的入口。
+- 控制闭环必须至少包含一次“读状态”：操作前读 `ui_get_focused_control`，操作后读 `ui_get_focused_control` 或 `ui_screenshot_analyze`，不能只发点击/键盘后直接声称成功。
+
+小模型优先使用这个最小 JSON，不要自行改成 `powershell`、`cmd.exe`、exe 路径或 `Headless` 作为 `command`：
+
+```json
+{
+  "mode": "call",
+  "target_tool_name": "lan_agent_run_command",
+  "arguments": {
+    "command": "run-light",
+    "action_id": "ui_screenshot",
+    "args_text": "",
+    "dry_run": true
+  }
+}
+```
+
+
+
+错误处理约定：
+
+- `unsupported local_cli command`：`command` 写错了；把 `command` 改成 `run-light`，把具体动作写到 `action_id`。
+- `action_id is not in run-light allowlist`：`action_id` 不在当前进程白名单中；读取返回体里的 `safe_action_allowlist`，或重启 serve 让 cfg 中新增的 `local_cli_run_light.*` 生效。
+- 小模型不要因为 `tools/list` 只有 `lan_agent_mcp_route` 就回复“没有截图工具”；必须先读 `mcp_overview` 的 `desktop_ui_available` / `desktop_ui_actions_csv` / `desktop_ui_call_example_json` 字段。
+
+## cxvision_ui_bridge Qt desktop interface
+
+Initial desktop image operations are implemented as a small Qt console interface program, matching the `optfile` layout instead of embedding UI control directly in `codex_lan_agent.exe`.
+
+Source layout:
+
+```text
+cxvision_ui_bridge/
+  cxvision_ui_bridge.pro
+  main.cxx
+```
+
+Build with Qt 5.14.2 / MinGW:
+
+```bat
+cd /d D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\cxvision_ui_bridge
+C:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin\qmake.exe cxvision_ui_bridge.pro -spec win32-g++ "CONFIG+=release"
+C:\Qt\Qt5.14.2\Tools\mingw730_64\bin\mingw32-make.exe release
+copy /Y Release\cxvision_ui_bridge.exe D:\Codex-WorkDir\Sean_WorkDir\codex-lan-agent\cxvision_ui_bridge.exe
+```
+
+Runtime config, loaded by `codex_lan_agent.cfg` after serve restart:
+
+```ini
+profile.cxvision_ui_bridge="D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/cxvision_ui_bridge.exe"
+profile_timeout.cxvision_ui_bridge=1800
+profile_stall_timeout.cxvision_ui_bridge=120
+local_cli_run_light.ui_screenshot=cxvision_ui_bridge
+local_cli_run_light.ui_cursor=cxvision_ui_bridge
+local_cli_run_light.ui_move=cxvision_ui_bridge
+local_cli_run_light.ui_click=cxvision_ui_bridge
+local_cli_run_light.ui_analyze=cxvision_ui_bridge
+local_cli_run_light.ui_screenshot_analyze=cxvision_ui_bridge
+```
+
+Direct bridge actions:
+
+```bat
+cxvision_ui_bridge.exe --action screenshot --output D:\temp\screen.png
+cxvision_ui_bridge.exe --action cursor
+cxvision_ui_bridge.exe --action move --x 500 --y 300
+cxvision_ui_bridge.exe --action click --x 500 --y 300 --button left --clicks 1
+```
+
+Analysis is intentionally parameter-template based because `cxvision_imgui_acceptance.exe` may change its CLI contract. The bridge replaces `{image}` and `{output}` before starting cxvision:
+
+```bat
+cxvision_ui_bridge.exe --action analyze ^
+  --image D:\temp\screen.png ^
+  --cxvision-exe D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\build01\Release\cxvision_imgui_acceptance.exe ^
+  --cxvision-workdir D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo ^
+  --analysis-output D:\temp\screen.analysis.json ^
+  --cxvision-args "--headless --cxscript-headless --image {image} --script D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo\cxparser\cxscript\module\cximage\find_circle_direct_test.cxsc --case-name codex_ui_bridge_smoke --out {output} --max-steps 10000 --unified-log D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxscript_runs\_shared\cxvision_imgui_acceptance.jsonl" ^
+  --timeout-ms 120000
+```
+
+Combined capture plus analysis:
+
+```bat
+cxvision_ui_bridge.exe --action screenshot-analyze ^
+  --output D:\temp\screen.png ^
+  --cxvision-exe D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\build01\Release\cxvision_imgui_acceptance.exe ^
+  --cxvision-workdir D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo ^
+  --analysis-output D:\temp\screen.analysis.json ^
+  --cxvision-args "--headless --cxscript-headless --image {image} --script D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxvision_repo\cxparser\cxscript\module\cximage\find_circle_direct_test.cxsc --case-name codex_ui_bridge_smoke --out {output} --max-steps 10000 --unified-log D:\Codex-WorkDir\Sean_WorkDir\cxvisionai\cxscript_runs\_shared\cxvision_imgui_acceptance.jsonl"
+```
+
+All actions print one compact JSON object to stdout. `screenshot` returns `image_path`, `image_mime`, and capture rectangle. Mouse actions return the final coordinates. Analysis actions return the cxvision process exit code, stdout/stderr preview, and expected analysis output path.
+
+After the config-driven run-light allowlist is active and `codex_lan_agent serve` has been restarted, the bridge can also be built through the auditable gateway action:
+
+```json
+{
+  "name": "local_cli",
+  "arguments": {
+    "command": "run-light",
+    "action_id": "build_cxvision_ui_bridge"
+  }
+}
+```
+
+The build action runs `build_cxvision_ui_bridge.bat`, which generates the qmake Makefile, runs `mingw32-make release`, copies `cxvision_ui_bridge/Release/cxvision_ui_bridge.exe` to `D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/cxvision_ui_bridge.exe`, and deploys the required Qt GUI runtime files under the same directory.
+
+
+### cxvision_ui_bridge restart verification - 2026-08-27
+
+After restarting `codex_lan_agent serve`, the gateway health check passed:
+
+```json
+{"ok":true,"status":"success","outcome":"PASS","current_tool_chain_node":"lan_agent_health"}
+```
+
+The active `codex_lan_agent.cfg` was read through the gateway and contains the expected external run-light mappings:
+
+```ini
+profile.cxvision_ui_bridge="D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/cxvision_ui_bridge.exe"
+local_cli_run_light.ui_screenshot=cxvision_ui_bridge
+local_cli_run_light.ui_cursor=cxvision_ui_bridge
+local_cli_run_light.ui_move=cxvision_ui_bridge
+local_cli_run_light.ui_click=cxvision_ui_bridge
+local_cli_run_light.ui_analyze=cxvision_ui_bridge
+local_cli_run_light.ui_screenshot_analyze=cxvision_ui_bridge
+local_cli_run_light.build_cxvision_ui_bridge=build_cxvision_ui_bridge
+```
+
+However, the restarted live service still rejects the configured action:
+
+```json
+{
+  "ok": false,
+  "exit_code": 45,
+  "error": "action_id is not in run-light allowlist",
+  "action_id": "build_cxvision_ui_bridge",
+  "safe_action_allowlist": "check_remote_online,check_local_chat,read_latest_log,get_git_diff,read_test_result"
+}
+```
+
+Conclusion: the Qt bridge executable itself has already been built and previously validated, including screenshot, cursor, mouse move, and a real `cxvision_imgui_acceptance.exe` headless analysis returning `cxscript_headless_ok=true`. The remaining failure is not in `cxvision_ui_bridge`; it is that the live `codex_lan_agent serve` process is still using the old built-in run-light allowlist. To complete gateway execution, deploy the rebuilt `codex_lan_agent.exe` that includes `local_cli_run_light.*` config parsing to the actual serve path, then restart serve with `D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/codex_lan_agent.cfg`.
+
+
+### cxvision_ui_bridge gateway verification - second pass 2026-08-27
+
+After deploying the rebuilt `codex_lan_agent.exe` to the actual `stage_x64/bin` serve path and restarting, the external run-light allowlist is now active.
+
+Health check:
+
+```json
+{"ok":true,"status":"success","outcome":"PASS","current_tool_chain_node":"lan_agent_health"}
+```
+
+Dry-run for `build_cxvision_ui_bridge` now succeeds and shows the configured actions in the live allowlist:
+
+```text
+check_remote_online,check_local_chat,read_latest_log,get_git_diff,read_test_result,
+run_cxvision_imgui_acceptance,ui_click,ui_screenshot,ui_analyze,ui_cursor,ui_move,
+ui_screenshot_analyze,build_cxvision_ui_bridge
+```
+
+`ui_screenshot` dry-run also succeeds and resolves to profile `cxvision_ui_bridge` through `local_cli_run_light.ui_screenshot`.
+
+Real execution of `ui_cursor` currently fails at process start:
+
+```json
+{
+  "ok": false,
+  "exit_code": 4,
+  "error": "failed to start process: D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent/cxvision_ui_bridge.exe --action cursor",
+  "action_id": "ui_cursor",
+  "profile": "cxvision_ui_bridge",
+  "execution_backend": "configured_run_light_profile"
+}
+```
+
+Code analysis: `RunConfiguredCommand()` starts profile processes with `working_directory=config.workspace_root`. The current cfg uses a semicolon-separated multi-root value:
+
+```ini
+workspace_root=D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent;D:/Codex-WorkDir/Sean_WorkDir/cxvisionai
+```
+
+That string is not a valid Windows directory for `CreateProcessA`, so the process cannot start even though the allowlist and profile mapping are now correct.
+
+Immediate config-only fix:
+
+```ini
+workspace_root=D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent
+allowed_roots=D:/Codex-WorkDir/Sean_WorkDir/codex-lan-agent;D:/Codex-WorkDir/Sean_WorkDir/cxvisionai;D:\Codex-WorkDir\Sean_WorkDir\AItest\muparser-master\src
+```
+
+Recommended code hardening: profile execution should not pass a multi-root string directly as the child process working directory. `RunConfiguredCommand()` should use `config.config_dir` or the first valid workspace root as `CreateProcessA` working directory, while path authorization continues to use `workspace_root` / `allowed_roots` separately.
+
+---
+
+## 20. Qt6 工具链构建记录（无系统安装）
+
+**日期**：2026-10-08
+**目标**：在 Devuan 系统未安装 Qt 的前提下，编译三个 QtCore 辅助工具（`optfile` / `directory_access` / `git_snapshot`），保持宿主系统 `/usr` / `/lib` 不被修改。
+
+### 20.1 背景
+
+`BUILD.gn` 的 `runtime` group 在 Linux 上要求编译三个 QtCore 可执行文件：
+
+```gn
+foreach(target_name, [ "optfile", "directory_access", "git_snapshot" ]) {
+  executable(target_name) {
+    sources = [ "optfile/main.cpp" ]          # optfile
+    sources = [ "tools/"+target_name+"/main.cpp" ]  # 另外两个
+    defines = [ "QT_CORE_LIB" ]
+    libs = [ "Qt5Core", "pthread" ]
+  }
+}
+```
+
+源码原本面向 Qt5（使用 `QTextStream::setCodec()`、`QTextStream::setGenerateByteOrderMark()`、`#include <QTextCodec>`）。当前 Devuan excalibur 仓库同时有 Qt5 和 Qt6，但本次选择 **Qt6.8.2**，因为 `codex_lan_agent.cfg` 已经有 `optfile_write_enabled=true`，且 `codex_lan_agent` 进程在运行时只链接 `libQt6Core.so.6`（非 dev 包即可）。
+
+硬性操作边界（AGENTS.md）：**禁止**修改宿主 `/usr`、`/lib`、热替换系统库；所有依赖独立放置在 `/H/usr/aisrc/` 下，通过环境变量或 RPATH 生效。
+
+### 20.2 源码改动（Qt5 → Qt6 兼容）
+
+`optfile/main.cpp`（6 处）：
+- 删除 `input.setCodec("UTF-8")`（Qt6 `QTextStream` 默认 UTF-8）
+- 删除 `out.setCodec("UTF-8")` + `out.setGenerateByteOrderMark(false)`（Qt6 无此 API）
+- 删除 `in.setCodec("UTF-8")`
+- 删除 `write_test_file` 中同上两行
+- 删除 `write_explicit_result` 中同上两行
+
+`tools/directory_access/main.cpp`（1 处）：
+- 删除 `#include <QTextCodec>`
+- 保留原有 `#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)` 分支中的 `input.setEncoding(QStringConverter::Utf8)`
+
+`tools/git_snapshot/main.cpp`：无需改动。
+
+> **关键经验**：Qt6 的 `QTextStream::setCodec()` 和 `QTextCodec` 模块已移除。直接删除即可，因为 Qt6 全局使用 UTF-8。不要用 `setEncoding()` 替代 —— 默认就是 UTF-8，无需显式设置。
+
+### 20.3 依赖获取策略（不 apt install）
+
+| 依赖 | 获取方式 | 存放路径 |
+|---|---|---|
+| `qt6-base-dev` 6.8.2+dfsg-9+deb13u2 | `curl` 从 Debian pool 下载 .deb | `/H/usr/aisrc/apt/` |
+| `libqt6core6t64` 同上 | 同上 | 同上 |
+| Qt6 运行时依赖（`libdouble-conversion3` / `libb2-1` / `libpcre2-16-0`） | 同上 | 同上 |
+| gcc-14 + binutils + libc6-dev + libgcc-s1 | 从 `/H/usr/aisrc/apt/` 缓存中选取 | 解压到 `/H/usr/aisrc/toolchain/` |
+| Qt6 headers + `libQt6Core.so.6` | `dpkg-deb -x` 解压 | `/H/usr/aisrc/qt6/` |
+
+**关键路径表**：
+
+| 路径 | 内容 |
+|---|---|
+| `/H/usr/aisrc/qt6/usr/include/x86_64-linux-gnu/qt6/` | Qt6 头文件根 |
+| `/H/usr/aisrc/qt6/usr/include/x86_64-linux-gnu/qt6/QtCore/` | QtCore 头文件 |
+| `/H/usr/aisrc/qt6/usr/lib/x86_64-linux-gnu/libQt6Core.so.6` | QtCore 共享库 |
+| `/H/usr/aisrc/toolchain/usr/bin/g++` | g++ 14.2.0 |
+| `/H/usr/aisrc/toolchain/usr/lib/x86_64-linux-gnu/` | 运行时库（libc / libm / libdouble-conversion / libpcre2-16 / libb2 等） |
+| `/H/usr/aisrc/apt/` | .deb 缓存（可 mirror copy 回宿主 apt cache） |
+
+### 20.4 构建命令
+
+推荐使用项目内脚本：
+
+```bash
+bash scripts/build_qt_tools.sh [output-dir]
+```
+
+输出到 `build/`（默认），三个二进制：
+
+| 二进制 | 大小 | 用途 |
+|---|---|---|
+| `build/optfile` | ~116 KB | 文件原子读写、范围读取、SHA256 校验、fuzzy 匹配、diff 应用 |
+| `build/directory_access` | ~47 KB | 目录列表、文件分页读取 |
+| `build/git_snapshot` | ~48 KB | git 仓库快照 |
+
+直接调用 g++ 的完整命令（等价于 `scripts/build_qt_tools.sh` 内部执行的内容）：
+
+```bash
+export PATH=/H/usr/aisrc/toolchain/usr/bin:$PATH
+export LD_LIBRARY_PATH=/H/usr/aisrc/toolchain/usr/lib/x86_64-linux-gnu:/H/usr/aisrc/toolchain/usr/lib/gcc/x86_64-linux-gnu/14:$LD_LIBRARY_PATH
+
+g++ -std=c++17 -O2 -DQT_CORE_LIB \
+  -isystem /H/usr/aisrc/toolchain/usr/include/c++/14 \
+  -isystem /H/usr/aisrc/toolchain/usr/include/x86_64-linux-gnu/c++/14 \
+  -isystem /H/usr/aisrc/toolchain/usr/include/c++/14/backward \
+  -isystem /H/usr/aisrc/toolchain/usr/lib/gcc/x86_64-linux-gnu/14/include \
+  -isystem /H/usr/aisrc/toolchain/usr/include \
+  -isystem /H/usr/aisrc/toolchain/usr/include/x86_64-linux-gnu \
+  -isystem /H/usr/aisrc/qt6/usr/include/x86_64-linux-gnu/qt6 \
+  -isystem /H/usr/aisrc/qt6/usr/include/x86_64-linux-gnu/qt6/QtCore \
+  optfile/main.cpp \
+  -L/H/usr/aisrc/qt6/usr/lib/x86_64-linux-gnu \
+  -L/H/usr/aisrc/toolchain/usr/lib/x86_64-linux-gnu \
+  -L/H/usr/aisrc/toolchain/usr/lib/gcc/x86_64-linux-gnu/14 \
+  -L/usr/lib/x86_64-linux-gnu -L/lib/x86_64-linux-gnu \
+  -lQt6Core -lpthread \
+  -Wl,--disable-new-dtags \
+  -Wl,-rpath,/H/usr/aisrc/qt6/usr/lib/x86_64-linux-gnu:/H/usr/aisrc/toolchain/usr/lib/x86_64-linux-gnu \
+  -o build/optfile
+```
+
+### 20.5 RPATH 策略（关键！）
+
+Qt6 Core 的传递依赖包括 `libglib-2.0.so.0`、`libicu*`、`libzstd.so.1` 等（系统已安装，无需处理），以及 **`libdouble-conversion.so.3`、`libb2.so.1`、`libpcre2-16.so.0`**（系统未安装）。
+
+使用 `-Wl,--disable-new-dtags` + `-Wl,-rpath,qt6_lib:toolchain_lib` 强制写 `DT_RPATH`（而非默认的 `DT_RUNPATH`）。**两者区别**：
+
+| 字段 | 语义 |
+|---|---|
+| `DT_RUNPATH` | 只搜索自身 RPATH，不传递给依赖（子依赖需自己有 RPATH 或在 `LD_LIBRARY_PATH` 内） |
+| `DT_RPATH` | 搜索自身 RPATH，也传递给子依赖（**Qt6Core 的传递依赖能被找到**） |
+
+如果不用 `--disable-new-dtags`，`libdouble-conversion.so.3 not found` 会直接导致运行失败（即使 toolchain 里有这个库）。
+
+**运行时完全不需要设置 `LD_LIBRARY_PATH`**，RPATH 内嵌在每个二进制里：
+
+```bash
+# 直接运行，成功
+/H/aisrc/lan-agent/build/optfile --target-dir /tmp --test-file demo.txt --content-write "OK"
+```
+
+### 20.6 踩坑清单（经验记录）
+
+1. **`features.h: No such file or directory`**（6 小时）
+   - 根因：`g++ --sysroot /path` 后，CC1Plus 在 sysroot 内搜索 `features.h`，但系统 C++ headers 的绝对路径引用没跟着切换。
+   - 解法：**不用 `--sysroot` 处理 C++ 头文件搜索**，改用 `-isystem ${TC}/usr/include/...` 显式列出所有搜索目录（C++ 三层 headers + GCC builtins + C 两层 headers + Qt），只在链接阶段用 `-L` 显式指定库路径。
+
+2. **`libc_nonshared.a: No such file or directory`**
+   - 根因：toolchain 里的 `/usr/lib/x86_64-linux-gnu/libc.so` 是个 linker script：`GROUP ( /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/libc_nonshared.a ... )`。脚本里写的是 **绝对路径** `/lib/...`，`--sysroot` 后找不到。
+   - 解法：**改写 linker script，换成相对路径**：
+     ```
+     GROUP ( libc.so.6 libc_nonshared.a AS_NEEDED ( /lib64/ld-linux-x86-64.so.2 ) )
+     ```
+
+3. **`ld-linux-x86-64.so.2` inside sysroot not found**
+   - 根因：`g++ --sysroot` 默认写 `-dynamic-linker /lib64/ld-linux-x86-64.so.2`，而 toolchain 里没有 `/lib64/` 目录（Debian 是 `/lib/x86_64-linux-gnu/` 布局 + `/lib64` 软链到 `../lib/x86_64-linux-gnu/`）。
+   - 解法：在 toolchain 里创建 `/lib64/ld-linux-x86-64.so.2` 软链到系统的。
+
+4. **Qt6Core 传递依赖缺失**（`libdouble-conversion.so.3` / `libb2.so.1` / `libpcre2-16.so.0`）
+   - 根因：只解压了 `qt6-base-dev`（头文件 + stub .so）和 `libqt6core6t64`（运行时 .so），但 Qt6Core 共享库本身还依赖 **3 个系统库**。
+   - 解法：额外下载这 3 个运行时 .deb（`libdouble-conversion3` / `libb2-1` / `libpcre2-16-0`），解压到 `/H/usr/aisrc/toolchain/usr/lib/x86_64-linux-gnu/`。
+
+5. **`RPATH` vs `RUNPATH`**
+   - 根因：GCC 14 默认写 `DT_RUNPATH`，不会传递给依赖。
+   - 解法：加 `-Wl,--disable-new-dtags` 让 ld 写 `DT_RPATH`。
+
+6. **`/usr/lib/x86_64-linux-gnu/libgcc_s.so.1`**
+   - 根因：`libgcc-s1` 这个 runtime 库在 Devuan apt 里找不到 .deb，工具链里只有 `libgcc_s.so`（链接脚本）。
+   - 解法：从 **系统** 直接 `cp /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /H/usr/aisrc/toolchain/usr/lib/x86_64-linux-gnu/`（宿主已安装 libgcc-s1）。
+
+7. **Qt5→Qt6 兼容改动**
+   - 根因：Qt6 删除了 `QTextCodec` 模块、`QTextStream::setCodec()`、`setGenerateByteOrderMark()`。
+   - 解法：全部删除即可，Qt6 默认 UTF-8。**不要**用 `setEncoding()` 替代（默认就是 UTF-8，显式调用无意义）。
+
+### 20.7 三个工具的运行时验证
+
+```bash
+# optfile：写 + 读 + SHA256
+/H/aisrc/lan-agent/build/optfile \
+  --target-dir /tmp --test-file demo.txt --content-write "Hello from Qt6!"
+# => {"status":"ok","operation":"write_file_atomic","new_bytes":14,...}
+
+/H/aisrc/lan-agent/build/optfile \
+  --target-dir /tmp --test-file demo.txt --read-offset 0 --read-length 256
+# => {"status":"ok","content_text":"Hello from Qt6!","content_sha256":"..."}
+
+# directory_access：列目录
+/H/aisrc/lan-agent/build/directory_access \
+  --mode list-directory --directory /H/aisrc/lan-agent/optfile
+# => status=success, total_entries=1, entry_0=[file] main.cpp
+
+# git_snapshot：git 仓库快照
+/H/aisrc/lan-agent/build/git_snapshot --repo-root /H/aisrc/lan-agent
+# => [snapshot_start], repo_root=/H/aisrc/lan-agent
+```
+
+### 20.8 CMakeLists.txt 变更
+
+在 `CMakeLists.txt` 末尾新增了 Qt helper tools 的条件目标块（检测 `/H/usr/aisrc/qt6` 存在时自动启用）：
+
+```cmake
+set(CODEX_LAN_AGENT_QT6_PREFIX
+  "/H/usr/aisrc/qt6"
+  CACHE PATH "Path to manually extracted Qt6 root containing usr/")
+
+set(_qt6_inc_root "${CODEX_LAN_AGENT_QT6_PREFIX}/usr/include/x86_64-linux-gnu/qt6")
+set(_qt6_lib_root "${CODEX_LAN_AGENT_QT6_PREFIX}/usr/lib/x86_64-linux-gnu")
+
+if(EXISTS "${_qt6_inc_root}/QtCore/QCoreApplication"
+   AND EXISTS "${_qt6_lib_root}/libQt6Core.so")
+  foreach(_qt_tool IN ITEMS optfile directory_access git_snapshot)
+    add_executable(${_qt_tool} ...)
+    target_link_libraries(${_qt_tool} PRIVATE Qt6Core pthread)
+  endforeach()
+endif()
+```
+
+**实际构建仍推荐** `bash scripts/build_qt_tools.sh` —— 原因：CMakeLists.txt 的 `target_include_directories` / `target_link_directories` 不完整覆盖 `-isystem` 显式列出的 C++ 标准头文件三层路径、以及 `libc.so` linker script 改写后的相对路径搜索。如果后续要把这条路径补齐，需要在 CMake 里也加上 `-Wl,--disable-new-dtags`。
+
+### 20.9 经验总结
+
+| 维度 | 决策 | 原因 |
+|---|---|---|
+| Qt 版本 | Qt6.8.2 | 仓库已在使用 Qt6Core 运行时，apt 里有现成 libqt6core6t64 deb |
+| 编译器 | 系统 g++ 14.2.0（解压 .deb） | 无 root 权限；宿主 gcc 和 Qt ABI 必须匹配 |
+| 头文件搜索 | 手写 `-isystem` 显式列表 | `--sysroot` 对 C++ headers 的绝对路径处理不可靠 |
+| RPATH | `--disable-new-dtags` + 双路径 | RUNPATH 不传递给依赖，导致 Qt6Core 的子依赖找不到 |
+| apt 源 | `http://deb.debian.org/debian/pool/` | Devuan merged pool 的 403/404 间歇性失败，Debian pool 更稳定 |
+| deb 缓存 | mirror copy 到 `/H/usr/aisrc/apt/` | AGENTS.md 硬规则：所有下载 apt Packages 必须镜像 |

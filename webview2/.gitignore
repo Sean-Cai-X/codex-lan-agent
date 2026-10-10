@@ -1,0 +1,57 @@
+# Local toolchains and caches
+.tools/
+.cache/
+
+# Runtime binaries and generated executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.pdb
+*.ilk
+*.obj
+*.o
+
+# Archives and packages
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.msi
+*.pkg
+
+# Images and packaged app resources
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.ico
+*.icns
+*.bmp
+*.svg
+
+# Local runtime data and private configs
+buildme.md
+config.yaml
+config.local.yaml
+*.local.yaml
+local.*.yaml
+profiles/
+providers/
+cache.db
+*.log
+*.mmdb
+*.metadb
+geoip.dat
+geosite.dat
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

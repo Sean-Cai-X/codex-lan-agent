@@ -1,0 +1,131 @@
+{
+  "dns": {
+    "strategy": "prefer_ipv4",
+    "rules": [
+      {
+        "ip_cidr": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16"
+        ],
+        "server": "block-dns",
+        "strategy": "ipv4_only"
+      }
+    ],
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "block-dns",
+        "server": "0.0.0.0"
+      },
+      {
+        "prefer_go": true,
+        "tag": "local-dns",
+        "type": "local"
+      },
+      {
+        "type": "udp",
+        "tag": "clean-dns",
+        "server": "223.5.5.5"
+      }
+    ],
+    "final": "clean-dns"
+  },
+  "outbounds": [
+    {
+      "tag": "direct-out",
+      "type": "direct"
+    },
+    {
+      "tag": "block-out",
+      "type": "block"
+    },
+    {
+      "tag": "mihomo-out",
+      "type": "http",
+      "server": "127.0.0.1",
+      "server_port": 12790
+    }
+  ],
+  "inbounds": [
+    {
+      "tag": "mixed-eth2",
+      "listen": "0.0.0.0",
+      "listen_port": 2080,
+      "set_system_proxy": false,
+      "type": "mixed",
+      "bind_interface": "eth2",
+      "users": [
+        {
+          "username": "codex",
+          "password": "CHANGE_ME_AUDIT_GATEWAY_PASSWORD"
+        }
+      ]
+    }
+  ],
+  "log": {
+    "timestamp": true,
+    "level": "info"
+  },
+  "route": {
+    "auto_detect_interface": true,
+    "final": "mihomo-out",
+    "default_domain_resolver": "local-dns",
+    "rules": [
+      {
+        "ip_cidr": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16"
+        ],
+        "outbound": "block-out"
+      },
+      {
+        "domain_suffix": [
+          "trae.cn",
+          "trae.ide",
+          "lf-cdn.trae.com.cn",
+          "trae-update.com",
+          "trae-cdn.oss-cn-beijing.aliyuncs.com"
+        ],
+        "outbound": "direct-out"
+      },
+      {
+        "domain_suffix": [
+          "fonts.googleapis.com",
+          "fonts.gstatic.com",
+          "byteoversea.com",
+          "gator.volces.com",
+          "volceapplog.com",
+          "umeng.com",
+          "bugly.qq.com",
+          "vortex.data.microsoft.com",
+          "dc.services.visualstudio.com",
+          "google-analytics.com",
+          "sentry.io",
+          "collector.github.com",
+          "telemetry.gitlab.com",
+          "telemetry.npmjs.org",
+          "stats.yarnpkg.com",
+          "telemetry.vercel.com",
+          "stats.vercel.com",
+          "ark.cn-beijing.volces.com",
+          "blob.core.windows.net",
+          "windowsupdate.com",
+          "s3.amazonaws.com",
+          "update.microsoft.com",
+          "feedback.windows.com",
+          "feadback.search.microsoft.com",
+          "self.events.data.microsoft.com",
+          "v10.events.data.microsoft.com",
+          "v20.events.data.microsoft.com",
+          "mobile.events.data.microsoft.com",
+          "diagnostics.support.microsoft.com"
+        ],
+        "outbound": "block-out"
+      }
+    ]
+  }
+}

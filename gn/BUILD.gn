@@ -1,0 +1,57 @@
+toolchain("gcc") {
+  tool("cc") {
+    command = "gcc -MMD -MF {{output}}.d {{defines}} {{include_dirs}} {{cflags}} {{cflags_c}} -c {{source}} -o {{output}}"
+    depfile = "{{output}}.d"
+    depsformat = "gcc"
+    outputs = [ "{{source_out_dir}}/{{target_output_name}}.{{source_name_part}}.o" ]
+  }
+  tool("cxx") {
+    command = "g++ -MMD -MF {{output}}.d {{defines}} {{include_dirs}} {{cflags}} {{cflags_cc}} -c {{source}} -o {{output}}"
+    depfile = "{{output}}.d"
+    depsformat = "gcc"
+    outputs = [ "{{source_out_dir}}/{{target_output_name}}.{{source_name_part}}.o" ]
+  }
+  tool("alink") {
+    command = "ar rcs {{output}} {{inputs}}"
+    outputs = [ "{{root_out_dir}}/{{target_output_name}}.a" ]
+  }
+  tool("link") {
+    command = "g++ {{ldflags}} -o {{output}} {{inputs}} {{libs}}"
+    lib_switch = "-l"
+    lib_dir_switch = "-L"
+    outputs = [ "{{root_out_dir}}/{{target_output_name}}" ]
+  }
+  tool("stamp") {
+    command = "touch {{output}}"
+  }
+  tool("copy") {
+    command = "cp -f {{source}} {{output}}"
+  }
+}
+
+toolchain("msvc") {
+  tool("cc") {
+    command = "cl.exe /nologo /showIncludes /c {{defines}} {{include_dirs}} {{cflags}} {{cflags_c}} /Fo{{output}} {{source}}"
+    depsformat = "msvc"
+    outputs = [ "{{source_out_dir}}/{{target_output_name}}.{{source_name_part}}.obj" ]
+  }
+  tool("cxx") {
+    command = "cl.exe /nologo /showIncludes /c {{defines}} {{include_dirs}} {{cflags}} {{cflags_cc}} /Fo{{output}} {{source}}"
+    depsformat = "msvc"
+    outputs = [ "{{source_out_dir}}/{{target_output_name}}.{{source_name_part}}.obj" ]
+  }
+  tool("alink") {
+    command = "lib.exe /nologo /OUT:{{output}} {{inputs}}"
+    outputs = [ "{{root_out_dir}}/{{target_output_name}}.lib" ]
+  }
+  tool("link") {
+    command = "link.exe /nologo /OUT:{{output}} {{inputs}} {{ldflags}} {{libs}}"
+    outputs = [ "{{root_out_dir}}/{{target_output_name}}.exe" ]
+  }
+  tool("stamp") {
+    command = "cmd /c type nul > {{output}}"
+  }
+  tool("copy") {
+    command = "cmd /c copy /Y {{source}} {{output}} > nul"
+  }
+}

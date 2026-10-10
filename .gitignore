@@ -1,0 +1,122 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pb
+
+# Binary / compiled targets
+codex_lan_agent
+codex_lan_agent.exe
+
+# Logs & runtime state
+*.log
+logs/
+*.pid
+*.state
+*.tmp
+agent_server_*.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Test scripts / ad-hoc
+test_perm.py
+test_*.py
+*.sh.bak
+
+# Trae/IDE workspace
+.trae/
+.vs-code/
+
+# === 禁止上传: 生成/运行/二进制/库/图片/压缩包 ===
+# 编译产物（所有 .o .a .so 都在 build/ 里，已排除）
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# 二进制可执行
+*.exe
+*.bin
+*.cur
+codex_lan_agent
+codex_lan_agent.exe
+
+# Debian/RPM/包
+*.deb
+*.rpm
+*.apk
+
+# 图片（任何图片格式）
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.svg
+*.ico
+*.heic
+*.raw
+
+# 压缩包 / 大文件
+*.zip
+*.7z
+*.rar
+*.tar
+*.tgz
+*.tar.gz
+*.tar.bz2
+*.iso
+*.img
+*.gguf
+*.bin
+
+# 字体
+*.ttf
+*.otf
+*.woff
+*.woff2
+*.eot
+
+# 运行时生成
+*.log
+*.bak
+*.tmp
+*.swp
+*.swo
+*.sock
+*.pid
+*.state
+*.db
+*.sqlite
+*.pyc
+*.pyo
+*.class
+*.jar
+*.war
+*.egg
+*.whl
+
+# Trae/Local 临时
+.trae/
+.vs-code/
+.vscode/
+logs/
+*.state.json
