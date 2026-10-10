@@ -178,15 +178,33 @@ public:
         }
 #else
         const std::string lock_path = GetServerLockFilePath();
-        lock_fd_ = open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+        int open_flags = O_CREAT | O_RDWR;
+#ifdef O_CLOEXEC
+        open_flags |= O_CLOEXEC;
+#endif
+        lock_fd_ = open(lock_path.c_str(), open_flags, 0644);
         if (lock_fd_ < 0) {
             acquired_ = false;
-            error_message_ = "failed to open server lock file";
+            error_message_ =
+                "failed to open server lock file: " + lock_path + ": " + std::strerror(errno);
+            return;
+        }
+        const int descriptor_flags = fcntl(lock_fd_, F_GETFD);
+        if (descriptor_flags < 0 || fcntl(lock_fd_, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+            const int error = errno;
+            error_message_ =
+                "failed to mark server lock file close-on-exec: " + lock_path + ": " + std::strerror(error);
+            close(lock_fd_);
+            lock_fd_ = -1;
+            acquired_ = false;
             return;
         }
         if (flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+            const int error = errno;
             acquired_ = false;
-            error_message_ = "another codex_lan_agent server instance is already running";
+            error_message_ =
+                "another codex_lan_agent server instance is already running (lock=" + lock_path + ", " +
+                std::strerror(error) + ")";
             return;
         }
 #endif

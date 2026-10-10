@@ -25,6 +25,9 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace codex_lan_agent {
@@ -286,6 +289,16 @@ bool RunCommandWithLog(
         return false;
     }
 
+    // Resolve the fallback bound before fork; the child must not retain any
+    // gateway locks or network sockets when executing an external command.
+    const long child_fd_limit = sysconf(_SC_OPEN_MAX);
+    if (child_fd_limit < 0) {
+        close(log_fd);
+        if (error_message) {
+            *error_message = "failed to determine child descriptor limit";
+        }
+        return false;
+    }
     const pid_t child_pid = fork();
     if (child_pid < 0) {
         close(log_fd);
@@ -301,9 +314,20 @@ bool RunCommandWithLog(
                 _exit(126);
             }
         }
-        dup2(log_fd, STDOUT_FILENO);
-        dup2(log_fd, STDERR_FILENO);
-        close(log_fd);
+        if (dup2(log_fd, STDOUT_FILENO) < 0 ||
+            dup2(log_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        // Linux closes even descriptors above a subsequently lowered rlimit.
+        // The fallback also supports older kernels without close_range.
+#if defined(__linux__) && defined(SYS_close_range)
+        if (syscall(SYS_close_range, 3u, ~0u, 0u) != 0)
+#endif
+        {
+            for (long fd = 3; fd < child_fd_limit; ++fd) {
+                close(static_cast<int>(fd));
+            }
+        }
         const std::string shell_program = GetShellProgram();
         const std::string shell_argv0 = std::filesystem::path(shell_program).filename().string();
         const std::string shell_flag = GetShellFlag();
